@@ -169,6 +169,7 @@ async fn seed_task_with_system_comment(db: &db::SqliteDb) -> String {
     TaskRepo::create(
         db,
         CreateTask {
+            repositories: Vec::new(),
             id: task_id.clone(),
             project_id,
             repo_id: Some(repo_id),

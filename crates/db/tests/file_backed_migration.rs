@@ -90,6 +90,7 @@ async fn file_backed_migrations_apply_and_task_operation_claim_is_atomic_across_
     TaskRepo::create(
         &db,
         CreateTask {
+            repositories: Vec::new(),
             id: task_id.clone(),
             project_id,
             repo_id: None,
@@ -115,6 +116,8 @@ async fn file_backed_migrations_apply_and_task_operation_claim_is_atomic_across_
     let first_claim = CreateTaskIntegrationOperation {
         id: db::new_uuid_v4(),
         task_id: task_id.clone(),
+        repo_id: None,
+        repository_merge_batch_id: None,
         kind: TaskIntegrationOperationKind::WorkUnitIntegration,
         owner_id: "integration-attempt-a".to_owned(),
         gate_evaluation_id: None,
@@ -125,6 +128,8 @@ async fn file_backed_migrations_apply_and_task_operation_claim_is_atomic_across_
     let second_claim = CreateTaskIntegrationOperation {
         id: db::new_uuid_v4(),
         task_id: task_id.clone(),
+        repo_id: None,
+        repository_merge_batch_id: None,
         kind: TaskIntegrationOperationKind::IntegrationWorkspaceCleanup,
         owner_id: "merge-attempt-b".to_owned(),
         gate_evaluation_id: None,
@@ -492,7 +497,7 @@ async fn pr5_rebuild_preserves_legacy_workspace_as_task_integration_scope() {
     .await
     .expect("legacy scope");
     assert_eq!(scope, ("integration".into(), None));
-    let canonical = db::WorkspaceRepo::get_integration_by_task_id(&db, &task_id)
+    let canonical = db::WorkspaceRepo::get_integration_by_task_repo(&db, &task_id, &repo_id)
         .await
         .expect("legacy get")
         .expect("integration workspace");
@@ -1038,6 +1043,7 @@ async fn historical_task_modes_are_removed_without_losing_task_rows() {
     let discovery = TaskRepo::create(
         &db,
         CreateTask {
+            repositories: Vec::new(),
             id: "discovery-task".to_owned(),
             project_id: "discovery-project".to_owned(),
             repo_id: Some("discovery-repo".to_owned()),

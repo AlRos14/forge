@@ -3,9 +3,9 @@ use db::{
     AddWorkUnitDependency, CoordinationMode, CreateDomainEvent, CreateExecution, CreateProject,
     CreateRepo, CreateRoleMembership, CreateTask, CreateTaskRole, CreateWorkUnit,
     CreateWorkUnitExecution, CreateWorkUnitIntegration, CreateWorkUnitWorkspace, CreateWorkspace,
-    CreateWorkspaceLease, DbError, ExecutionRepo, ExecutionStatus, ProjectRepo,
-    RecordWorkUnitIntegration, RepoRepo, RoleMembershipRepo, RoleMembershipStatus, SqliteDb,
-    TaskIntegrationOperationRepo, TaskRepo, TaskRoleRepo, UpdateExecution, WorkMode,
+    CreateWorkspaceGroup, CreateWorkspaceLease, DbError, ExecutionRepo, ExecutionStatus,
+    ProjectRepo, RecordWorkUnitIntegration, RepoRepo, RoleMembershipRepo, RoleMembershipStatus,
+    SqliteDb, TaskIntegrationOperationRepo, TaskRepo, TaskRoleRepo, UpdateExecution, WorkMode,
     WorkUnitExecutionRepo, WorkUnitIntegrationOutcome, WorkUnitRepo, WorkUnitStatus,
     WorkUnitWorkspaceRepo, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
 };
@@ -218,6 +218,7 @@ struct CleanupAdmissionFixture {
     agent_id: String,
     work_unit_id: String,
     workspace_id: String,
+    workspace_group_id: String,
     task_version: i64,
 }
 
@@ -231,6 +232,7 @@ async fn cleanup_admission_fixture(db: &SqliteDb, root: &Path) -> CleanupAdmissi
         agent_id: new_uuid_v4(),
         work_unit_id: new_uuid_v4(),
         workspace_id: new_uuid_v4(),
+        workspace_group_id: new_uuid_v4(),
         task_version: 1,
     };
     db::UserRepo::create_user(
@@ -321,6 +323,7 @@ async fn cleanup_admission_fixture(db: &SqliteDb, root: &Path) -> CleanupAdmissi
     TaskRepo::create(
         db,
         CreateTask {
+            repositories: Vec::new(),
             id: fixture.task_id.clone(),
             project_id: fixture.project_id.clone(),
             repo_id: Some(fixture.repo_id.clone()),
@@ -370,6 +373,7 @@ async fn cleanup_admission_fixture(db: &SqliteDb, root: &Path) -> CleanupAdmissi
     WorkUnitRepo::create(
         db,
         CreateWorkUnit {
+            repository_ids: Vec::new(),
             id: fixture.work_unit_id.clone(),
             task_id: fixture.task_id.clone(),
             parent_work_unit_id: None,
@@ -396,6 +400,21 @@ async fn cleanup_admission_fixture(db: &SqliteDb, root: &Path) -> CleanupAdmissi
     )
     .await
     .expect("WorkUnit");
+    WorkspaceRepo::create_group_for_work_unit(
+        db,
+        CreateWorkspaceGroup {
+            id: fixture.workspace_group_id.clone(),
+            task_id: fixture.task_id.clone(),
+            work_unit_id: fixture.work_unit_id.clone(),
+            root_path: root
+                .join(format!("group-{}", fixture.work_unit_id))
+                .to_string_lossy()
+                .into_owned(),
+            created_at: now.clone(),
+        },
+    )
+    .await
+    .expect("WorkUnit WorkspaceGroup");
     WorkUnitWorkspaceRepo::create_for_work_unit(
         db,
         CreateWorkUnitWorkspace {
@@ -417,6 +436,7 @@ async fn cleanup_admission_fixture(db: &SqliteDb, root: &Path) -> CleanupAdmissi
                 updated_at: now,
             },
             work_unit_id: fixture.work_unit_id.clone(),
+            workspace_group_id: fixture.workspace_group_id.clone(),
         },
     )
     .await
@@ -456,6 +476,7 @@ async fn integration_lookup_stays_exact_with_multiple_work_unit_workspaces() {
     WorkUnitRepo::create(
         &db,
         CreateWorkUnit {
+            repository_ids: Vec::new(),
             id: second_work_unit_id.clone(),
             task_id: fixture.task_id.clone(),
             parent_work_unit_id: None,
@@ -482,6 +503,23 @@ async fn integration_lookup_stays_exact_with_multiple_work_unit_workspaces() {
     )
     .await
     .expect("second WorkUnit");
+    let second_workspace_group_id = new_uuid_v4();
+    WorkspaceRepo::create_group_for_work_unit(
+        &db,
+        CreateWorkspaceGroup {
+            id: second_workspace_group_id.clone(),
+            task_id: fixture.task_id.clone(),
+            work_unit_id: second_work_unit_id.clone(),
+            root_path: root
+                .path()
+                .join("second-group")
+                .to_string_lossy()
+                .into_owned(),
+            created_at: now.clone(),
+        },
+    )
+    .await
+    .expect("second WorkUnit WorkspaceGroup");
     let second_workspace = WorkUnitWorkspaceRepo::create_for_work_unit(
         &db,
         CreateWorkUnitWorkspace {
@@ -504,27 +542,33 @@ async fn integration_lookup_stays_exact_with_multiple_work_unit_workspaces() {
                 updated_at: now,
             },
             work_unit_id: second_work_unit_id.clone(),
+            workspace_group_id: second_workspace_group_id,
         },
     )
     .await
     .expect("second WorkUnit Workspace");
 
-    let selected_integration = WorkspaceRepo::get_integration_by_task_id(&db, &fixture.task_id)
-        .await
-        .expect("integration scope lookup")
-        .expect("canonical integration Workspace");
+    let selected_integration =
+        WorkspaceRepo::get_integration_by_task_repo(&db, &fixture.task_id, &fixture.repo_id)
+            .await
+            .expect("integration scope lookup")
+            .expect("canonical integration Workspace");
     assert_eq!(selected_integration.id, integration_workspace.id);
 
     let first_unit_workspace =
-        WorkUnitWorkspaceRepo::get_by_work_unit_id(&db, &fixture.work_unit_id)
+        WorkUnitWorkspaceRepo::list_by_work_unit_id(&db, &fixture.work_unit_id)
             .await
             .expect("first exact WorkUnit Workspace lookup")
+            .into_iter()
+            .next()
             .expect("first WorkUnit Workspace");
     assert_eq!(first_unit_workspace.id, fixture.workspace_id);
     let selected_second_unit =
-        WorkUnitWorkspaceRepo::get_by_work_unit_id(&db, &second_work_unit_id)
+        WorkUnitWorkspaceRepo::list_by_work_unit_id(&db, &second_work_unit_id)
             .await
             .expect("second exact WorkUnit Workspace lookup")
+            .into_iter()
+            .next()
             .expect("second WorkUnit Workspace");
     assert_eq!(selected_second_unit.id, second_workspace.id);
     assert_ne!(selected_second_unit.id, selected_integration.id);
@@ -559,7 +603,7 @@ async fn cleanup_admission_attempt(
             execution,
             work_unit_id: fixture.work_unit_id.clone(),
             work_unit_version: 1,
-            workspace_lease: Some(lease),
+            workspace_leases: vec![lease],
         },
         execution_started_event(task, &execution_id, &fixture.agent_id),
     )
@@ -695,10 +739,11 @@ async fn assert_failed_admission_has_no_execution_lease_or_event(
     expected: DbError,
 ) {
     let execution_id = attempt.execution.id.clone();
-    let lease_id = attempt
-        .workspace_lease
-        .as_ref()
-        .map(|lease| lease.id.clone());
+    let lease_ids = attempt
+        .workspace_leases
+        .iter()
+        .map(|lease| lease.id.clone())
+        .collect::<Vec<_>>();
     let result = WorkUnitExecutionRepo::create_for_work_unit(db, attempt, event_input).await;
     assert!(
         matches!(&result, Err(error) if std::mem::discriminant(error) == std::mem::discriminant(&expected)),
@@ -724,7 +769,7 @@ async fn assert_failed_admission_has_no_execution_lease_or_event(
     assert_eq!(execution_count, 0, "rejected execution was rolled back");
     assert_eq!(lease_count, 0, "rejected lease was rolled back");
     assert_eq!(event_count, 0, "rejected events were rolled back");
-    if let Some(lease_id) = lease_id {
+    for lease_id in lease_ids {
         let lease_by_id: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM workspace_lease WHERE id = ?")
                 .bind(lease_id)
@@ -820,6 +865,7 @@ async fn work_unit_admission_guard_classifies_each_live_rejection_without_partia
     WorkUnitRepo::create(
         &db,
         CreateWorkUnit {
+            repository_ids: Vec::new(),
             id: dependent_work_unit_id.clone(),
             task_id: blocked_dependency.task_id.clone(),
             parent_work_unit_id: None,
@@ -850,6 +896,7 @@ async fn work_unit_admission_guard_classifies_each_live_rejection_without_partia
     WorkUnitRepo::create(
         &db,
         CreateWorkUnit {
+            repository_ids: Vec::new(),
             id: prerequisite_id.clone(),
             task_id: blocked_dependency.task_id.clone(),
             parent_work_unit_id: None,
@@ -908,7 +955,7 @@ async fn work_unit_admission_guard_classifies_each_live_rejection_without_partia
         execution,
         work_unit_id: dependent_work_unit_id.clone(),
         work_unit_version: 2,
-        workspace_lease: None,
+        workspace_leases: Vec::new(),
     };
     let event_input = execution_started_event(
         &blocked_dependency.task_id,
@@ -927,7 +974,7 @@ async fn work_unit_admission_guard_classifies_each_live_rejection_without_partia
     let (mut attempt, mut event_input) = cleanup_admission_attempt(&db, &integration_human).await;
     attempt.execution.actor_ref = Some(ActorRef::Human(integration_human.human_id.clone()));
     attempt.execution.agent_id = None;
-    attempt.workspace_lease = None;
+    attempt.workspace_leases.clear();
     event_input.actor_type = "human".to_owned();
     event_input.actor_id = Some(integration_human.human_id.clone());
     assert_failed_admission_has_no_execution_lease_or_event(
@@ -1080,6 +1127,8 @@ async fn active_task_operation_blocks_work_unit_cleanup_claim() {
         db::CreateTaskIntegrationOperation {
             id: new_uuid_v4(),
             task_id: fixture.task_id.clone(),
+            repo_id: None,
+            repository_merge_batch_id: None,
             kind: db::TaskIntegrationOperationKind::WorkUnitWorkspacePrepare,
             owner_id: fixture.work_unit_id.clone(),
             gate_evaluation_id: None,
@@ -1168,6 +1217,7 @@ async fn work_unit_task_binding_is_immutable_without_provenance() {
         TaskRepo::create(
             &db,
             CreateTask {
+                repositories: Vec::new(),
                 id: id.clone(),
                 project_id: project_id.clone(),
                 repo_id: None,
@@ -1205,6 +1255,7 @@ async fn work_unit_task_binding_is_immutable_without_provenance() {
     WorkUnitRepo::create(
         &db,
         CreateWorkUnit {
+            repository_ids: Vec::new(),
             id: work_unit_id.clone(),
             task_id: task_id.clone(),
             parent_work_unit_id: None,
@@ -1349,6 +1400,7 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
         TaskRepo::create(
             &db,
             CreateTask {
+                repositories: Vec::new(),
                 id: id.clone(),
                 project_id: project_id.clone(),
                 repo_id: Some(repo_id.clone()),
@@ -1432,6 +1484,7 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
 
     let create =
         |id: String, task: &str, creator: &str, requires_integration: bool| CreateWorkUnit {
+            repository_ids: Vec::new(),
             id,
             task_id: task.to_owned(),
             parent_work_unit_id: None,
@@ -1466,6 +1519,7 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
     let provenance = WorkUnitRepo::create(
         &db,
         CreateWorkUnit {
+            repository_ids: Vec::new(),
             id: provenance_id.clone(),
             task_id: task_id.clone(),
             parent_work_unit_id: None,
@@ -1505,6 +1559,7 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
     assert!(WorkUnitRepo::create(
         &db,
         CreateWorkUnit {
+            repository_ids: Vec::new(),
             id: invalid_provenance_id.clone(),
             task_id: task_id.clone(),
             parent_work_unit_id: None,
@@ -1902,6 +1957,18 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
     )
     .await
     .expect("prerequisite is fixed before Workspace preparation");
+    let pinned_workspace_group = WorkspaceRepo::create_group_for_work_unit(
+        &db,
+        CreateWorkspaceGroup {
+            id: new_uuid_v4(),
+            task_id: task_id.clone(),
+            work_unit_id: pinned_unit.clone(),
+            root_path: "/tmp/pr5/workunit-pinned-group".into(),
+            created_at: now.clone(),
+        },
+    )
+    .await
+    .expect("pinned WorkUnit WorkspaceGroup");
     WorkUnitWorkspaceRepo::create_for_work_unit(
         &db,
         CreateWorkUnitWorkspace {
@@ -1917,6 +1984,7 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
                 updated_at: now.clone(),
             },
             work_unit_id: pinned_unit.clone(),
+            workspace_group_id: pinned_workspace_group.id,
         },
     )
     .await
@@ -1986,6 +2054,19 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
     let mut execution_ids = Vec::new();
     for (unit_id, suffix) in [(&d, "d"), (&e, "e")] {
         let workspace_id = new_uuid_v4();
+        let workspace_group_id = new_uuid_v4();
+        WorkspaceRepo::create_group_for_work_unit(
+            &db,
+            CreateWorkspaceGroup {
+                id: workspace_group_id.clone(),
+                task_id: task_id.clone(),
+                work_unit_id: unit_id.clone(),
+                root_path: format!("/tmp/pr5/workunit-group-{suffix}"),
+                created_at: now.clone(),
+            },
+        )
+        .await
+        .expect("WorkUnit WorkspaceGroup");
         WorkUnitWorkspaceRepo::create_for_work_unit(
             &db,
             CreateWorkUnitWorkspace {
@@ -2001,6 +2082,7 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
                     updated_at: now.clone(),
                 },
                 work_unit_id: unit_id.clone(),
+                workspace_group_id,
             },
         )
         .await
@@ -2023,7 +2105,7 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
                 execution,
                 work_unit_id: unit_id.clone(),
                 work_unit_version: 1,
-                workspace_lease: Some(lease),
+                workspace_leases: vec![lease],
             },
             execution_started_event(&task_id, &execution_id, &agent_id),
         )
@@ -2037,13 +2119,17 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
         .expect("latest Task-scoped Execution query");
     assert_eq!(latest_task_execution.len(), 1);
     assert_eq!(latest_task_execution[0].id, task_scoped_execution_id);
-    let lease_d = WorkspaceLeaseRepo::get_active_for_work_unit(&db, &d)
+    let lease_d = WorkspaceLeaseRepo::list_active_for_work_unit(&db, &d)
         .await
         .expect("lease query")
+        .into_iter()
+        .next()
         .expect("D lease active");
-    let lease_e = WorkspaceLeaseRepo::get_active_for_work_unit(&db, &e)
+    let lease_e = WorkspaceLeaseRepo::list_active_for_work_unit(&db, &e)
         .await
         .expect("lease query")
+        .into_iter()
+        .next()
         .expect("E lease active");
     assert_ne!(lease_d.id, lease_e.id);
     assert_ne!(lease_d.workspace_id, lease_e.workspace_id);
@@ -2078,7 +2164,7 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
             execution: over_capacity_execution,
             work_unit_id: over_capacity_work_unit_id,
             work_unit_version: 1,
-            workspace_lease: None,
+            workspace_leases: Vec::new(),
         },
         execution_started_event(&task_id, &over_capacity_execution_id, &agent_id),
     )
@@ -2138,7 +2224,7 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
     assert!(WorkUnitExecutionRepo::create_for_work_unit(
         &db,
         CreateWorkUnitExecution {
-            workspace_lease: Some(work_unit_lease(WorkUnitLeaseBinding {
+            workspace_leases: vec![work_unit_lease(WorkUnitLeaseBinding {
                 task_id: &task_id,
                 project_id: &project_id,
                 repo_id: &repo_id,
@@ -2147,7 +2233,7 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
                 execution_id: &blocked_retry.id,
                 task_version: task.version,
                 agent_id: &agent_id,
-            })),
+            })],
             work_unit_id: unit_d.clone(),
             work_unit_version: 1,
             execution: blocked_retry.clone(),
@@ -2180,14 +2266,14 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
     )
     .await
     .expect("Execution completes");
-    assert!(WorkspaceLeaseRepo::get_active_for_work_unit(&db, &d)
+    assert!(WorkspaceLeaseRepo::list_active_for_work_unit(&db, &d)
         .await
         .expect("D lease query")
-        .is_none());
-    assert!(WorkspaceLeaseRepo::get_active_for_work_unit(&db, &e)
+        .is_empty());
+    assert!(!WorkspaceLeaseRepo::list_active_for_work_unit(&db, &e)
         .await
         .expect("E lease query")
-        .is_some());
+        .is_empty());
 
     WorkUnitRepo::transition(
         &db,
@@ -2397,6 +2483,8 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
         db::CreateTaskIntegrationOperation {
             id: new_uuid_v4(),
             task_id: task_id.clone(),
+            repo_id: None,
+            repository_merge_batch_id: None,
             kind: db::TaskIntegrationOperationKind::IntegrationWorkspaceCleanup,
             owner_id: "project-teardown-guard".into(),
             gate_evaluation_id: None,

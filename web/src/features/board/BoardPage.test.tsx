@@ -39,6 +39,12 @@ describe('BoardPage TaskLifecycle authority', () => {
   const mutateAsync = vi.fn()
   const task = {
     id: 'task-ready',
+    project_id: 'project-1',
+    repo_id: null,
+    repositories: [],
+    repository_set_revision: 0,
+    repository_set_digest: null,
+    repository_merge_batches: [],
     title: 'Lifecycle ready task',
     priority: 2,
     status: 'done',

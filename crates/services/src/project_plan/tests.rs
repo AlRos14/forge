@@ -83,6 +83,7 @@ async fn seed_task(db: &SqliteDb, project_id: &str, title: &str) -> String {
     TaskRepo::create(
         db,
         CreateTask {
+            repositories: Vec::new(),
             id: id.clone(),
             project_id: project_id.to_owned(),
             repo_id: None,
@@ -115,6 +116,7 @@ async fn seed_repo_task(
     TaskRepo::create(
         db,
         CreateTask {
+            repositories: Vec::new(),
             id: id.clone(),
             project_id: project_id.to_owned(),
             repo_id: Some(repo_id.to_owned()),
@@ -277,6 +279,7 @@ async fn seed_repository_work_unit(
     WorkUnitRepo::create(
         db,
         CreateWorkUnit {
+            repository_ids: Vec::new(),
             id: work_unit_id.clone(),
             task_id: task_id.to_owned(),
             parent_work_unit_id: None,
@@ -316,6 +319,19 @@ async fn seed_work_unit_workspace(
     before_sha: &str,
 ) -> db::Workspace {
     let now = now_rfc3339();
+    let workspace_group_id = new_uuid_v4();
+    WorkspaceRepo::create_group_for_work_unit(
+        db,
+        db::CreateWorkspaceGroup {
+            id: workspace_group_id.clone(),
+            task_id: task_id.to_owned(),
+            work_unit_id: work_unit_id.to_owned(),
+            root_path: path.parent().unwrap_or(path).to_string_lossy().into_owned(),
+            created_at: now.clone(),
+        },
+    )
+    .await
+    .expect("WorkUnit WorkspaceGroup creates");
     WorkUnitWorkspaceRepo::create_for_work_unit(
         db,
         CreateWorkUnitWorkspace {
@@ -331,6 +347,7 @@ async fn seed_work_unit_workspace(
                 updated_at: now,
             },
             work_unit_id: work_unit_id.to_owned(),
+            workspace_group_id,
         },
     )
     .await

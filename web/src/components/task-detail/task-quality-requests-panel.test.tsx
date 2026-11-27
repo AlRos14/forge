@@ -25,6 +25,11 @@ vi.mock('@/api/hooks', () => ({
 const task = {
   id: 'task-1',
   project_id: 'project-1',
+  repo_id: null,
+  repositories: [],
+  repository_set_revision: 0,
+  repository_set_digest: null,
+  repository_merge_batches: [],
   title: 'Task',
   description: null,
   version: 1,
@@ -119,7 +124,9 @@ describe('quality route escalation presentation', () => {
       ),
     ).toBeTruthy()
     expect(
-      screen.getByText('Pending role chain: Revisión independiente → Implementación → Revisión independiente'),
+      screen.getByText(
+        'Pending role chain: Revisión independiente → Implementación → Revisión independiente',
+      ),
     ).toBeTruthy()
   })
 })

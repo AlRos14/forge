@@ -1,12 +1,337 @@
 mod common;
 
 use api_types::{
-    AgentResponse, ExecutionResponse, ProjectResponse, TaskResponse, WorkUnitResponse,
+    AgentResponse, ExecutionResponse, ProjectResponse, TaskResponse, ValidationRunResponse,
+    WorkUnitResponse,
 };
 use axum::http::{Method, StatusCode};
 use common::*;
-use serde_json::json;
+use serde_json::{json, Value};
+use std::{path::Path, sync::Arc};
 use tower::ServiceExt;
+
+fn git_head(path: &Path) -> String {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(path)
+        .output()
+        .expect("git resolves HEAD");
+    assert!(output.status.success(), "git rev-parse succeeds");
+    String::from_utf8(output.stdout)
+        .expect("git SHA is UTF-8")
+        .trim()
+        .to_owned()
+}
+
+async fn create_multirepo_task(
+    harness: &Harness,
+    project_id: &str,
+    primary_repo_id: &str,
+    title: &str,
+) -> (TaskResponse, String) {
+    let now = db::now_rfc3339();
+    let affected = db::RepoRepo::create(
+        &*harness.state.db,
+        db::CreateRepo {
+            id: uuid::Uuid::new_v4().to_string(),
+            project_id: project_id.to_owned(),
+            name: "affected".to_owned(),
+            remote_url: "https://example.invalid/affected.git".to_owned(),
+            local_path: None,
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch: "main".to_owned(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("affected repository creates");
+    let task: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({
+            "title": title,
+            "repositories": [
+                { "repo_id": primary_repo_id, "role": "primary" },
+                { "repo_id": affected.id, "role": "affected" }
+            ]
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    (task, affected.id)
+}
+
+#[tokio::test]
+async fn multirepo_result_execution_response_lists_each_repo() {
+    let primary_dir = TestDir::new("multirepo-execution-response-primary");
+    let primary_path = setup_git_repo(primary_dir.path());
+    let affected_dir = TestDir::new("multirepo-execution-response-affected");
+    let affected_path = setup_git_repo(affected_dir.path());
+    let workspace_root = TestDir::new("multirepo-execution-response-workspaces");
+    let harness = test_app(workspace_root.path(), "multirepo-execution-response").await;
+    let (project_id, primary_repo_id) =
+        create_project_and_repo(&harness.app, "Execution response", &primary_path).await;
+    let (task, affected_repo_id) = create_multirepo_task(
+        &harness,
+        &project_id,
+        &primary_repo_id,
+        "Two repository results",
+    )
+    .await;
+    let now = db::now_rfc3339();
+    if db::TaskRoleRepo::get_by_task_and_role(&*harness.state.db, &task.id, "implementer")
+        .await
+        .expect("implementer TaskRole lookup succeeds")
+        .is_none()
+    {
+        db::TaskRoleRepo::create_with_configuration(
+            &*harness.state.db,
+            db::CreateTaskRole {
+                id: uuid::Uuid::new_v4().to_string(),
+                task_id: task.id.clone(),
+                role: "implementer".to_owned(),
+                coordination_mode: Some(db::CoordinationMode::Collaborative),
+                policy_json: "{}".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+            r#"{"schema_version":1,"display_label":null,"capabilities":[],"rework":null}"#,
+        )
+        .await
+        .expect("implementer TaskRole creates");
+    }
+    let work_unit_id = uuid::Uuid::new_v4().to_string();
+    db::WorkUnitRepo::create(
+        &*harness.state.db,
+        db::CreateWorkUnit {
+            id: work_unit_id.clone(),
+            task_id: task.id.clone(),
+            parent_work_unit_id: None,
+            title: "Read repository result rows".to_owned(),
+            scope: "Expose exact results for both writable repositories".to_owned(),
+            execution_instructions: None,
+            role: "implementer".to_owned(),
+            assigned_actor: None,
+            requires_integration: true,
+            provenance: None,
+            artifact_input_ids: Vec::new(),
+            repository_ids: Vec::new(),
+            review_approval_gate_id: None,
+            review_approval_line_id: None,
+            created_by: db::ActorRef::Human("test-user-id".to_owned()),
+            created_at: now.clone(),
+        },
+        db::CreateDomainEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            event_type: "work_unit.created".to_owned(),
+            entity_type: "work_unit".to_owned(),
+            entity_id: work_unit_id.clone(),
+            actor_type: "human".to_owned(),
+            actor_id: Some("test-user-id".to_owned()),
+            scope_type: "task".to_owned(),
+            scope_id: task.id.clone(),
+            correlation_id: work_unit_id.clone(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(format!("work-unit-created:{work_unit_id}")),
+            payload_json: json!({
+                "work_unit_id": work_unit_id,
+                "task_id": task.id,
+            })
+            .to_string(),
+            created_at: now.clone(),
+        },
+    )
+    .await
+    .expect("repository WorkUnit creates");
+    let group_id = uuid::Uuid::new_v4().to_string();
+    let group_root = workspace_root.path().join(format!("group-{group_id}"));
+    tokio::fs::create_dir_all(&group_root)
+        .await
+        .expect("WorkUnit WorkspaceGroup root creates");
+    db::WorkspaceRepo::create_group_for_work_unit(
+        &*harness.state.db,
+        db::CreateWorkspaceGroup {
+            id: group_id.clone(),
+            task_id: task.id.clone(),
+            work_unit_id: work_unit_id.clone(),
+            root_path: group_root.to_string_lossy().into_owned(),
+            created_at: now.clone(),
+        },
+    )
+    .await
+    .expect("WorkUnit WorkspaceGroup creates");
+    let execution_id = uuid::Uuid::new_v4().to_string();
+    let mut results = Vec::new();
+    let mut primary_workspace_id = None;
+    let mut primary_sha = None;
+    for (repo_id, repo_path) in [
+        (primary_repo_id.clone(), primary_path),
+        (affected_repo_id.clone(), affected_path),
+    ] {
+        let sha = git_head(&repo_path);
+        let workspace_id = uuid::Uuid::new_v4().to_string();
+        let workspace = db::WorkUnitWorkspaceRepo::create_for_work_unit(
+            &*harness.state.db,
+            db::CreateWorkUnitWorkspace {
+                workspace: db::CreateWorkspace {
+                    id: workspace_id.clone(),
+                    task_id: task.id.clone(),
+                    repo_id: repo_id.clone(),
+                    worktree_path: group_root.join(&repo_id).to_string_lossy().into_owned(),
+                    branch: format!("agent/{}-{work_unit_id}", task.id),
+                    status: db::WorkspaceStatus::Ready,
+                    before_sha: Some(sha.clone()),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+                work_unit_id: work_unit_id.clone(),
+                workspace_group_id: group_id.clone(),
+            },
+        )
+        .await
+        .expect("WorkUnit Workspace creates");
+        if repo_id == primary_repo_id {
+            primary_workspace_id = Some(workspace.id.clone());
+            primary_sha = Some(sha.clone());
+        }
+        results.push(db::ExecutionRepositoryResult {
+            execution_id: execution_id.clone(),
+            task_id: task.id.clone(),
+            repo_id: repo_id.clone(),
+            workspace_id: workspace.id,
+            before_sha: Some(sha.clone()),
+            after_sha: Some(sha),
+            snapshot_digest: (repo_id != primary_repo_id).then(|| "a".repeat(64)),
+            created_at: now.clone(),
+        });
+    }
+    let primary_workspace_id = primary_workspace_id.expect("primary Workspace exists");
+    let primary_sha = primary_sha.expect("primary Workspace has a base SHA");
+    db::ExecutionRepo::create(
+        &*harness.state.db,
+        db::CreateExecution {
+            id: execution_id.clone(),
+            task_id: task.id.clone(),
+            agent_id: None,
+            actor_ref: None,
+            harness_session_id: None,
+            role: "implementer".to_owned(),
+            status: db::ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Execution creates");
+    sqlx::query(
+        "UPDATE execution
+         SET work_unit_id = ?, work_unit_version = 1, workspace_id = ?,
+             before_sha = ?, after_sha = ?, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(&work_unit_id)
+    .bind(&primary_workspace_id)
+    .bind(&primary_sha)
+    .bind(&primary_sha)
+    .bind(&now)
+    .bind(&execution_id)
+    .execute(harness.state.db.pool())
+    .await
+    .expect("Execution binds to its exact WorkUnit WorkspaceGroup");
+    db::ExecutionRepo::record_repository_results(&*harness.state.db, &execution_id, &results)
+        .await
+        .expect("repository results record");
+
+    let page: api_types::PaginatedResponse<ExecutionResponse> = empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}/executions", task.id),
+        StatusCode::OK,
+    )
+    .await;
+    let response = page
+        .items
+        .iter()
+        .find(|item| item.id == execution_id)
+        .expect("Execution appears in REST response");
+    assert_eq!(response.repository_results.len(), 2);
+    assert!(response
+        .repository_results
+        .iter()
+        .any(|result| result.repo_id == primary_repo_id));
+    assert!(response
+        .repository_results
+        .iter()
+        .any(|result| result.repo_id == affected_repo_id));
+}
+
+#[tokio::test]
+async fn multirepo_result_validation_response_names_exact_repo() {
+    let repo_dir = TestDir::new("multirepo-validation-response-repo");
+    let repo_path = setup_git_repo(repo_dir.path());
+    let workspace_root = TestDir::new("multirepo-validation-response-workspaces");
+    let harness = test_app(workspace_root.path(), "multirepo-validation-response").await;
+    let (project_id, repo_id) =
+        create_project_and_repo(&harness.app, "Validation response", &repo_path).await;
+    let task: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({"title":"Validation names Workspace repository"}),
+        StatusCode::OK,
+    )
+    .await;
+    let now = db::now_rfc3339();
+    let workspace = db::WorkspaceRepo::create(
+        &*harness.state.db,
+        db::CreateWorkspace {
+            id: uuid::Uuid::new_v4().to_string(),
+            task_id: task.id.clone(),
+            repo_id: repo_id.clone(),
+            worktree_path: repo_path.to_string_lossy().into_owned(),
+            branch: "main".to_owned(),
+            status: db::WorkspaceStatus::Ready,
+            before_sha: Some(git_head(&repo_path)),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("validation Workspace creates");
+    let result = services::ValidationService::new(
+        Arc::clone(&harness.state.db),
+        Arc::clone(&harness.state.event_bus),
+    )
+    .run_command(&task.id, &workspace.id, "true", 0, None, None)
+    .await
+    .expect("deterministic validation completes");
+    let response: ValidationRunResponse = empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/validation-runs/{}", result.run.id),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(response.repo_id, repo_id);
+    assert_eq!(response.workspace_id, workspace.id);
+}
 
 #[tokio::test]
 async fn work_unit_api_creates_lists_and_rejects_cross_task_parent() {
@@ -115,6 +440,119 @@ async fn work_unit_api_creates_lists_and_rejects_cross_task_parent() {
     )
     .await;
     assert_eq!(unknown_field.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn multirepo_task_work_unit_accepts_repository_ids() {
+    let repo_dir = TestDir::new("multirepo-work-unit-api-repo");
+    let repo_path = setup_git_repo(repo_dir.path());
+    let workspace_root = TestDir::new("multirepo-work-unit-api-workspaces");
+    let harness = test_app(workspace_root.path(), "multirepo-work-unit-api").await;
+    let (project_id, primary_repo_id) =
+        create_project_and_repo(&harness.app, "Multirepo WorkUnit", &repo_path).await;
+
+    let now = db::now_rfc3339();
+    let affected_repo = db::RepoRepo::create(
+        &*harness.state.db,
+        db::CreateRepo {
+            id: uuid::Uuid::new_v4().to_string(),
+            project_id: project_id.clone(),
+            name: "affected".to_owned(),
+            remote_url: "https://example.invalid/multirepo-affected.git".to_owned(),
+            local_path: None,
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch: "main".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("affected repository creates");
+    let context_repo = db::RepoRepo::create(
+        &*harness.state.db,
+        db::CreateRepo {
+            id: uuid::Uuid::new_v4().to_string(),
+            project_id: project_id.clone(),
+            name: "context".to_owned(),
+            remote_url: "https://example.invalid/multirepo-context.git".to_owned(),
+            local_path: None,
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch: "main".to_owned(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("context repository creates");
+    let task: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({
+            "title": "WorkUnit repository scope",
+            "repositories": [
+                { "repo_id": primary_repo_id, "role": "primary" },
+                { "repo_id": affected_repo.id, "role": "affected" },
+                { "repo_id": context_repo.id, "role": "context" }
+            ]
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let role = format!("multirepo-{}", uuid::Uuid::new_v4());
+    let now = db::now_rfc3339();
+    db::TaskRoleRepo::create(
+        &*harness.state.db,
+        db::CreateTaskRole {
+            id: uuid::Uuid::new_v4().to_string(),
+            task_id: task.id.clone(),
+            role: role.clone(),
+            coordination_mode: None,
+            policy_json: "{}".to_owned(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("TaskRole exists for WorkUnit allocation context");
+
+    let work_unit: WorkUnitResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/work-units", task.id),
+        json!({
+            "title": "Affected repository scope",
+            "scope": "Write only in the affected repository",
+            "role": role,
+            "parent_work_unit_id": null,
+            "assigned_actor": null,
+            "requires_integration": true,
+            "provenance": null,
+            "repository_ids": [affected_repo.id]
+        }),
+        StatusCode::CREATED,
+    )
+    .await;
+    assert_eq!(work_unit.repository_ids, vec![affected_repo.id.clone()]);
+
+    let context_scope: Value = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/work-units", task.id),
+        json!({
+            "title": "Reject context writes",
+            "scope": "Context repositories are read-only",
+            "role": format!("multirepo-context-{}", uuid::Uuid::new_v4()),
+            "parent_work_unit_id": null,
+            "assigned_actor": null,
+            "requires_integration": true,
+            "provenance": null,
+            "repository_ids": [context_repo.id]
+        }),
+        StatusCode::UNPROCESSABLE_ENTITY,
+    )
+    .await;
+    assert_eq!(context_scope["code"], "work_unit.repositories.invalid");
 }
 
 #[tokio::test]

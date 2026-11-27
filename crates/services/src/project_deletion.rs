@@ -103,6 +103,7 @@ mod tests {
         TaskRepo::create(
             &*db,
             CreateTask {
+                repositories: Vec::new(),
                 id: task_id.clone(),
                 project_id: project_id.clone(),
                 repo_id: None,
@@ -185,6 +186,8 @@ mod tests {
             db::CreateTaskIntegrationOperation {
                 id: db::new_uuid_v4(),
                 task_id: task_id.clone(),
+                repo_id: None,
+                repository_merge_batch_id: None,
                 kind: TaskIntegrationOperationKind::IntegrationWorkspaceCleanup,
                 owner_id: "crashed-project-owner".to_owned(),
                 gate_evaluation_id: None,

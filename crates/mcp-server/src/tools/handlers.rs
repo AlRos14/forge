@@ -8,8 +8,9 @@ use db::{
     new_uuid_v4, now_rfc3339, AgentListQuery, AgentProfileRepo, AgentRepo, ArtifactKind,
     CollaborationRepo, CreateProject, ExecutionRepo, GateRepo, GateScopeKind, PageRequest,
     ProjectRepo, RoleMembershipRepo, SortBy, SortOrder, Task, TaskDependencyRepo,
-    TaskLifecycleRepo, TaskListQuery, TaskRepo, TaskRoleRepo, UpdateProject, UpdateTask,
-    ValidationRunRepo, WorkUnitDependency, WorkUnitRepo,
+    TaskLifecycleRepo, TaskListQuery, TaskRepo, TaskRepositoryMergeBatchRepo,
+    TaskRepositorySetRepo, TaskRoleRepo, UpdateProject, UpdateTask, ValidationRunRepo,
+    WorkUnitDependency, WorkUnitRepo, WorkUnitRepositoryIntegrationRepo, WorkspaceRepo,
 };
 use executors::ExecutionOverrides;
 use serde_json::{json, Map, Value};
@@ -31,15 +32,15 @@ use crate::{
         ListWorkUnitsParams, RegisterAgentParams, RemoveTaskDependencyParams, RequestReworkParams,
         ReviewExecutionParams, ReviewTaskParams, ReviseGatePolicyParams,
         SubmitWorkUnitReviewParams, TaskDispatchActionParams, TransitionTaskLifecycleParams,
-        UpdateProjectHooksParams, UpdateProjectParams, UpdateTaskParams, UpdateTaskRoleParams,
-        UpdateWorkUnitParams, ValidationRunParams, ValidationTaskParams, WorkUnitDependencyParams,
-        WorkUnitIdParams, WorkUnitTransitionParams,
+        UpdateProjectHooksParams, UpdateProjectParams, UpdateTaskParams,
+        UpdateTaskRepositoriesParams, UpdateTaskRoleParams, UpdateWorkUnitParams,
+        ValidationRunParams, ValidationTaskParams, WorkUnitDependencyParams, WorkUnitIdParams,
+        WorkUnitTransitionParams,
     },
     protocol::McpContext,
     state::AppState,
     values::{
-        agent_profile_value, agent_value, execution_page_value, execution_value,
-        project_page_value, project_value,
+        agent_profile_value, agent_value, execution_value, project_page_value, project_value,
     },
 };
 
@@ -94,14 +95,28 @@ pub(super) async fn forge_create_task(
             })),
         ));
     }
+    let repositories = params.repositories.map(|repositories| {
+        repositories
+            .into_iter()
+            .map(|repository| db::TaskRepositoryWrite {
+                repo_id: repository.repo_id,
+                role: match repository.role {
+                    api_types::TaskRepositoryRole::Primary => db::TaskRepositoryRole::Primary,
+                    api_types::TaskRepositoryRole::Affected => db::TaskRepositoryRole::Affected,
+                    api_types::TaskRepositoryRole::Context => db::TaskRepositoryRole::Context,
+                },
+            })
+            .collect()
+    });
     let task = state
         .task_service
-        .create_task(
+        .create_task_with_repositories(
             params.project_id,
             params.title,
             params.description,
             params.parent_task_id,
             params.priority,
+            repositories,
             None,
             None,
         )
@@ -302,7 +317,36 @@ pub(super) async fn forge_list_executions(
         page_request(params.cursor, params.limit, None)?,
     )
     .await?;
-    Ok(execution_page_value(page))
+    let mut items = Vec::with_capacity(page.items.len());
+    for execution in page.items {
+        items.push(execution_value_with_repository_results(state, execution).await?);
+    }
+    let has_more = page.next_cursor.is_some();
+    Ok(json!({
+        "items": items,
+        "next_cursor": page.next_cursor,
+        "has_more": has_more,
+        "total_count": page.total_count,
+    }))
+}
+
+async fn execution_value_with_repository_results(
+    state: &AppState,
+    execution: db::Execution,
+) -> Result<Value, McpToolError> {
+    let results = ExecutionRepo::list_repository_results(&*state.db, &execution.id).await?;
+    let mut value = execution_value(execution);
+    value["repository_results"] = json!(results
+        .into_iter()
+        .map(|result| json!({
+            "repo_id": result.repo_id,
+            "workspace_id": result.workspace_id,
+            "before_sha": result.before_sha,
+            "after_sha": result.after_sha,
+            "snapshot_digest": result.snapshot_digest,
+        }))
+        .collect::<Vec<_>>());
+    Ok(value)
 }
 
 pub(super) async fn forge_get_task_dispatch(
@@ -557,7 +601,7 @@ pub(super) async fn forge_create_work_unit(
     });
     let unit = state
         .work_unit_service
-        .create_idempotent(
+        .create_idempotent_with_repository_ids(
             source.clone(),
             services::CreateWorkUnitInput {
                 task_id: params.task_id,
@@ -576,6 +620,7 @@ pub(super) async fn forge_create_work_unit(
                     .map(|subject| subject.reviewed_work_unit_id),
             },
             &params.idempotency_key,
+            params.repository_ids.unwrap_or_default(),
         )
         .await?;
     work_unit_value_for(state, source, unit).await
@@ -630,7 +675,7 @@ pub(super) async fn forge_submit_work_unit_review(
         .await?;
     Ok(json!({
         "review_execution": {
-            "execution": execution_value(execution),
+            "execution": execution_value_with_repository_results(state, execution).await?,
             "report": artifact_value(report.clone())?,
         },
         "report": artifact_value(report)?,
@@ -873,6 +918,33 @@ async fn work_unit_value_for(
     unit: db::WorkUnit,
 ) -> Result<Value, McpToolError> {
     let readiness = state.work_unit_service.readiness(source, &unit.id).await?;
+    let repository_ids = WorkUnitRepo::list_repository_ids(&*state.db, &unit.id).await?;
+    let integrations = WorkUnitRepositoryIntegrationRepo::list_by_work_unit(&*state.db, &unit.id)
+        .await?
+        .into_iter()
+        .map(|integration| {
+            json!({
+                "integration_id": integration.id,
+                "parent_integration_id": integration.work_unit_integration_id,
+                "task_id": integration.task_id,
+                "work_unit_id": integration.work_unit_id,
+                "execution_id": integration.execution_id,
+                "repository_set_revision": integration.repository_set_revision,
+                "repo_id": integration.repo_id,
+                "source_workspace_id": integration.source_workspace_id,
+                "source_branch": integration.source_branch,
+                "source_sha": integration.source_sha,
+                "target_workspace_id": integration.target_workspace_id,
+                "target_branch": integration.target_branch,
+                "target_before_sha": integration.target_before_sha,
+                "target_after_sha": integration.target_after_sha,
+                "outcome": integration.outcome.to_string(),
+                "version": integration.version,
+                "started_at": integration.started_at,
+                "finished_at": integration.finished_at,
+            })
+        })
+        .collect::<Vec<_>>();
     let review_subject = services::task_rework::get_review_subject(&state.db, &unit.id)
         .await?
         .as_ref()
@@ -902,6 +974,8 @@ async fn work_unit_value_for(
             "awaiting_acceptance": readiness.awaiting_acceptance,
         },
         "review_subject": review_subject,
+        "repository_ids": repository_ids,
+        "integrations": integrations,
     }))
 }
 
@@ -1048,8 +1122,11 @@ pub(super) async fn forge_get_project(
 pub(super) async fn forge_update_project(
     state: &AppState,
     params: Value,
+    context: &McpContext,
 ) -> Result<Value, McpToolError> {
     let params: UpdateProjectParams = parse_params(params)?;
+    let user_id = authenticated_user(context)?;
+    require_project_admin_access(state, &params.project_id, user_id).await?;
     if params
         .name
         .as_deref()
@@ -1058,19 +1135,66 @@ pub(super) async fn forge_update_project(
         return Err(McpToolError::new(-32602, "name must not be empty"));
     }
 
-    let project = ProjectRepo::update(
-        &*state.db,
-        UpdateProject {
-            id: params.project_id,
-            name: params.name,
-            settings: None,
-            primary_repo_id: None,
-            paused_at: params.paused.map(|paused| paused.then(now_rfc3339)),
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await?;
+    let project = services::ProjectRepositoryService::new(Arc::clone(&state.db))
+        .update_project_at_version(
+            UpdateProject {
+                id: params.project_id,
+                name: params.name,
+                settings: None,
+                primary_repo_id: params.primary_repo_id,
+                paused_at: params.paused.map(|paused| paused.then(now_rfc3339)),
+                updated_at: now_rfc3339(),
+            },
+            params.version,
+            None,
+            user_id,
+        )
+        .await?;
     project_value(project)
+}
+
+pub(super) async fn forge_update_task_repositories(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let params: UpdateTaskRepositoriesParams = parse_params(params)?;
+    let user_id = authenticated_user(context)?;
+    let task = require_task_access(state, &params.task_id, user_id).await?;
+    if context.copilot_run_id.is_some() {
+        return Err(McpToolError::new(
+            -32003,
+            "Task repository changes are outside the Copilot delegation",
+        ));
+    }
+    if context
+        .project_id
+        .as_deref()
+        .is_some_and(|project_id| project_id != task.project_id)
+    {
+        return Err(McpToolError::new(
+            -32602,
+            "task does not belong to scoped MCP project",
+        ));
+    }
+    require_project_write_access(state, &task.project_id, user_id).await?;
+    let repositories = params
+        .repositories
+        .into_iter()
+        .map(|repository| db::TaskRepositoryWrite {
+            repo_id: repository.repo_id,
+            role: match repository.role {
+                api_types::TaskRepositoryRole::Primary => db::TaskRepositoryRole::Primary,
+                api_types::TaskRepositoryRole::Affected => db::TaskRepositoryRole::Affected,
+                api_types::TaskRepositoryRole::Context => db::TaskRepositoryRole::Context,
+            },
+        })
+        .collect();
+    let task = state
+        .task_service
+        .replace_task_repositories(&params.task_id, params.expected_version, repositories)
+        .await?;
+    task_public_value(state, task).await
 }
 
 pub(super) async fn forge_update_project_hooks(
@@ -1134,7 +1258,7 @@ pub(super) async fn forge_follow_up_execution(
 
     Ok(json!({
         "task": task,
-        "execution": execution_value(launched.execution),
+        "execution": execution_value_with_repository_results(state, launched.execution).await?,
         "workspace": launched.workspace.map(|workspace| json!({
             "id": workspace.id,
             "task_id": workspace.task_id,
@@ -1316,10 +1440,169 @@ async fn task_public_value(state: &AppState, task: Task) -> Result<Value, McpToo
             "updated_at": role.updated_at,
         }));
     }
+    let repository_set = TaskRepositorySetRepo::get_current(&*state.db, &task.id)
+        .await?
+        .ok_or_else(|| McpToolError::not_found("task_repository_set_revision", task.id.clone()))?;
+    let batches = TaskRepositoryMergeBatchRepo::list_by_task(&*state.db, &task.id).await?;
+    let mut batch_repositories = std::collections::BTreeMap::<String, Vec<Value>>::new();
+    let mut repository_merge_batches = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let rows = TaskRepositoryMergeBatchRepo::list_repositories(&*state.db, &batch.id).await?;
+        let batch_rows = rows
+            .into_iter()
+            .map(|row| {
+                let repo_id = row.repo_id.clone();
+                let value = json!({
+                    "batch_id": row.batch_id,
+                    "repo_id": repo_id,
+                    "state": row.state.to_string(),
+                    "integration_id": row.work_unit_repository_integration_id,
+                    "task_merge_operation_id": row.task_merge_operation_id,
+                    "pr_metadata_id": row.pr_metadata_id,
+                    "before_sha": row.before_sha,
+                    "after_sha": row.after_sha,
+                });
+                batch_repositories
+                    .entry(repo_id)
+                    .or_default()
+                    .push(value.clone());
+                value
+            })
+            .collect::<Vec<_>>();
+        repository_merge_batches.push(json!({
+            "id": batch.id,
+            "task_id": batch.task_id,
+            "gate_evaluation_id": batch.gate_evaluation_id,
+            "repository_set_revision": batch.repository_set_revision,
+            "state": batch.state.to_string(),
+            "version": batch.version,
+            "repositories": batch_rows,
+            "created_at": batch.created_at,
+            "updated_at": batch.updated_at,
+        }));
+    }
+    let prs = db::PrMetadataRepo::list_by_task(&*state.db, &task.id).await?;
+    let mut pull_requests_by_id = std::collections::BTreeMap::new();
+    for pr in prs {
+        if let Some(repo_id) = pr.repo_id.clone() {
+            pull_requests_by_id.insert(
+                pr.id.clone(),
+                json!({
+                    "repo_id": repo_id,
+                    "admission_id": pr.task_merge_operation_id,
+                    "pr_metadata_id": pr.id,
+                    "provider_type": pr.provider_type,
+                    "provider_pr_id": pr.provider_pr_id,
+                    "pr_url": pr.pr_url,
+                    "pr_state": pr.pr_state,
+                    "merge_status": pr.merge_status,
+                    "admission_status": pr.admission_status,
+                }),
+            );
+        }
+    }
+    let work_units = WorkUnitRepo::list_by_task(&*state.db, &task.id).await?;
+    let mut integrations = std::collections::BTreeMap::<String, (String, Value)>::new();
+    for unit in work_units {
+        for integration in
+            WorkUnitRepositoryIntegrationRepo::list_by_work_unit(&*state.db, &unit.id).await?
+        {
+            if integration.repository_set_revision == repository_set.revision {
+                let replace = integrations
+                    .get(&integration.repo_id)
+                    .is_none_or(|(updated_at, _)| updated_at <= &integration.updated_at);
+                if replace {
+                    let outcome = match integration.outcome {
+                        db::WorkUnitRepositoryIntegrationOutcome::Running => "pending",
+                        db::WorkUnitRepositoryIntegrationOutcome::Success => "success",
+                        db::WorkUnitRepositoryIntegrationOutcome::Unchanged => "unchanged",
+                        db::WorkUnitRepositoryIntegrationOutcome::Conflict => "conflict",
+                        db::WorkUnitRepositoryIntegrationOutcome::Failed
+                        | db::WorkUnitRepositoryIntegrationOutcome::Rejected => "failed",
+                    };
+                    integrations.insert(
+                        integration.repo_id.clone(),
+                        (
+                            integration.updated_at.clone(),
+                            json!({
+                                "repo_id": integration.repo_id,
+                                "integration_id": integration.id,
+                                "outcome": outcome,
+                                "before_sha": integration.target_before_sha,
+                                "after_sha": integration.target_after_sha,
+                            }),
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    let current_revision_has_batch = repository_merge_batches
+        .iter()
+        .any(|batch| batch["repository_set_revision"] == repository_set.revision);
+    let repositories = repository_set
+        .repositories
+        .into_iter()
+        .map(|repository| {
+            let merge_rows = batch_repositories
+                .get(&repository.repo_id)
+                .into_iter()
+                .flatten()
+                .filter(|row| {
+                    repository_merge_batches.iter().any(|batch| {
+                        batch["id"] == row["batch_id"]
+                            && batch["repository_set_revision"] == repository_set.revision
+                    })
+                })
+                .collect::<Vec<_>>();
+            let merge = merge_rows.last().map(|row| (*row).clone());
+            let inferred_integration = (current_revision_has_batch
+                && repository.role != db::TaskRepositoryRole::Context)
+                .then(|| {
+                    json!({
+                        "repo_id": repository.repo_id.clone(),
+                        "integration_id": null,
+                        "outcome": "unchanged",
+                        "before_sha": null,
+                        "after_sha": null,
+                    })
+                });
+            let integration = integrations
+                .get(&repository.repo_id)
+                .map(|(_, integration)| integration)
+                .or(inferred_integration.as_ref());
+            let change_state = if merge.is_some() {
+                "changed"
+            } else if repository.role == db::TaskRepositoryRole::Context
+                || current_revision_has_batch
+            {
+                "unchanged"
+            } else {
+                "pending"
+            };
+            let pull_request = merge
+                .as_ref()
+                .and_then(|row| row["pr_metadata_id"].as_str())
+                .and_then(|metadata_id| pull_requests_by_id.get(metadata_id));
+            json!({
+                "repo_id": repository.repo_id,
+                "role": repository.role.to_string(),
+                "position": repository.position,
+                "change_state": change_state,
+                "integration": integration,
+                "merge": merge,
+                "pull_request": pull_request,
+            })
+        })
+        .collect::<Vec<_>>();
     Ok(json!({
         "id": task.id,
         "project_id": task.project_id,
         "repo_id": task.repo_id,
+        "repositories": repositories,
+        "repository_set_revision": repository_set.revision,
+        "repository_set_digest": repository_set.digest,
+        "repository_merge_batches": repository_merge_batches,
         "parent_task_id": task.parent_task_id,
         "title": task.title,
         "description": task.description,
@@ -1815,7 +2098,7 @@ fn coordination_request_value(request: &db::TaskCoordinationRequest) -> Value {
     })
 }
 fn coordination_plan_value(plan: &services::task_coordination::PlanView) -> Value {
-    json!({
+    let mut value = json!({
         "artifact_id": plan.plan.artifact_id,
         "task_id": plan.plan.task_id,
         "request_id": plan.plan.request_id,
@@ -1842,7 +2125,11 @@ fn coordination_plan_value(plan: &services::task_coordination::PlanView) -> Valu
         "version": plan.plan.version,
         "created_at": plan.plan.created_at,
         "updated_at": plan.plan.updated_at,
-    })
+    });
+    if let Some(repository_set) = plan.parsed.repository_set.as_ref() {
+        value["repository_set"] = json!(repository_set);
+    }
+    value
 }
 async fn coordination_overview_value(
     state: &AppState,
@@ -2569,7 +2856,10 @@ async fn review_execution_value(
     )
     .await?;
     let report = report.map(artifact_value).transpose()?;
-    Ok(json!({"execution": execution_value(execution), "report": report}))
+    Ok(json!({
+        "execution": execution_value_with_repository_results(state, execution).await?,
+        "report": report,
+    }))
 }
 
 pub(super) async fn forge_list_validation_runs(
@@ -2600,12 +2890,16 @@ async fn validation_run_value(
     state: &AppState,
     run: db::ValidationRun,
 ) -> Result<Value, McpToolError> {
+    let workspace = WorkspaceRepo::get_by_id(&*state.db, &run.workspace_id)
+        .await?
+        .ok_or_else(|| McpToolError::not_found("workspace", run.workspace_id.clone()))?;
     let evidence = ValidationRunRepo::list_evidence_for_validation_run(&*state.db, &run.id).await?;
     let artifact =
         ValidationRunRepo::get_validation_run_artifact_output(&*state.db, &run.id).await?;
     Ok(json!({
         "id": run.id,
         "task_id": run.task_id,
+        "repo_id": workspace.repo_id,
         "work_unit_id": run.work_unit_id,
         "caused_by_execution_id": run.caused_by_execution_id,
         "check_identity": run.check_identity,

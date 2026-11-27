@@ -71,6 +71,34 @@ impl From<ServiceError> for McpToolError {
                 -32002,
                 format!("project {project_id} has no primary repo configured"),
             ),
+            ServiceError::TaskRepositoriesInvalid => {
+                Self::new(-32602, "Task repository scope is invalid")
+                    .with_data(json!({ "code": "task.repositories.invalid" }))
+            }
+            ServiceError::TaskRepositoryNotInProject => {
+                Self::new(-32602, "Task repositories must belong to the Task Project")
+                    .with_data(json!({ "code": "task.repositories.repo_not_in_project" }))
+            }
+            ServiceError::TaskRepositoryReplanRequired => {
+                Self::new(-32009, "Task repository scope requires an authorized replan")
+                    .with_data(json!({ "code": "task.repositories.replan_required" }))
+            }
+            ServiceError::TaskRepositoryReplanRemovalBlocked { repo_id } => Self::new(
+                -32009,
+                format!("repository {repo_id} still has in-flight work"),
+            )
+            .with_data(json!({
+                "code": "task.repositories.replan_removal_blocked",
+                "repo_id": repo_id,
+            })),
+            ServiceError::WorkUnitRepositoriesInvalid => {
+                Self::new(-32602, "WorkUnit repositories must be writable repositories of its Task")
+                    .with_data(json!({ "code": "work_unit.repositories.invalid" }))
+            }
+            ServiceError::ProjectPrimaryRepoNotInProject => {
+                Self::new(-32602, "the primary repository must belong to the Project")
+                    .with_data(json!({ "code": "project.primary_repo_not_in_project" }))
+            }
             ServiceError::RepoMismatch { project_id } => Self::new(
                 -32002,
                 format!("provided repo_id does not match project {project_id} primary repo"),

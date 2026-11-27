@@ -142,6 +142,20 @@ impl ProjectRepo for SqliteDb {
         if let Some(paused_at) = input.paused_at {
             project.paused_at = paused_at;
         }
+        if let Some(repo_id) = project.primary_repo_id.as_deref() {
+            let belongs_to_project: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM repo WHERE id = ? AND project_id = ?)",
+            )
+            .bind(repo_id)
+            .bind(&project.id)
+            .fetch_one(&self.pool)
+            .await?;
+            if belongs_to_project == 0 {
+                return Err(DbError::Check(
+                    "project.primary_repo_not_in_project".to_owned(),
+                ));
+            }
+        }
         project.updated_at = input.updated_at;
         sqlx::query(
             "UPDATE project SET name = ?, settings = ?, primary_repo_id = ?, paused_at = ?, project_hooks_json = ?, project_work_epoch = ?, updated_at = ? WHERE id = ?",
@@ -202,6 +216,20 @@ impl ProjectRepo for SqliteDb {
         }
         if let Some(project_hooks_json) = project_hooks_json {
             project.project_hooks_json = project_hooks_json;
+        }
+        if let Some(repo_id) = project.primary_repo_id.as_deref() {
+            let belongs_to_project: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM repo WHERE id = ? AND project_id = ?)",
+            )
+            .bind(repo_id)
+            .bind(&project.id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if belongs_to_project == 0 {
+                return Err(DbError::Check(
+                    "project.primary_repo_not_in_project".to_owned(),
+                ));
+            }
         }
         project.updated_at = input.updated_at;
         let result = sqlx::query(
@@ -387,8 +415,6 @@ impl ProjectRepo for SqliteDb {
                  (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM task_coordinator_replan WHERE task_id IN
                  (SELECT id FROM task WHERE project_id = ?)",
-            "DELETE FROM human_decision_request WHERE task_id IN
-                 (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM validation_comparison WHERE task_id IN
                  (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM validation_check_request WHERE task_id IN
@@ -407,6 +433,10 @@ impl ProjectRepo for SqliteDb {
                  (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM remote_pr_admission WHERE task_id IN
                  (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM task_repository_merge_batch_repo WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM work_unit_repository_integration WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM legacy_pr_history WHERE task_id IN
                  (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM pr_metadata WHERE task_id IN
@@ -419,6 +449,8 @@ impl ProjectRepo for SqliteDb {
                  (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM task_integration_operation WHERE task_id IN
                  (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM task_repository_merge_batch WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM task_lifecycle_transition WHERE task_id IN
                  (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM task_dispatch_receipt WHERE task_id IN
@@ -426,6 +458,24 @@ impl ProjectRepo for SqliteDb {
             "DELETE FROM task_dispatch WHERE task_id IN
                  (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM task_rework_receipt WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM work_unit_result_requirement_repository WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM work_unit_review_subject_repository WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM execution_repository_result WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM task_repository_context_snapshot WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM work_unit_repository_set_revision WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM task_repository_set_revision_repo WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM task_repository_set_revision WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM human_decision_request WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM workspace_group WHERE task_id IN
                  (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM work_unit_result_requirement WHERE task_id IN
                  (SELECT id FROM task WHERE project_id = ?)",

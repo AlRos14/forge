@@ -196,6 +196,7 @@ impl TaskCoordinationService {
             &self.event_bus,
             EnqueueCheckRequest {
                 task_id: request.task_id.clone(),
+                repo_id: output.subject.repo_id,
                 check_key: output.check_key,
                 trigger: db::ValidationCheckRequestTrigger::CoordinatorRequest,
                 subject_kind,
@@ -244,6 +245,10 @@ impl TaskCoordinationService {
                 check.check_definition_id.clone(),
             )
         })?;
+        let workspace = db::WorkspaceRepo::get_by_id(&*self.db, &check.workspace_id)
+            .await?
+            .filter(|workspace| workspace.task_id == request.task_id)
+            .ok_or_else(|| ServiceError::not_found("workspace", check.workspace_id.clone()))?;
         let subject_version = match check.subject_kind {
             ValidationCheckSubjectKind::WorkUnitResult => {
                 WorkUnitRepo::get_by_id(&*self.db, &check.subject_id)
@@ -264,6 +269,7 @@ impl TaskCoordinationService {
             &self.event_bus,
             EnqueueCheckRequest {
                 task_id: request.task_id.clone(),
+                repo_id: workspace.repo_id,
                 check_key: definition.check_key,
                 trigger: db::ValidationCheckRequestTrigger::CoordinatorRequest,
                 subject_kind: check.subject_kind,
@@ -922,7 +928,7 @@ mod rt_tests {
         let output = json!({
             "type": "request_validation",
             "check_key": "unit",
-            "subject": {"kind": "work_unit_result", "id": "wu", "version": 3},
+            "subject": {"kind": "work_unit_result", "id": "wu", "version": 3, "repo_id": "repo"},
             "baseline": true,
             "reason": "touches validation",
         });

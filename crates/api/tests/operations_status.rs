@@ -125,6 +125,7 @@ async fn seed_blocked_task(harness: &common::Harness, title: &str) -> String {
     db::TaskRepo::create(
         &*harness.state.db,
         db::CreateTask {
+            repositories: Vec::new(),
             id: task_id.clone(),
             project_id: project.id,
             repo_id: Some(repo.id),

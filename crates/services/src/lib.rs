@@ -43,6 +43,7 @@ pub mod project_deletion;
 pub mod project_hooks;
 pub mod project_member_service;
 pub mod project_plan;
+pub mod project_repository_service;
 pub mod provider_authorization;
 pub mod recovery;
 pub mod release_history;
@@ -107,6 +108,7 @@ pub use orchestrator_runtime::{OrchestratorRun, OrchestratorRuntime};
 pub use project_copilot::ProjectCopilotService;
 pub use project_hooks::ProjectHookService;
 pub use project_member_service::ProjectMemberService;
+pub use project_repository_service::ProjectRepositoryService;
 pub use provider_authorization::ProviderAuthorizationService;
 pub use recovery::{CrashRecovery, HeartbeatMonitor};
 pub use release_history::HistoricalReleaseReader;
@@ -183,6 +185,24 @@ pub enum ServiceError {
 
     #[error("project {project_id} has no primary repo")]
     MissingPrimaryRepo { project_id: String },
+
+    #[error("Task repositories are invalid")]
+    TaskRepositoriesInvalid,
+
+    #[error("a Task repository does not belong to the Project")]
+    TaskRepositoryNotInProject,
+
+    #[error("Task repository scope cannot change after an Execution or invalidate an explicit WorkUnit repository selection")]
+    TaskRepositoryReplanRequired,
+
+    #[error("Task repository {repo_id} still has in-flight work and cannot be removed by replan")]
+    TaskRepositoryReplanRemovalBlocked { repo_id: String },
+
+    #[error("WorkUnit repository scope is invalid")]
+    WorkUnitRepositoriesInvalid,
+
+    #[error("the Project primary repository must belong to the Project")]
+    ProjectPrimaryRepoNotInProject,
 
     #[error("repo does not match primary repo for project {project_id}")]
     RepoMismatch { project_id: String },
@@ -287,6 +307,18 @@ impl From<db::DbError> for ServiceError {
                 code: "validation.workspace_leased",
                 message: error.to_string(),
             },
+            db::DbError::TaskRepositoryReplanBaseStale => Self::Coordination {
+                code: "coordination.authorization_stale",
+                message: "the repository-set revision changed after this replan was proposed"
+                    .to_owned(),
+            },
+            db::DbError::TaskRepositoryReplanPrimaryImmutable => Self::Coordination {
+                code: "task.repositories.replan_primary_immutable",
+                message: "coordinator replan cannot change the Task primary repository".to_owned(),
+            },
+            db::DbError::TaskRepositoryReplanRemovalBlocked { repo_id } => {
+                Self::TaskRepositoryReplanRemovalBlocked { repo_id }
+            }
             error => Self::Db(error),
         }
     }

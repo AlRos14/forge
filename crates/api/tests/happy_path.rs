@@ -134,9 +134,11 @@ async fn forge_happy_path_end_to_end() {
     let execution_id = execution.id.clone();
 
     let source_workspace =
-        db::WorkUnitWorkspaceRepo::get_by_work_unit_id(&*harness.state.db, &work_unit.id)
+        db::WorkUnitWorkspaceRepo::list_by_work_unit_id(&*harness.state.db, &work_unit.id)
             .await
             .expect("WorkUnit Workspace lookup succeeds")
+            .into_iter()
+            .next()
             .expect("Execution created its exact WorkUnit Workspace");
     let source_worktree_path = PathBuf::from(&source_workspace.worktree_path);
     poll_until_workspace_written(
@@ -181,16 +183,18 @@ async fn forge_happy_path_end_to_end() {
         StatusCode::OK,
     )
     .await;
+    assert_eq!(integration.repo_id, repo_id);
     assert_eq!(
         integration.outcome,
         api_types::WorkUnitIntegrationOutcome::Success
     );
     assert!(integration.target_after_sha.is_some());
 
-    let workspace = WorkspaceRepo::get_integration_by_task_id(&*harness.state.db, &task_id)
-        .await
-        .expect("Task Workspace lookup succeeds")
-        .expect("WorkUnit integration created the Task integration Workspace");
+    let workspace =
+        WorkspaceRepo::get_integration_by_task_repo(&*harness.state.db, &task_id, &repo_id)
+            .await
+            .expect("primary repository Workspace lookup succeeds")
+            .expect("WorkUnit integration created the Task integration Workspace");
     let worktree_path = PathBuf::from(&workspace.worktree_path);
     assert!(worktree_path.join("greeting.txt").exists());
     let validation = services::ValidationService::new(
@@ -522,6 +526,95 @@ async fn forge_happy_path_end_to_end() {
 }
 
 #[tokio::test]
+async fn multirepo_workspace_single_repo_preserves_legacy_scalar_response() {
+    let repo_dir = TestDir::new("multirepo-single-response-repo");
+    let repo_path = setup_git_repo(repo_dir.path()).await;
+    let workspaces_root = TestDir::new("multirepo-single-response-workspaces");
+    let harness = test_app(workspaces_root.path()).await;
+    let project: ProjectResponse = json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        json!({"name":"Single repository response regression"}),
+        StatusCode::OK,
+    )
+    .await;
+    let default_branch = run_git(&repo_path, &["symbolic-ref", "--short", "HEAD"]);
+    let repo: RepoResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/repos", project.id),
+        json!({
+            "name":"repo",
+            "local_path":repo_path.to_string_lossy(),
+            "remote_url":repo_path.to_string_lossy(),
+            "default_branch":default_branch
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let task: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/tasks", project.id),
+        json!({"title":"Single repository scalar contract"}),
+        StatusCode::OK,
+    )
+    .await;
+    let daemon_id = register_daemon_and_report_shell(&harness.app, workspaces_root.path()).await;
+    let agent: AgentResponse = json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/agents",
+        json!({
+            "name":"single-repository-agent",
+            "executor_type":"shell",
+            "daemon_id":daemon_id
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    assign_agent_as_implementer(&harness.state, &task.id, &agent.id).await;
+    let work_unit = common::create_allocated_work_unit(
+        &harness.app,
+        &task.id,
+        "implementer",
+        &agent.id,
+        "Write one repository result",
+        "Write and commit one file in the selected repository",
+        true,
+    )
+    .await;
+    let execution = common::launch_work_unit_execution(
+        &harness.app,
+        &task.id,
+        &work_unit,
+        Some("printf single > single.txt && git add single.txt && git commit -m single"),
+    )
+    .await;
+    poll_until_execution_completed(&harness.state.db, &execution.id).await;
+    let response: ExecutionResponse = empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/executions/{}", execution.id),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(response.status, ExecutionStatus::Completed);
+    assert_eq!(response.repository_results.len(), 1);
+    let result = &response.repository_results[0];
+    assert_eq!(result.repo_id, repo.id);
+    assert_eq!(result.before_sha, response.before_sha);
+    assert_eq!(result.after_sha, response.after_sha);
+    assert_eq!(
+        Some(result.workspace_id.as_str()),
+        response.workspace_id.as_deref()
+    );
+    assert!(response.before_sha.is_some());
+    assert!(response.after_sha.is_some());
+}
+
+#[tokio::test]
 async fn request_changes_report_leaves_lifecycle_to_gate_and_orchestration() {
     let repo_dir = TestDir::new("forge-autonomous-repo");
     let repo_path = setup_git_repo(repo_dir.path()).await;
@@ -635,9 +728,11 @@ async fn request_changes_report_leaves_lifecycle_to_gate_and_orchestration() {
     );
 
     let source_workspace =
-        db::WorkUnitWorkspaceRepo::get_by_work_unit_id(&*harness.state.db, &work_unit.id)
+        db::WorkUnitWorkspaceRepo::list_by_work_unit_id(&*harness.state.db, &work_unit.id)
             .await
             .expect("WorkUnit Workspace lookup succeeds")
+            .into_iter()
+            .next()
             .expect("Execution prepared its exact WorkUnit Workspace");
     let request_changes = submit_human_review(
         &harness.app,
@@ -1415,4 +1510,310 @@ impl Drop for TestDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
     }
+}
+
+#[tokio::test]
+async fn multirepo_task_create_request_omission_and_explicit_repositories() {
+    let repo_dir = TestDir::new("multirepo-task-api-repo");
+    let repo_path = setup_git_repo(repo_dir.path()).await;
+    let workspace_root = TestDir::new("multirepo-task-api-workspaces");
+    let harness = test_app(workspace_root.path()).await;
+    let (project_id, primary_repo_id) =
+        common::create_project_and_repo(&harness.app, "Multirepo Task API", &repo_path).await;
+
+    let now = db::now_rfc3339();
+    let affected_repo = db::RepoRepo::create(
+        &*harness.state.db,
+        db::CreateRepo {
+            id: uuid::Uuid::new_v4().to_string(),
+            project_id: project_id.clone(),
+            name: "affected".to_owned(),
+            remote_url: "https://example.invalid/affected.git".to_owned(),
+            local_path: None,
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch: "main".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("affected repository creates");
+    let context_repo = db::RepoRepo::create(
+        &*harness.state.db,
+        db::CreateRepo {
+            id: uuid::Uuid::new_v4().to_string(),
+            project_id: project_id.clone(),
+            name: "context".to_owned(),
+            remote_url: "https://example.invalid/context.git".to_owned(),
+            local_path: None,
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch: "main".to_owned(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("context repository creates");
+
+    let omitted: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({ "title": "Omitted repositories" }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(omitted.repo_id.as_deref(), Some(primary_repo_id.as_str()));
+    assert_eq!(omitted.repositories.len(), 1);
+    assert_eq!(omitted.repositories[0].repo_id, primary_repo_id);
+    assert_eq!(
+        omitted.repositories[0].role,
+        api_types::TaskRepositoryRole::Primary
+    );
+
+    let explicit: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({
+            "title": "Explicit repositories",
+            "repositories": [
+                { "repo_id": primary_repo_id, "role": "primary" },
+                { "repo_id": affected_repo.id, "role": "affected" },
+                { "repo_id": context_repo.id, "role": "context" }
+            ]
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(explicit.repositories.len(), 3);
+    assert_eq!(explicit.repository_set_revision, 1);
+    assert!(explicit.repository_set_digest.is_some());
+    assert_eq!(
+        explicit.repositories[0].role,
+        api_types::TaskRepositoryRole::Primary
+    );
+    assert_eq!(explicit.repositories[0].repo_id, primary_repo_id);
+    assert_eq!(explicit.repositories[0].position, 0);
+    assert_eq!(
+        explicit.repositories[0].change_state,
+        api_types::TaskRepositoryChangeState::Pending
+    );
+    assert_eq!(
+        explicit.repositories[1].role,
+        api_types::TaskRepositoryRole::Affected
+    );
+    assert_eq!(explicit.repositories[1].repo_id, affected_repo.id);
+    assert_eq!(
+        explicit.repositories[2].role,
+        api_types::TaskRepositoryRole::Context
+    );
+    assert_eq!(explicit.repositories[2].repo_id, context_repo.id);
+    assert_eq!(
+        explicit.repositories[2].change_state,
+        api_types::TaskRepositoryChangeState::Unchanged
+    );
+
+    let repo_less: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({ "title": "Explicit repo-less", "repositories": [] }),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(repo_less.repo_id.is_none());
+    assert!(repo_less.repositories.is_empty());
+    assert_eq!(repo_less.lifecycle.state, TaskLifecycleState::Backlog);
+
+    let updated: TaskResponse = json_request(
+        &harness.app,
+        Method::PATCH,
+        &format!("/api/v1/tasks/{}/repositories", repo_less.id),
+        json!({
+            "expected_version": repo_less.version,
+            "repositories": [
+                { "repo_id": primary_repo_id, "role": "primary" },
+                { "repo_id": affected_repo.id, "role": "affected" }
+            ]
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(updated.repo_id.as_deref(), Some(primary_repo_id.as_str()));
+    assert_eq!(updated.repositories.len(), 2);
+    assert_eq!(
+        updated.repository_set_revision,
+        repo_less.repository_set_revision + 1
+    );
+    assert!(updated.repository_set_digest.is_some());
+    assert!(updated.version > repo_less.version);
+}
+
+#[tokio::test]
+async fn multirepo_lifecycle_direct_repository_patch_keeps_typed_409() {
+    let repo_dir = TestDir::new("multirepo-replan-patch-primary");
+    let repo_path = setup_git_repo(repo_dir.path()).await;
+    let workspaces_root = TestDir::new("multirepo-replan-patch-workspaces");
+    let harness = test_app(workspaces_root.path()).await;
+    let project: ProjectResponse = json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        json!({"name":"Direct repository patch regression"}),
+        StatusCode::OK,
+    )
+    .await;
+    let primary_repo: RepoResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/repos", project.id),
+        json!({
+            "name":"primary",
+            "local_path":repo_path.to_string_lossy(),
+            "remote_url":repo_path.to_string_lossy(),
+            "default_branch":run_git(&repo_path, &["symbolic-ref", "--short", "HEAD"])
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let task: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/tasks", project.id),
+        json!({"title":"Repository scope stays pinned after execution"}),
+        StatusCode::OK,
+    )
+    .await;
+    let (agent_id, _) = common::create_shell_agents(
+        &harness.app,
+        workspaces_root.path(),
+        "multirepo-replan-patch",
+    )
+    .await;
+    assign_test_user_as_reviewer(&harness.state, &task.id).await;
+    assign_agent_as_implementer(&harness.state, &task.id, &agent_id).await;
+    let work_unit = common::create_allocated_work_unit(
+        &harness.app,
+        &task.id,
+        "implementer",
+        &agent_id,
+        "Create a result",
+        "Write and commit the requested result file",
+        true,
+    )
+    .await;
+    let execution = common::launch_work_unit_execution(
+        &harness.app,
+        &task.id,
+        &work_unit,
+        Some("echo result > result.txt && git add . && git commit -m result"),
+    )
+    .await;
+    poll_until_execution_completed(&harness.state.db, &execution.id).await;
+
+    let affected_dir = TestDir::new("multirepo-replan-patch-affected");
+    let affected_path = setup_git_repo(affected_dir.path()).await;
+    let now = db::now_rfc3339();
+    let affected_repo = db::RepoRepo::create(
+        &*harness.state.db,
+        db::CreateRepo {
+            id: uuid::Uuid::new_v4().to_string(),
+            project_id: project.id.clone(),
+            name: "affected".to_owned(),
+            local_path: Some(affected_path.to_string_lossy().into_owned()),
+            remote_url: affected_path.to_string_lossy().into_owned(),
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch: run_git(&affected_path, &["symbolic-ref", "--short", "HEAD"]),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("non-primary affected repository creates");
+    let current_task: TaskResponse = empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}", task.id),
+        StatusCode::OK,
+    )
+    .await;
+    let response = raw_json_request(
+        &harness.app,
+        Method::PATCH,
+        &format!("/api/v1/tasks/{}/repositories", task.id),
+        json!({
+            "expected_version": current_task.version,
+            "repositories": [
+                {"repo_id":primary_repo.id,"role":"primary"},
+                {"repo_id":affected_repo.id,"role":"affected"}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let error: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error response body reads"),
+    )
+    .expect("error response is JSON");
+    assert_eq!(error["code"], "task.repositories.replan_required");
+}
+
+#[tokio::test]
+async fn multirepo_lifecycle_single_repo_task_response_projection() {
+    let repo_dir = TestDir::new("single-repo-response-primary");
+    let repo_path = setup_git_repo(repo_dir.path()).await;
+    let workspaces_root = TestDir::new("single-repo-response-workspaces");
+    let harness = test_app(workspaces_root.path()).await;
+    let project: ProjectResponse = json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        json!({"name":"Single repository response regression"}),
+        StatusCode::OK,
+    )
+    .await;
+    let repository: RepoResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/repos", project.id),
+        json!({
+            "name":"primary",
+            "local_path":repo_path.to_string_lossy(),
+            "remote_url":repo_path.to_string_lossy(),
+            "default_branch":run_git(&repo_path, &["symbolic-ref", "--short", "HEAD"])
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let created: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/tasks", project.id),
+        json!({"title":"Keep the 0.9.1 single-repository projection"}),
+        StatusCode::OK,
+    )
+    .await;
+    let task: TaskResponse = empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}", created.id),
+        StatusCode::OK,
+    )
+    .await;
+
+    assert_eq!(task.repo_id.as_deref(), Some(repository.id.as_str()));
+    assert_eq!(task.repositories.len(), 1);
+    assert_eq!(task.repositories[0].repo_id, repository.id);
+    assert_eq!(task.repositories[0].position, 0);
+    assert!(task.repositories[0].merge.is_none());
+    assert!(task.repositories[0].pull_request.is_none());
+    assert!(task.repositories[0].integration.is_none());
+    assert!(task.repository_merge_batches.is_empty());
+    assert_eq!(
+        task.repositories[0].change_state,
+        api_types::TaskRepositoryChangeState::Pending
+    );
 }

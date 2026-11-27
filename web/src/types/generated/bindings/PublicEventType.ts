@@ -5,6 +5,11 @@
  */
 export type PublicEventType =
   | 'task.lifecycle_changed'
+  | 'task.repositories_changed'
+  | 'task.repository_set_replanned'
+  | 'work_unit.repository_integration_changed'
+  | 'task.repository_merge_batch_changed'
+  | 'task.repository_pr_status_changed'
   | 'gate.created'
   | 'gate.policy_revised'
   | 'gate.evaluated'
@@ -12,6 +17,7 @@ export type PublicEventType =
   | 'execution.completed'
   | 'execution.failed'
   | 'execution.cancelled'
+  | 'execution.repository_results_recorded'
   | 'execution.stalled'
   | 'validation_run.started'
   | 'validation_run.completed'

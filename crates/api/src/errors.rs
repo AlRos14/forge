@@ -280,6 +280,7 @@ impl From<ServiceError> for ApiError {
                             | "validation.subject_not_resolvable"
                             | "human_decision.invalid_options"
                             | "human_decision.evidence_invalid"
+                            | "coordination.coordinator_harness_unsupported"
                             | "pr_feedback.extend_out_of_scope"
                             | "pr_feedback.plan_without_extend"
                     )
@@ -313,6 +314,33 @@ impl From<ServiceError> for ApiError {
             ServiceError::MissingPrimaryRepo { project_id } => Self::conflict_with_code(
                 "missing_primary_repo",
                 format!("project {project_id} has no primary repo"),
+            ),
+            ServiceError::TaskRepositoriesInvalid => Self::bad_request_with_code(
+                "task.repositories.invalid",
+                "a non-empty Task repository set must have exactly one primary and no duplicate repository IDs",
+            ),
+            ServiceError::TaskRepositoryNotInProject => Self::unprocessable(
+                "task.repositories.repo_not_in_project",
+                "each Task repository must belong to the Task Project",
+            ),
+            ServiceError::TaskRepositoryReplanRequired => Self::conflict_with_code(
+                "task.repositories.replan_required",
+                "Task repository scope cannot change after an Execution or invalidate an explicit WorkUnit repository selection without an authorized replan",
+            ),
+            ServiceError::TaskRepositoryReplanRemovalBlocked { repo_id } => {
+                Self::conflict_with_code_and_details(
+                    "task.repositories.replan_removal_blocked",
+                    format!("repository {repo_id} still has in-flight work"),
+                    json!({ "repo_id": repo_id }),
+                )
+            }
+            ServiceError::WorkUnitRepositoriesInvalid => Self::unprocessable(
+                "work_unit.repositories.invalid",
+                "WorkUnit repository IDs must be writable repositories of its Task",
+            ),
+            ServiceError::ProjectPrimaryRepoNotInProject => Self::unprocessable(
+                "project.primary_repo_not_in_project",
+                "the primary repository must belong to the Project",
             ),
             ServiceError::RepoMismatch { project_id } => Self::conflict_with_code(
                 "repo_mismatch",
@@ -620,6 +648,10 @@ impl From<DbError> for ApiError {
                 "work_unit_workspace_unavailable",
                 "WorkUnit Workspace is not ready for Execution admission",
             ),
+            DbError::WorkUnitReviewGroupUnavailable => Self::conflict_with_code(
+                "work_unit_review_group_unavailable",
+                "The exact read-only review WorkspaceGroup is not ready for Execution admission",
+            ),
             DbError::WorkUnitExecutionAlreadyRunning => Self::conflict_with_code(
                 "work_unit_execution_running",
                 "WorkUnit already has a Running Execution",
@@ -691,6 +723,16 @@ mod tests {
     use axum::http::StatusCode;
     use db::DbError;
     use services::ServiceError;
+
+    #[test]
+    fn multirepo_lifecycle_plan_unsupported_coordinator_harness_is_unprocessable() {
+        let error = ApiError::from(ServiceError::Coordination {
+            code: "coordination.coordinator_harness_unsupported",
+            message: "unsupported coordinator".to_owned(),
+        });
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error.code, "coordination.coordinator_harness_unsupported");
+    }
 
     #[test]
     fn project_plan_apply_incomplete_has_a_typed_conflict_code() {

@@ -26,6 +26,7 @@ async fn event_bus_creates_notification_and_api_manages_inbox() {
     TaskRepo::create(
         &*harness.state.db,
         CreateTask {
+            repositories: Vec::new(),
             id: task_id.clone(),
             project_id: project.id.clone(),
             repo_id: Some(repo.id.clone()),

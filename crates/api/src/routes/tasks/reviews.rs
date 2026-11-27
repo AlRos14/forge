@@ -17,7 +17,8 @@ pub async fn trigger_review(
         )
         .await?;
     Ok(Json(api_types::ReviewExecutionResponse {
-        execution: execution_response(execution),
+        execution: crate::routes::execution_response_with_repository_results(&state.db, execution)
+            .await?,
         report: None,
     }))
 }
@@ -62,7 +63,10 @@ pub async fn list_reviews(
         .map(|artifact| crate::routes::collaboration::artifact_response(artifact, true))
         .transpose()?;
         reviews.push(api_types::ReviewExecutionResponse {
-            execution: execution_response(execution),
+            execution: crate::routes::execution_response_with_repository_results(
+                &state.db, execution,
+            )
+            .await?,
             report,
         });
     }

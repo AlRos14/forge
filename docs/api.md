@@ -7,6 +7,9 @@
 returns `SubmitReviewReportResponse`. It requires the exact assigned Human
 reviewer and an available, independent, same-Task result subject. Forge derives
 the technical attempt and frozen subject; request fields cannot replace them.
+For repository subjects, submission freezes each repository result and prepares
+the exact read-only WorkspaceGroup before admitting the Human review attempt.
+The Human attempt remains workspace-free.
 The operation stores the ReviewReport and completes the reviewer WorkUnit;
 `request_changes` completes the review work without approving the delivery.
 An identical retry reuses the same provenance attempt and Artifact.
@@ -19,7 +22,7 @@ own workspace. Gate evaluation verifies the report against the durable
 review-subject relation and source attempt. A WorkUnit-scoped review Gate
 targets the reviewed WorkUnit, rather than its separate reviewer WorkUnit.
 
-Forge exposes the versioned REST API at `/api/v1`. This reference describes the 0.9.1 public contract through migration V180 for Project, Task, Actor, TaskRole, RoleMembership, Execution, HarnessSession, WorkUnit, Workspace, collaboration, Artifact, Review, Validation, Evidence, Gate, and TaskLifecycle records.
+Forge exposes the versioned REST API at `/api/v1`. This reference describes the 0.9.1 public contract through migration V183 for Project, Task, Actor, TaskRole, RoleMembership, Execution, HarnessSession, WorkUnit, Workspace, collaboration, Artifact, Review, Validation, Evidence, Gate, and TaskLifecycle records. M1 adds Task and WorkUnit repository associations from V181; M2 adds grouped WorkUnit workspaces, exact per-repository Execution results, and repository-scoped review and validation projections from V182; M3 adds per-repository integration/PR batches, repository-aware dependency handoffs, and repository-set replan projections from V183.
 
 > The orchestrator owns work. The harness owns cognition.
 
@@ -57,6 +60,25 @@ unsupported lifecycle request, `401` for missing/invalid credentials, `404`
 for absent or invisible records, `409` for version or authority conflicts,
 and `422` for malformed DTOs or unknown request fields.
 
+Repository-scope errors use `task.repositories.invalid` (`400`) for a missing
+or repeated primary and duplicate repository IDs, `task.repositories.repo_not_in_project`
+(`422`) for a repository outside its Project, `task.repositories.replan_required`
+(`409`) after an Execution or when a change would invalidate an explicit
+WorkUnit repository selection, `work_unit.repositories.invalid`
+(`422`) for duplicate or non-writable WorkUnit repository IDs, and
+`project.primary_repo_not_in_project` (`422`) for a primary repository outside
+its Project. Coordinator replans return
+`task.repositories.replan_primary_immutable` (`409`) for a primary change and
+`task.repositories.replan_removal_blocked` (`409`, with `repo_id`) when a
+removed repository may still have in-flight work. Stale Task or Project
+versions return `409 version_conflict`.
+
+Automatic Task coordination accepts only a Codex CLI coordinator supported by
+the PR6 dispatcher. Authorization rejects other harnesses with
+`coordination.coordinator_harness_unsupported` (`422`). If the selected Agent
+becomes unsupported before the wake starts an attempt, the exact coordination
+request transitions to `failed` with the same failure code and message.
+
 If a provider Start may have taken effect but its response is uncertain, Forge
 does not send another Start. A launch response can admit an Execution without
 listing it in `started_execution_ids`; read that exact Execution and its
@@ -85,7 +107,7 @@ the maximum is 100.
 | `POST /projects` | Create an ordinary Project from `{ name }`. It does not create a Charter, Genesis session, baseline, Agent binding, or Task. |
 | `GET /projects` | List Projects visible to the authenticated user. |
 | `GET /projects/{id}` | Read a Project and its generic Project hook configuration. |
-| `PATCH /projects/{id}` | Update Project identity, pause state, and supported generic hooks. |
+| `PATCH /projects/{id}` | Update Project identity, pause state, supported generic hooks, or nullable `primary_repo_id`; include the expected `version`. The selected repository must belong to the Project. A primary change affects future Tasks only. |
 | `GET /projects/{id}/task-role-defaults`, `PUT /projects/{id}/task-role-defaults` | Read or replace the role-to-worker template copied into new ordinary Tasks. Reads require Project visibility; updates require owner/admin membership and `expected_version`. Humans must be current Project members. Agents must be owned by the canonical Project owner; global visibility alone is not consent to run an Agent from another account. |
 | `GET /projects/{id}/copilot`, `PUT /projects/{id}/copilot` | Read or assign the Project Copilot. Assignment accepts `expected_version` and nullable `agent_id`, requires current Project owner/admin authority and same-account Agent ownership. |
 | `GET /projects/{id}/copilot/messages`, `POST /projects/{id}/copilot/messages` | Read the durable Project conversation using an opaque cursor, or send `{content, idempotency_key, task_id?}`. Sending requires Project write authority and enabled MCP, returns HTTP 202 with the durable run and user message. An optional Task must belong to the same Project. |
@@ -98,7 +120,7 @@ the maximum is 100.
 | `POST /projects/{id}/plan/batches/{batch_id}` | A Project owner/admin sends `{ expected_version, action, idempotency_key }`, where `action` is `pause`, `resume`, or `revoke`. Copilot cannot authorize or change a batch. |
 | `DELETE /projects/{id}` | Delete a Project under the existing workspace cleanup contract. |
 | `POST /projects/{id}/pause`, `POST /projects/{id}/resume` | Pause or resume the Project. |
-| `GET /projects/{id}/repos`, `POST /projects/{id}/repos` | List or add repositories. Create accepts PR provider settings, including `pr_provider_config.credential_id`; a Repo, provider config, credential reference, and primary-Repo selection are committed atomically. The credential must be a configured GitHub SCM API key owned by the authenticated Project owner/admin. |
+| `GET /projects/{id}/repos`, `POST /projects/{id}/repos` | List or add repositories. Create accepts PR provider settings, including `pr_provider_config.credential_id`; a Repo, provider config, credential reference, and primary-Repo selection are committed atomically. The Project's first Repo becomes its primary Repo; later Repos are added as non-primary Project repositories for multi-repository Tasks and leave the primary selection unchanged. The credential must be a configured GitHub SCM API key owned by the authenticated Project owner/admin. |
 | `GET /repos/{id}`, `PATCH /repos/{id}`, `DELETE /repos/{id}`, `POST /repos/{id}/sync` | Read, update, remove, or sync a repository. `PATCH` can set `pr_provider`, polling/base URL configuration, and `pr_provider_config.credential_id`; setting the provider to `null` removes its configuration. Responses expose `has_credential`, `credential_handle_id`, and the handle label, never a secret. Sending `token` or `token_secret_ref` returns `400 repo.pr_provider_token_retired`. Deleting a Repo with any associated Task returns `409 repo_in_use` and leaves the Repo, primary-Repo selection, and Tasks intact. Deleting a Task-free Repo returns `204` and clears its primary-Repo selection atomically. |
 | `GET /repos/{id}/pr-feedback-policy`, `PUT /repos/{id}/pr-feedback-policy` | Read or replace the PR feedback policy; owner/admin only. GET and PUT return `{policy, updated_at}`. PUT accepts `{expected_updated_at?, policy}` and atomically compares the supplied timestamp before writing; schema version, polling limit, trusted associations and logins are validated. Policy changes do not widen existing PR admissions. A stale timestamp returns `409 pr_feedback.policy_version_conflict`; invalid policy returns `400 pr_feedback.policy_invalid`. |
 | `GET /projects/{id}/project_hook_runs` | Read generic Project hook run history. |
@@ -193,21 +215,23 @@ provenance and active defaults use an exact `default_implementer` ActorRef.
 
 | Method and path | Contract |
 | --- | --- |
-| `POST /projects/{project_id}/tasks` | Create a Task. Supported fields are `title`, `description`, `parent_task_id`, and `priority`; Task classification and access modes are not part of the contract. Project task-role defaults are copied atomically. |
+| `POST /projects/{project_id}/tasks` | Create a Task. Supported fields include `title`, `description`, `parent_task_id`, `priority`, and optional `repositories: [{repo_id, role}]`, where role is `primary`, `affected`, or `context`. Omission inherits the parent scope or Project primary; `repositories: []` creates a repo-less Task. Project task-role defaults are copied atomically. |
+| `PATCH /tasks/{id}/repositories` | Replace the repository scope with `{expected_version, repositories}`. A non-empty set has exactly one primary; all repositories must belong to the Task Project. After an Execution, an authorized replan is required. Before an Execution, the update cannot remove or make read-only a repository explicitly selected by an existing WorkUnit. |
+| `GET /tasks/{id}` and Task list responses | Include the active `repository_set_revision` and `repository_set_digest`, repository rows with `change_state` (`pending`, `changed`, or `unchanged`) and exact integration/merge/PR identity, plus the full `repository_merge_batches` history. Context repositories remain read-only. |
 | `GET /projects/{project_id}/tasks` | List Tasks. Filter with `lifecycle_state`, `priority`, and `q`; order with the supported Task sort fields. Task classification is not a filter. `status`, `include_cancelled`, and `include_archived` are rejected. |
 | `GET /tasks/{id}`, `PATCH /tasks/{id}`, `DELETE /tasks/{id}` | Read, update, or delete a Task. Updates require the Task `version`. |
 | `POST /tasks/{id}/subtasks/reorder` | Reorder exact child Task IDs. |
 | `GET /tasks/{id}/dependencies`, `GET /tasks/{id}/dependents` | Read same-Project Task dependencies. |
 | `POST /tasks/{id}/dependencies` | Add a same-Project dependency using `{ depends_on_id, expected_graph_version, idempotency_key }`. Writes pass through the Project DAG service. |
 | `DELETE /tasks/{id}/dependencies/{dep_id}` | Remove a dependency using JSON body `{ expected_graph_version, idempotency_key }`. Writes pass through the Project DAG service. |
-| `GET /tasks/{id}/workspace`, `GET /tasks/{id}/diff` | Read the Task integration workspace or inspect its current diff. Workspace mutation and recovery require an exact WorkUnit and Workspace identity. |
+| `GET /tasks/{id}/workspace`, `GET /tasks/{id}/diff` | Read the primary repository's Task integration workspace or inspect its current diff. The scalar workspace route keeps its single-repository projection; WorkUnit integration results identify each repository. Workspace mutation and recovery require an exact WorkUnit and Workspace identity. |
 | `GET /tasks/{id}/lifecycle` | Read the authoritative aggregate TaskLifecycle and its version. |
 | `POST /tasks/{id}/lifecycle` | Request a deterministic TaskLifecycle edge with `to_state`, `expected_lifecycle_version`, and `idempotency_key`; use `gate_evaluation_id` for an edge admitted by that exact evaluation. `reason_kind` and `reason_ref` must be supplied together, with non-empty values, or both omitted. |
 | `GET /tasks/{id}/lifecycle/transitions` | Read exact durable transition receipts and facts. |
 | `GET /tasks/{id}/gates`, `POST /tasks/{id}/gates` | List or create Task-scoped Gates. |
 | `GET /gates/{id}`, `PUT /gates/{id}/policy`, `POST /gates/{id}/evaluate` | Read a Gate, revise its policy against the expected revision, or evaluate its exact current inputs. |
 | `GET /gate-evaluations/{id}` | Read one immutable GateEvaluation and its frozen input facts. |
-| `POST /tasks/{id}/merge` | Request merge admission using the exact satisfied GateEvaluation. The service rechecks its current policy and input identities under the Task integration lock. |
+| `POST /tasks/{id}/merge` | Request merge admission using the exact satisfied GateEvaluation. The response retains the 0.9.1 scalar fields and adds `repository_merge_batch_id` and per-repository results. The service rechecks its current policy and input identities under the Task integration lock; merge remains a Human action. |
 | `GET /task-role-capabilities` | Read the closed capability catalog and editable role templates. The web client uses this response instead of maintaining its own catalog. |
 | `GET /tasks/{id}/task-roles`, `POST /tasks/{id}/task-roles`, `PATCH /tasks/{id}/task-roles/{role}` | Read or update TaskRole definitions, including versioned `configuration` with `display_label`, `capabilities`, and optional `rework` route. Capability and orchestration policy changes require Project owner/admin authority and exact TaskRole version. |
 | `GET /projects/{id}/task-role-defaults`, `PUT /projects/{id}/task-role-defaults` | Read or replace Project TaskRole templates. Defaults store route references by role name and resolve them to Task-local IDs on Task creation. Updates require Project owner/admin authority and the expected defaults version. |
@@ -287,13 +311,13 @@ are in [the PR0 contract](plans/pr0-task-coordination-contract.md).
 | `GET /tasks/{id}/fallback-receipts` | Read Task-visible fallback receipts with the replaced and selected Actor, TaskRole, failure class, chain index, cost class, and exact authorization/envelope/route-attempt digests. |
 | `GET /tasks/{id}/micro-fixes` | Read bounded micro-fix receipts, declared findings and paths, diff counts, bounds outcome/violation, reviewer profile cost class, and exact commit references. |
 | `GET /tasks/{id}/coordinator-replans` | Read coordinator replan ordinal, reason, evidence links, deterministic classification and measured facts, state, and any linked Human decision. |
-| `POST /tasks/{id}/coordination/authorize` | Create or replace the versioned authorization. Body: `expected_task_version`, `expected_coordination_version`, `mode`, optional exact `coordinator_task_role_id` and `coordinator_actor`, optional `envelope`, `idempotency_key`. The coordinator TaskRole must currently have `orchestration` capability and the Actor must be an active member. If the current authorization is bound to a running or paused Project batch, the generic route returns `409 project_plan_batch_inactive`. Explicitly revoke the Task authorization or revoke/complete the Project batch before creating a fresh standalone Human authorization. The old batch grant then becomes stale and admits no further work; the new authorization does not revive it. |
+| `POST /tasks/{id}/coordination/authorize` | Create or replace the versioned authorization. Body: `expected_task_version`, `expected_coordination_version`, `mode`, optional exact `coordinator_task_role_id` and `coordinator_actor`, optional `envelope`, `idempotency_key`. The coordinator TaskRole must currently have `orchestration` capability, the Actor must be an active member, and automatic modes require a Codex CLI Agent accepted by the PR6 dispatcher (`422 coordination.coordinator_harness_unsupported` otherwise). If the current authorization is bound to a running or paused Project batch, the generic route returns `409 project_plan_batch_inactive`. Explicitly revoke the Task authorization or revoke/complete the Project batch before creating a fresh standalone Human authorization. The old batch grant then becomes stale and admits no further work; the new authorization does not revive it. |
 | `POST /tasks/{id}/coordination/revoke` | Revoke the authorization, advance its version, and preserve existing WorkUnits, plans, and history. Running Executions are not silently stopped. |
 | `POST /tasks/{id}/coordination/requests` | Request one bounded turn. Body: expected Task/coordination versions, `objective`, optional `constraints`/`context`, `acceptance_criteria`, idempotency key. A Human coordinator returns `422 coordination.human_turn_unsupported`; use manual editing. Replays return the same request. A version minted by a Project batch is scoped to that batch and returns `409 project_plan_batch_inactive` through this generic route, even after batch revocation or completion; create a fresh explicit TaskCoordination authorization to restore the standalone request flow. |
 | `GET /tasks/{id}/coordination/requests/{request_id}` | Read the exact turn state, wake, Execution, failure reason, plan Artifact, and brief. |
-| `GET /tasks/{id}/coordination/plans/{artifact_id}` | Read the inspectable plan and its parsed WorkUnits, roles, Actors, dependencies, review subjects, proposal/decision, and materialization receipt. |
+| `GET /tasks/{id}/coordination/plans/{artifact_id}` | Read the inspectable plan and its parsed WorkUnits, roles, Actors, dependencies, review subjects, optional per-WorkUnit `repository_ids`, optional complete `repository_set` proposal, proposal/decision, and materialization receipt. Omitted or empty `repository_ids` means all writable repositories in the effective Task set. When the plan omits `repository_set`, the response omits it and uses the current Task set. |
 | `POST /tasks/{id}/coordination/plans/{artifact_id}/approve` | Approve or reject one exact plan by digest. Approval records a `Decision` on the exact open Proposal; a changed digest or Proposal version returns a typed conflict. |
-| `POST /tasks/{id}/coordination/plans/{artifact_id}/materialize` | Atomically create WorkUnits, dependencies, review subjects, and Artifact input pins from one approved plan, with a deterministic replay receipt. The operation also records the normal launch intent; dispatch still revalidates every worker assignment, capability, and lease. A paused Task returns `409 coordination.paused`. |
+| `POST /tasks/{id}/coordination/plans/{artifact_id}/materialize` | Atomically create WorkUnits, dependencies, review subjects, and Artifact input pins from one approved plan, with a deterministic replay receipt. Every non-empty `repository_ids` list must contain unique writable IDs from the current Task set or proposed `repository_set`; duplicate, unknown, or `context` IDs return `422 coordination.invalid_plan`. A non-review WorkUnit with non-empty `repository_ids` and `requires_integration: false` returns `422 coordination.plan_repository_requires_integration`. The selection and immutable repository-set revision pin are written in this transaction. An approved coordinator replan may also materialize its complete `repository_set`; the exact Human decision and base revision are revalidated in the same transaction, and new WorkUnits pin the new immutable revision. Removing a repository or downgrading a writable repository to `context` while open WorkUnits, running Executions, active leases/batches, or nonterminal PR/admission state may depend on it returns `409 task.repositories.replan_removal_blocked`. Primary changes return `409 task.repositories.replan_primary_immutable`. The operation also records the normal launch intent; dispatch still revalidates every worker assignment, capability, and lease. A paused Task returns `409 coordination.paused`. |
 | `GET/POST /tasks/{id}/coordination/quality-requests` | List or create structured quality requests. Categories are `delivery_correction`, `plan_revision`, `specialist`, and `human_decision`; targets are `implementation`, `orchestrator`, `specialist`, or `human`. Creation records routing facts and consumes the Task-global and exact-route budgets atomically; a deterministic Handoff is informational. An optional `source_execution_id` attributes a ReviewReport-sourced request to the exact reviewer Execution instead of the calling Human. The durable consumer creates or links a correction/specialist WorkUnit or opens a plan-revision turn. Responses include `work_unit_id`, `coordination_request_id`, exact resolution evidence, and `quality_route` with stable `id`, `round`, `limit`, and source TaskRole. Review reports on the same review line share a route even when category or destination role changes. |
 | `POST /tasks/{id}/coordination/quality-requests/{request_id}/resolve` | Resolve, cancel, or escalate one exact request using its version. |
 | `GET/POST /tasks/{id}/coordination/interventions` | Read or create one versioned Human/Copilot intervention. Kinds are `instruction`, `decision`, `pause`, `resume`, `cancel`, `revoke_authorization`, and `request_replan`. Project Copilot may record an instruction through this same circuit; it cannot request a replan, pause, cancel, revoke, approve, or decide. |
@@ -323,6 +347,31 @@ TaskRole action. Its plan is classified against the captured Task objective,
 team, WorkUnit budget, repository/path scope, and envelope; a scope or authority
 change requires an exact Human decision before materialization. The V172 ledger
 limits coordinator replans to two per Task.
+
+The coordinator receives the Task's repositories as `{ id, name, role }` entries
+and returns the ordinary `work_unit_plan` JSON shape. Each `work_units[]` entry
+may optionally include `repository_ids: ["repo-id"]`; the IDs must be unique
+`primary`/`affected` members of the effective Task set. A replan validates
+against its proposed `repository_set` when present. Empty or omitted arrays are
+omitted from serialized plans, preserving older plan digests and selecting all
+writable repositories.
+
+A replan `WorkUnitPlan` may carry `repository_set: [{repo_id, role}]` as a
+complete replacement. Its roles are `primary`, `affected`, and `context`; the
+primary must remain the Task's current primary, and the input order determines
+positions after it. Omitting the field preserves the existing plan wire shape
+and repository set. Rust classifies any membership, role, or ordering change as
+`scope_or_authority_change`, which requires the exact Human approval. A change
+to `repository_ids` on a stable existing WorkUnit key has the same
+classification. Resume
+rechecks the captured revision/digest and decision inside materialization,
+creates the immutable revision, and pins only new WorkUnits to it. Removal or
+downgrading a writable repository to `context` is rejected while any open
+WorkUnit, running Execution, active lease/batch, or nonterminal PR/admission
+may still depend on that repository. Old revisions
+and their pins remain immutable; removed catalog rows stay as `context` for
+historical references. Direct repository PATCH still returns
+`409 task.repositories.replan_required` after the first Execution.
 
 The coordination overview returns the authorized `fallback_agents` chain and
 optional `micro_fix_reviewer`; each grant includes its `cost_class`, which the
@@ -375,7 +424,9 @@ Public SSE events are `task.coordination_authorized`,
 `task.validation_comparison_recorded`, `task.human_decision_requested`,
 `task.human_decision_answered`, `task.human_decision_closed`, and
 `task.work_unit_fallback`, `task.micro_fix_bounds_exceeded`, and
-`task.coordinator_replan_proposed`. Fallback events carry the WorkUnit and origin
+`task.coordinator_replan_proposed`, and `task.repository_set_replanned`. The
+repository-set event carries only Task/revision/digest, plan Artifact, and
+HumanDecision IDs. Fallback events carry the WorkUnit and origin
 Execution IDs, receipt and TaskRole IDs when reassigned, source and destination
 Agent IDs, chain index, cost class, authorization version, envelope and route
 attempt digests, and outcome/reason state. An exhausted or no-longer-authorized
@@ -468,15 +519,21 @@ synthetic Execution.
 
 | Method and path | Contract |
 | --- | --- |
-| `GET /tasks/{id}/executions` | List exact historical Task Executions. |
+| `GET /tasks/{id}/executions` | List exact historical Task Executions, including `repository_results` with each selected `repo_id`, `workspace_id`, `before_sha`, `after_sha`, and `snapshot_digest`. |
 | `POST /tasks/{id}/executions` | Retired. Returns `410 Gone` with code `execution.manual_launch_retired`; use Task dispatch and prepared WorkUnits. |
 | `POST /tasks/{task_id}/executions/{execution_id}/recovery` | Explicitly select one cancelled exact crash-recovery, Agent-timeout, or graceful-shutdown Execution for a fresh child attempt. Supply its exact `work_unit_id`, expected Task, TaskLifecycle, and WorkUnit versions, and an `idempotency_key`; an optional `context` is included in the request identity. The selected Execution's Agent must still be the WorkUnit's current assignee and active role member. The requesting Human must be authorized to mutate the Task and is recorded in the decision receipt. A same-key retry returns the exact admitted child without dispatching it again. Selecting one candidate from an ambiguous aggregate block resolves that block and admits the child in one transaction; remaining WorkUnits keep their own pending Execution history and can be selected afterward. This human selection may explicitly override an Auto candidate when the operator chooses a fresh attempt; dispatcher Auto recovery itself resumes only the parent's exact reusable HarnessSession. |
-| `GET /executions/{id}` | Read one exact Execution, including its Actor, role, WorkUnit, HarnessSession reference, frozen execution configuration, and workspace identity. |
+| `GET /executions/{id}` | Read one exact Execution, including its Actor, role, WorkUnit, HarnessSession reference, frozen execution configuration, scalar workspace identity, and `repository_results` for each exact repository result. |
 | `POST /executions/{id}/follow-up` | Create a child from the exact parent Execution. `idempotency_key`, `message`, and `agent_id` are required. Repeating the same key and request replays the exact child; reusing the key with different request content conflicts. A new authorized follow-up uses a new key. A same-Agent continuation can reuse only the exact compatible HarnessSession; it never substitutes a current role member or latest Execution. |
 | `POST /executions/{id}/cancel` | Cancel the exact Execution. |
 | `GET /executions/{id}/logs`, `GET /executions/{id}/hook-logs` | Read the exact Execution's persisted log output and hook logs. |
 | `GET /executions/{id}/usage`, `GET /tasks/{id}/usage` | Read Execution or aggregate Task usage. |
 | `GET /workspaces/{id}/diff` | Read an exact Workspace diff. |
+
+When the WorkUnit selects the primary repository, scalar `workspace_id`,
+`before_sha`, and `after_sha` retain their legacy meaning. A WorkUnit that does
+not select the primary leaves those scalar fields unset; its `repository_results`
+still expose every selected result. A single-repository WorkUnit returns one
+repository result and preserves its scalar response.
 
 The public Execution projection identifies the participant through `actor_ref`;
 it does not expose a purpose classification or the legacy AgentSession identity.
@@ -493,10 +550,10 @@ table does not authorize a decision or satisfy a Gate.
 | Method and path | Contract |
 | --- | --- |
 | `POST /tasks/{id}/review-executions` | Start a Human Review Execution with `{ "task_role_id": "...", "workspace_id": "..." }`. The exact role must currently grant `formal_review` and contain the caller as an active member. `workspace_id`, when supplied, must name the exact Ready Workspace to review; `null` starts a Workspace-free review and never selects a Task Workspace implicitly. |
-| `GET /tasks/{id}/review-executions` | List exact Executions admitted with `formal_review` and their ReviewReport Artifact outputs. |
-| `GET /review-executions/{id}` | Read one exact formal Review Execution and report. |
+| `GET /tasks/{id}/review-executions` | List exact Executions admitted with `formal_review`, their per-repository results, and ReviewReport Artifact outputs. |
+| `GET /review-executions/{id}` | Read one exact formal Review Execution, its per-repository results, and report. |
 | `POST /review-executions/{id}` | Submit a ReviewReport to that exact reviewer Execution. Optional `reviewed_work_unit_id` and `reviewed_work_unit_version` pin the exact WorkUnit subject; both must be supplied together. |
-| `GET /tasks/{id}/validation-runs`, `GET /validation-runs/{id}` | List or read exact ValidationRuns. |
+| `GET /tasks/{id}/validation-runs`, `GET /validation-runs/{id}` | List or read exact ValidationRuns. Each response includes `repo_id` resolved from its exact Workspace. |
 | `GET /evidence/{id}` | Read exact Evidence and its producer ValidationRun identity. |
 | `GET /tasks/{task_id}/artifacts`, `POST /tasks/{task_id}/artifacts` | List or create generic Artifacts with exact provenance. |
 | `GET /artifacts/{id}` | Read one exact Artifact. |
@@ -517,7 +574,7 @@ Validation definitions are immutable Project catalog versions. A check request m
 | `GET /tasks/{id}/human-decisions/{decision_id}` | Read one exact Task decision. |
 | `POST /tasks/{id}/human-decisions/{decision_id}/answer` | Answer one stored option with expected_version, option_id, optional note, and idempotency_key. The authenticated Human is the answerer. Options with authority_effect=scope or authority require Project owner/admin authority. |
 
-ValidationRunResponse includes run_origin (legacy_command|coordinator_request|after_integration|baseline), definition_digest, catalog_check_id, and check_request_id. Coordination request responses include exact nullable source_subject_kind/id/digest and resumes_request_id fields.
+ValidationRunResponse includes `repo_id` resolved from the exact Workspace, `run_origin` (legacy_command|coordinator_request|after_integration|baseline), `definition_digest`, `catalog_check_id`, and `check_request_id`. A requested catalog check binds `(repo_id, check_key)` to that repository's exact Workspace, commit, and snapshot. Coordination request responses include exact nullable source_subject_kind/id/digest and resumes_request_id fields.
 
 A terminal run in failed, error, or stale state, or a baseline comparison in regression or inconclusive state, can create an exact validation_findings coordinator request. The coordinator may choose correct, recheck, or human. A recheck stays on the pinned check and subject. Passing checks and non-regression comparisons do not wake the coordinator. Answering a resumable decision creates at most one resume request for its original authorization; Project Copilot never answers Human decisions.
 
@@ -553,20 +610,20 @@ The policy schema is version 1. Its defaults are ingest=false, trusted_author_as
 
 Connect GitHub with `POST /providers` using the `provider`, `label`, and `credential` request fields. The secret is accepted for connection and is never returned. `GET /providers?purpose=scm` lists SCM handles; the ordinary provider list excludes them. Set `pr_provider_config.credential_id` when creating `POST /projects/{id}/repos` or updating `PATCH /repos/{id}`. Both Project administration and credential ownership are checked. Responses expose `has_credential`, `credential_handle_id`, and `credential_label`, never the secret. The retired `token` and `token_secret_ref` PR configuration fields return `repo.pr_provider_token_retired`.
 
-The REST and MCP error codes include credential.invalid, credential.purpose_invalid, credential.owner_not_authorized, repo.pr_provider_forbidden, repo.pr_provider_credential_invalid, repo.pr_provider_token_retired, pr_feedback.policy_invalid, pr_feedback.policy_forbidden, pr_rework.not_authorized, pr_action.not_authorized, and pr_action.version_conflict. See the [PR feedback loop](concepts/pr-feedback-loop.md) for the lifecycle and policy boundaries.
+The REST and MCP error codes include credential.invalid, credential.purpose_invalid, credential.owner_not_authorized, repo.pr_provider_forbidden, repo.pr_provider_credential_invalid, repo.pr_provider_token_retired, pr_feedback.policy_invalid, pr_feedback.policy_forbidden, pr_rework.not_authorized, pr_action.not_authorized, and pr_action.version_conflict. PR feedback, actions, and rework records identify both `repo_id` and the exact `admission_id`. See the [PR feedback loop](concepts/pr-feedback-loop.md) for the lifecycle and policy boundaries.
 
 ## WorkUnits and generic collaboration
 
 | Method and path | Contract |
 | --- | --- |
-| `GET /tasks/{task_id}/work-units`, `POST /tasks/{task_id}/work-units` | List or create Task-scoped WorkUnits. Creation accepts optional `execution_instructions` passed to the assigned harness instead of the generic Task/WorkUnit prompt, exact `artifact_inputs` IDs to pin on every Execution, and `review_approval: { gate_id, review_line_id }` to require a current satisfied review Gate before admission. |
-| `GET /work-units/{id}`, `PATCH /work-units/{id}` | Read or update an exact WorkUnit. |
+| `GET /tasks/{task_id}/work-units`, `POST /tasks/{task_id}/work-units` | List or create Task-scoped WorkUnits. Creation accepts `repository_ids` as a subset of the Task's primary/affected repositories; omission or an empty list means all writable Task repositories. Context repositories cannot be selected. It also accepts optional `execution_instructions` passed to the assigned harness instead of the generic Task/WorkUnit prompt, exact `artifact_inputs` IDs to pin on every Execution, and `review_approval: { gate_id, review_line_id }` to require a current satisfied review Gate before admission. |
+| `GET /work-units/{id}`, `PATCH /work-units/{id}` | Read or update an exact WorkUnit. A formal `review_subject` includes `repository_results`, one exact row for each repo in the reviewed result. |
 | `GET /work-units/{id}/artifact-package` | Read the WorkUnit's exact immutable Artifact input bindings and result manifests, including producer Executions and digests. |
 | `POST /work-units/{id}/allocation`, `POST /work-units/{id}/status` | Allocate a WorkUnit or request its target state transition. |
 | `GET /work-units/{id}/dependencies`, `POST /work-units/{id}/dependencies/{prerequisite_id}`, `DELETE /work-units/{id}/dependencies/{prerequisite_id}` | Read or update exact WorkUnit dependencies. |
 | `GET /work-units/{id}/readiness` | Read deterministic WorkUnit readiness, including `awaiting_acceptance` and `awaiting_review_approval`. |
-| `POST /work-units/{id}/workspace` | Prepare or rebuild the exact repository WorkUnit Workspace before launch. |
-| `POST /work-units/{id}/integrations` | Integrate an explicitly scoped WorkUnit under the existing integration lock. |
+| `POST /work-units/{id}/workspace` | Prepare or rebuild the exact WorkUnit workspace group before launch, with one Workspace per writable repository and pinned read-only Workspaces for selected context repos. |
+| `POST /work-units/{id}/integrations` | Integrate an explicitly scoped WorkUnit under the existing integration lock. The response retains its primary-repository scalar fields and adds ordered `repositories` results. A partial result preserves successful repositories; retry the same completed Execution with the same idempotency key to continue pending repositories. `GET` WorkUnit responses expose all child integration records after a timeout or partial result. |
 | `GET /tasks/{task_id}/messages`, `POST /tasks/{task_id}/messages`, `GET /messages/{id}` | Create or read generic collaboration Messages. |
 | `GET /tasks/{task_id}/handoffs`, `POST /tasks/{task_id}/handoffs`, `GET /handoffs/{id}`, `POST /handoffs/{id}/status` | Create, read, or update generic Handoffs. |
 | `GET /tasks/{task_id}/proposals`, `POST /tasks/{task_id}/proposals`, `GET /proposals/{id}`, `POST /proposals/{id}/withdraw` | Create or read generic Proposals. |
@@ -575,6 +632,8 @@ The REST and MCP error codes include credential.invalid, credential.purpose_inva
 These are generic domain records. They do not recreate Agent Chat, Charter,
 AgentAction, the historical Project readiness workflow, or Main/Project Agent
 workflows. WorkUnit readiness is a current deterministic projection.
+Execution admission that reaches a formal repository review without its exact
+ready WorkspaceGroup returns `409 work_unit_review_group_unavailable`.
 
 ## Agents, providers, credentials, and daemon transport
 
@@ -668,7 +727,16 @@ Public durable event types are:
 - `gate.created`, `gate.policy_revised`, and `gate.evaluated` with exact Gate,
   policy revision, outcome, and input digest facts;
 - `execution.started`, `execution.completed`, `execution.failed`,
-  `execution.cancelled`, and `execution.stalled`;
+  `execution.cancelled`, `execution.repository_results_recorded`, and
+  `execution.stalled`. The repository-results event contains only exact repo
+  and Workspace IDs, commit SHAs, and snapshot digests;
+- `work_unit.repository_integration_changed`,
+  `task.repository_merge_batch_changed`, and
+  `task.repository_pr_status_changed` expose allowlisted Task, repository,
+  revision, batch, integration, admission, and PR metadata IDs, along with the
+  relevant repository and batch states and versions, so clients can refresh
+  partial progress. PR status events include the provider admission status and
+  PR state. An individual event never advances TaskLifecycle;
 - `validation_run.started`, `validation_run.completed`, `evidence.created`,
   and `artifact.created`;
 - `project.plan_changed` for plan proposals, applies, dependency mutations, and
@@ -681,7 +749,11 @@ Public durable event types are:
 - PR feedback events: `task.pr_feedback_ingested` and `task.pr_feedback_triaged`; rework events: `task.pr_rework_superseded`, `task.pr_rework_resumed`, `task.pr_rework_converged`, and `task.pr_followup_proposed`; external action events: `task.pr_action_requested` and `task.pr_action_completed`. Their payloads contain only allowlisted identifiers, digests, heads, kinds, and states.
 - Phase-3 events: `task.work_unit_fallback`, `task.micro_fix_bounds_exceeded`, and `task.coordinator_replan_proposed` carry allowlisted receipt and authorization facts. They omit provider text, paths, plan contents, prompts, and free-form reasons.
 
-Runtime hint names are `project.created`, `project.updated`, `project.deleted`,
+Runtime hint names include `task.repositories_changed`, emitted after the Task
+repository scope transaction commits with payload `{task_id, task_version,
+repositories}`; each repository contains `repo_id` and `role` (`primary`,
+`affected`, or `context`). Other runtime hint names are `project.created`,
+`project.updated`, `project.deleted`,
 `project.paused`, `project.resumed`, `project_hook.run_changed`,
 `notification.created`, and `operations.status_changed`.
 `events.resync_required` asks clients to refetch active queries after an EventBus
@@ -758,7 +830,8 @@ The MCP server advertises only registered tools. The current tool names are:
   `forge_list_task_dependencies`. Direct dependency mutations require
   `expected_graph_version` and `idempotency_key` and call the Project DAG
   service. There is no MCP tool for authorizing a Project batch.
-- Executions and roles: `forge_list_executions`, `forge_get_task_dispatch`,
+- Executions and roles: `forge_list_executions` (including exact per-repository
+  results), `forge_get_task_dispatch`,
   `forge_launch_task`, `forge_pause_task`, `forge_resume_task`,
   `forge_cancel_task`, `forge_request_rework`, `forge_follow_up_execution`,
   `forge_list_task_roles`, `forge_create_task_role`, `forge_update_task_role`,

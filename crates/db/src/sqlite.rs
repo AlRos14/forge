@@ -2,16 +2,18 @@ use crate::{
     new_uuid_v4, ActorKind, ActorRef, AddWorkUnitDependency, AdmitWorkUnitExecutionWithLifecycle,
     Agent, AgentListQuery, AgentProfile, AgentProfileRepo, AgentRepo, AgentStatus,
     AgentTaskListQuery, AllocateWorkUnit, Artifact, ClaimDomainEvents, CollaborationWrite,
-    CompleteDomainEvent, CreateAgent, CreateAgentIdentity, CreateAgentProfile, CreateDomainEvent,
-    CreateEvidence, CreateExecution, CreateHarnessSession, CreateNotification, CreatePrMetadata,
-    CreatePrProviderConfig, CreateProject, CreateProjectHookRun, CreateProjectIntegration,
-    CreateProjectMediaAsset, CreateRemotePrAdmission, CreateRepo, CreateReviewExecutionSubject,
-    CreateRuntime, CreateSkill, CreateTask, CreateTaskComment, CreateTaskExternalLink,
-    CreateTaskIntegrationOperation, CreateTaskMedia, CreateTerminalSession, CreateValidationRun,
-    CreateWorkUnit, CreateWorkUnitExecution, CreateWorkUnitIntegration, CreateWorkUnitWorkspace,
-    CreateWorkspace, CreateWorkspaceLease, Daemon, DaemonRepo, DbError, DomainEvent,
-    DomainEventRepo, EventConsumerCursor, Evidence, Execution, ExecutionEvidenceInput,
-    ExecutionRepo, ExecutionStatus, ExecutionUsage, ExecutionUsageRepo, ExternalLinkRepo,
+    CompleteDomainEvent, CoordinatorReplanDecisionProof, CreateAgent, CreateAgentIdentity,
+    CreateAgentProfile, CreateDomainEvent, CreateEvidence, CreateExecution, CreateHarnessSession,
+    CreateNotification, CreatePrMetadata, CreatePrProviderConfig, CreateProject,
+    CreateProjectHookRun, CreateProjectIntegration, CreateProjectMediaAsset,
+    CreateRemotePrAdmission, CreateRepo, CreateReviewExecutionSubject, CreateRuntime, CreateSkill,
+    CreateTask, CreateTaskComment, CreateTaskExternalLink, CreateTaskIntegrationOperation,
+    CreateTaskMedia, CreateTaskRepositorySetRevision, CreateTerminalSession, CreateValidationRun,
+    CreateWorkUnit, CreateWorkUnitExecution, CreateWorkUnitIntegration,
+    CreateWorkUnitRepositoryIntegration, CreateWorkUnitWorkspace, CreateWorkspace,
+    CreateWorkspaceLease, Daemon, DaemonRepo, DbError, DomainEvent, DomainEventRepo,
+    EventConsumerCursor, Evidence, Execution, ExecutionEvidenceInput, ExecutionRepo,
+    ExecutionStatus, ExecutionUsage, ExecutionUsageRepo, ExternalLinkRepo,
     FinishTaskIntegrationOperation, FinishValidationRun, HarnessSession, HarnessSessionRepo,
     HarnessSessionStatus, IntegrationRepo, MediaAsset, Notification, NotificationListQuery,
     NotificationRepo, Page, PageRequest, PrMetadata, PrMetadataRepo, PrProviderConfig,
@@ -25,7 +27,11 @@ use crate::{
     TaskComment, TaskCommentRepo, TaskDependencyRepo, TaskExternalLink, TaskIntegrationOperation,
     TaskIntegrationOperationKind, TaskIntegrationOperationRepo, TaskIntegrationOperationStatus,
     TaskLifecycleState, TaskLifecycleTransitionIdentity, TaskListQuery, TaskMedia, TaskMediaRepo,
-    TaskRepo, TaskUsageSummary, TerminalSession, TerminalSessionRepo, TerminalSessionStatus,
+    TaskRepo, TaskRepositoryMergeBatch, TaskRepositoryMergeBatchRepo,
+    TaskRepositoryMergeBatchRepoRow, TaskRepositoryMergeBatchRepoState,
+    TaskRepositoryMergeBatchState, TaskRepositoryRole, TaskRepositorySetRepo,
+    TaskRepositorySetRevision, TaskRepositorySetRevisionRepo, TaskRepositoryWrite,
+    TaskUsageSummary, TerminalSession, TerminalSessionRepo, TerminalSessionStatus,
     TransitionTaskLifecycle, TransitionWorkUnit, UpdateAgent, UpdateDaemonReport, UpdateExecution,
     UpdateHarnessSession, UpdatePrMetadata, UpdatePrProviderConfig, UpdateProject,
     UpdateProjectHookRun, UpdateProjectIntegration, UpdateRepo, UpdateSkill, UpdateTask,
@@ -33,8 +39,9 @@ use crate::{
     ValidationRunCompletionWrite, ValidationRunRepo, ValidationRunStartWrite, ValidationRunStatus,
     WorkUnit, WorkUnitDependency, WorkUnitExecutionLifecycleWrite, WorkUnitExecutionRepo,
     WorkUnitIntegration, WorkUnitIntegrationOutcome, WorkUnitProvenance, WorkUnitRepo,
-    WorkUnitStatus, WorkUnitWorkspaceRepo, Workspace, WorkspaceLease, WorkspaceLeaseRepo,
-    WorkspaceRepo, WorkspaceScope, WorkspaceStatus,
+    WorkUnitRepositoryIntegration, WorkUnitRepositoryIntegrationOutcome,
+    WorkUnitRepositoryIntegrationRepo, WorkUnitStatus, WorkUnitWorkspaceRepo, Workspace,
+    WorkspaceLease, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceScope, WorkspaceStatus,
 };
 use crate::{
     AuthorizeTaskCoordinationInput, CompleteTaskCoordinationTurnInput,
@@ -102,11 +109,14 @@ mod task_coordination;
 mod task_dependency;
 mod task_integration_operation;
 mod task_media;
+mod task_repository;
+mod task_repository_merge_batch;
 mod task_terminal_session;
 mod user_auth;
 mod validation_catalog;
 mod validation_run;
 mod work_unit;
+mod work_unit_repository_integration;
 mod workspace;
 mod workspace_lease;
 
@@ -322,6 +332,12 @@ fn check_error(error: sqlx::Error) -> DbError {
         {
             return DbError::Check(database_error.message().to_owned());
         }
+        if database_error
+            .message()
+            .contains("repository merge batch state/version transition")
+        {
+            return DbError::Check(database_error.message().to_owned());
+        }
     }
     error.into()
 }
@@ -350,6 +366,9 @@ pub(super) fn work_unit_execution_admission_error(error: &sqlx::Error) -> Option
             Some(DbError::WorkUnitRoleMembershipInactive)
         }
         "FORGE_WU_ADMISSION_WORKSPACE_UNAVAILABLE" => Some(DbError::WorkUnitWorkspaceUnavailable),
+        "FORGE_WU_ADMISSION_REVIEW_GROUP_UNAVAILABLE" => {
+            Some(DbError::WorkUnitReviewGroupUnavailable)
+        }
         "FORGE_WU_ADMISSION_ALREADY_RUNNING" => Some(DbError::WorkUnitExecutionAlreadyRunning),
         "FORGE_WU_ADMISSION_DEPENDENCY_UNSATISFIED" => Some(DbError::DependencyGate),
         "FORGE_WU_ADMISSION_PROJECT_DEPENDENCY_UNSATISFIED" => {
@@ -418,6 +437,15 @@ pub(crate) fn try_get_v173_text(row: &SqliteRow, column: &str) -> Result<Option<
     }
 }
 
+/// Reads a text column that may be absent in a historical schema fixture.
+pub(crate) fn try_get_optional_text(row: &SqliteRow, column: &str) -> Result<Option<String>> {
+    match row.try_get::<Option<String>, _>(column) {
+        Ok(value) => Ok(value),
+        Err(sqlx::Error::ColumnNotFound(_)) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn map_pr_provider_config(row: SqliteRow) -> Result<PrProviderConfig> {
     Ok(PrProviderConfig {
         id: row.try_get("id")?,
@@ -439,6 +467,8 @@ fn map_pr_metadata(row: SqliteRow) -> Result<PrMetadata> {
     Ok(PrMetadata {
         id: row.try_get("id")?,
         task_id: row.try_get("task_id")?,
+        repo_id: try_get_optional_text(&row, "repo_id")?
+            .or(try_get_optional_text(&row, "resolved_repo_id")?),
         provider_type: row.try_get("provider_type")?,
         provider_pr_id: row.try_get("provider_pr_id")?,
         pr_url: row.try_get("pr_url")?,
@@ -446,7 +476,8 @@ fn map_pr_metadata(row: SqliteRow) -> Result<PrMetadata> {
         target_branch: row.try_get("target_branch")?,
         pr_state: row.try_get("pr_state")?,
         merge_status: row.try_get("merge_status")?,
-        admission_status: row.try_get("admission_status")?,
+        admission_status: try_get_optional_text(&row, "admission_status")?
+            .unwrap_or_else(|| "legacy_unadmitted".to_owned()),
         task_merge_operation_id: row.try_get("task_merge_operation_id")?,
         publish_operation_id: row.try_get("publish_operation_id")?,
         last_synced_at: row.try_get("last_synced_at")?,

@@ -127,7 +127,10 @@ pub(crate) async fn dispatch_tool(
         "forge_list_projects" => handlers::forge_list_projects(state, arguments, context).await,
         "forge_get_project" => handlers::forge_get_project(state, arguments).await,
         "forge_create_project" => handlers::forge_create_project(state, arguments, context).await,
-        "forge_update_project" => handlers::forge_update_project(state, arguments).await,
+        "forge_update_project" => handlers::forge_update_project(state, arguments, context).await,
+        "forge_update_task_repositories" => {
+            handlers::forge_update_task_repositories(state, arguments, context).await
+        }
         "forge_update_project_hooks" => {
             handlers::forge_update_project_hooks(state, arguments).await
         }

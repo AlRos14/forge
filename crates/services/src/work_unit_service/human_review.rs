@@ -35,14 +35,13 @@ impl WorkUnitService {
                 "Review submission requires the exact assigned Human in a formal_review TaskRole",
             ));
         }
-        if !crate::task_rework::review_subject_ready(&self.db, work_unit_id).await?
-            || !crate::task_rework::reviewer_is_independent(
-                &self.db,
-                work_unit_id,
-                &api_types::ActorRef::Human(user_id.to_owned()),
-            )
-            .await?
-        {
+        let independent = crate::task_rework::reviewer_is_independent(
+            &self.db,
+            work_unit_id,
+            &api_types::ActorRef::Human(user_id.to_owned()),
+        )
+        .await?;
+        if !independent {
             return Err(invalid(
                 "Review requires an available exact result and an independent reviewer",
             ));
@@ -71,6 +70,26 @@ impl WorkUnitService {
         // Do not turn a client supplied version into authority.
         report.reviewed_work_unit_version = None;
         report.reviewed_work_unit_id = None;
+
+        // A replay of an already submitted review finds the WorkUnit completed;
+        // its subject rows and group were frozen and prepared by the first call.
+        if unit.status == WorkUnitStatus::Open && subject.result_execution_id.is_some() {
+            let repositories = self
+                .freeze_review_subject_repositories(work_unit_id)
+                .await?;
+            if !repositories.is_empty() {
+                // Human review is a workspace-free Execution, but repository
+                // subjects still require a prepared, read-only WorkspaceGroup
+                // before the database admission guard accepts that attempt.
+                self.prepare_workspace_group(source.clone(), work_unit_id)
+                    .await?;
+            }
+        }
+        if !crate::task_rework::review_subject_ready(&self.db, work_unit_id).await? {
+            return Err(invalid(
+                "Review requires an available exact result and an independent reviewer",
+            ));
+        }
 
         let digest = Sha256::digest(format!(
             "forge.human-work-unit-review.v1:{work_unit_id}:{expected_version}:{user_id}"

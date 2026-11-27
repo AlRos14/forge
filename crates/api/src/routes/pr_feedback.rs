@@ -105,6 +105,7 @@ fn feedback_item_response(
         id: item.id,
         task_id: item.task_id,
         admission_id: item.admission_id,
+        repo_id: item.repo_id,
         provider_item_id: item.provider_item_id,
         kind: item.kind,
         author_login: item.author_login,
@@ -133,6 +134,7 @@ fn action_response(row: SqliteRow) -> Result<PrExternalActionResponse, sqlx::Err
         id: row.try_get("id")?,
         task_id: row.try_get("task_id")?,
         admission_id: row.try_get("admission_id")?,
+        repo_id: row.try_get("repo_id")?,
         kind: row.try_get("kind")?,
         state: row.try_get("state")?,
         authorization_mode: row.try_get("authorization_mode")?,
@@ -150,11 +152,15 @@ fn action_response(row: SqliteRow) -> Result<PrExternalActionResponse, sqlx::Err
     })
 }
 
-fn action_model_response(action: db::PrExternalAction) -> PrExternalActionResponse {
+fn action_model_response(
+    action: db::PrExternalAction,
+    repo_id: String,
+) -> PrExternalActionResponse {
     PrExternalActionResponse {
         id: action.id,
         task_id: action.task_id,
         admission_id: action.admission_id,
+        repo_id,
         kind: action.kind.to_string(),
         state: action.state.to_string(),
         authorization_mode: action.authorization_mode.to_string(),
@@ -176,6 +182,8 @@ fn supersession_response(row: SqliteRow) -> Result<PrReworkSupersessionResponse,
     Ok(PrReworkSupersessionResponse {
         id: row.try_get("id")?,
         task_id: row.try_get("task_id")?,
+        repo_id: row.try_get("repo_id")?,
+        admission_id: row.try_get("task_merge_operation_id")?,
         task_merge_operation_id: row.try_get("task_merge_operation_id")?,
         publish_operation_id: row.try_get("publish_operation_id")?,
         metadata_id: row.try_get("metadata_id")?,
@@ -217,11 +225,49 @@ pub async fn list_task_rework(
     tasks::require_task_visible(&state, &task_id, &user).await?;
     let cursor = decode_keyset_cursor(query.cursor)?;
     let limit = page_limit(query.limit);
-    let mut sql = "SELECT * FROM pr_rework_supersession WHERE task_id = ?".to_owned();
+    let mut sql = "SELECT supersession.*,
+                          COALESCE(admission.repo_id, merge_op.repo_id, task.repo_id) AS repo_id
+                   FROM pr_rework_supersession supersession
+                   JOIN remote_pr_admission admission
+                     ON admission.task_merge_operation_id = supersession.task_merge_operation_id
+                    AND admission.task_id = supersession.task_id
+                   JOIN task_integration_operation merge_op
+                     ON merge_op.id = admission.task_merge_operation_id
+                    AND merge_op.task_id = admission.task_id
+                    AND merge_op.kind = 'task_merge'
+                   JOIN task ON task.id = admission.task_id
+                   WHERE supersession.task_id = ?
+                     AND (
+                         (merge_op.repository_merge_batch_id IS NOT NULL
+                          AND admission.repo_id = merge_op.repo_id)
+                         OR (merge_op.repository_merge_batch_id IS NULL
+                             AND (admission.repo_id IS NULL OR admission.repo_id = task.repo_id)
+                             AND (merge_op.repo_id IS NULL OR merge_op.repo_id = task.repo_id)
+                             AND task.repo_id IS NOT NULL
+                             AND NOT EXISTS (
+                                 SELECT 1 FROM task_requires_repository_merge_batch required
+                                 WHERE required.task_id = task.id
+                             )
+                             AND EXISTS (
+                                 SELECT 1 FROM task_repository_set_revision revision
+                                 JOIN task_repository_set_revision_repo repository
+                                   ON repository.task_id = revision.task_id
+                                  AND repository.revision = revision.revision
+                                 WHERE revision.task_id = task.id AND revision.state = 'current'
+                                   AND repository.repo_id = task.repo_id
+                                   AND repository.role = 'primary'
+                                   AND (SELECT COUNT(*)
+                                        FROM task_repository_set_revision_repo writable
+                                        WHERE writable.task_id = revision.task_id
+                                          AND writable.revision = revision.revision
+                                          AND writable.role IN ('primary', 'affected')) = 1
+                             ))
+                     )"
+    .to_owned();
     if cursor.is_some() {
-        sql.push_str(" AND (created_at < ? OR (created_at = ? AND id < ?))");
+        sql.push_str(" AND (supersession.created_at < ? OR (supersession.created_at = ? AND supersession.id < ?))");
     }
-    sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ?");
+    sql.push_str(" ORDER BY supersession.created_at DESC, supersession.id DESC LIMIT ?");
     let mut request = sqlx::query(&sql).bind(&task_id);
     if let Some(cursor) = &cursor {
         request = request
@@ -262,14 +308,52 @@ pub async fn list_task_actions(
     let state_filter = action_state(query.state.as_deref())?.map(|state| state.to_string());
     let cursor = decode_keyset_cursor(query.cursor)?;
     let limit = page_limit(query.limit);
-    let mut sql = "SELECT * FROM pr_external_action WHERE task_id = ?".to_owned();
+    let mut sql = "SELECT action.*,
+                          COALESCE(admission.repo_id, merge_op.repo_id, task.repo_id) AS repo_id
+                   FROM pr_external_action action
+                   JOIN remote_pr_admission admission
+                     ON admission.task_merge_operation_id = action.admission_id
+                    AND admission.task_id = action.task_id
+                   JOIN task_integration_operation merge_op
+                     ON merge_op.id = admission.task_merge_operation_id
+                    AND merge_op.task_id = admission.task_id
+                    AND merge_op.kind = 'task_merge'
+                   JOIN task ON task.id = admission.task_id
+                   WHERE action.task_id = ?
+                     AND (
+                         (merge_op.repository_merge_batch_id IS NOT NULL
+                          AND admission.repo_id = merge_op.repo_id)
+                         OR (merge_op.repository_merge_batch_id IS NULL
+                             AND (admission.repo_id IS NULL OR admission.repo_id = task.repo_id)
+                             AND (merge_op.repo_id IS NULL OR merge_op.repo_id = task.repo_id)
+                             AND task.repo_id IS NOT NULL
+                             AND NOT EXISTS (
+                                 SELECT 1 FROM task_requires_repository_merge_batch required
+                                 WHERE required.task_id = task.id
+                             )
+                             AND EXISTS (
+                                 SELECT 1 FROM task_repository_set_revision revision
+                                 JOIN task_repository_set_revision_repo repository
+                                   ON repository.task_id = revision.task_id
+                                  AND repository.revision = revision.revision
+                                 WHERE revision.task_id = task.id AND revision.state = 'current'
+                                   AND repository.repo_id = task.repo_id
+                                   AND repository.role = 'primary'
+                                   AND (SELECT COUNT(*)
+                                        FROM task_repository_set_revision_repo writable
+                                        WHERE writable.task_id = revision.task_id
+                                          AND writable.revision = revision.revision
+                                          AND writable.role IN ('primary', 'affected')) = 1
+                             ))
+                     )"
+    .to_owned();
     if state_filter.is_some() {
-        sql.push_str(" AND state = ?");
+        sql.push_str(" AND action.state = ?");
     }
     if cursor.is_some() {
-        sql.push_str(" AND (created_at < ? OR (created_at = ? AND id < ?))");
+        sql.push_str(" AND (action.created_at < ? OR (action.created_at = ? AND action.id < ?))");
     }
-    sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ?");
+    sql.push_str(" ORDER BY action.created_at DESC, action.id DESC LIMIT ?");
     let mut request = sqlx::query(&sql).bind(&task_id);
     if let Some(state_filter) = &state_filter {
         request = request.bind(state_filter);
@@ -364,7 +448,15 @@ async fn decide_task_action(
             .await
     }
     .map_err(map_action_error)?;
-    Ok(Json(action_model_response(decided)))
+    let repo_id: String = sqlx::query_scalar(
+        "SELECT repo_id FROM remote_pr_admission
+         WHERE task_merge_operation_id = ? AND task_id = ?",
+    )
+    .bind(&action.admission_id)
+    .bind(&task_id)
+    .fetch_one(state.db.pool())
+    .await?;
+    Ok(Json(action_model_response(decided, repo_id)))
 }
 
 pub async fn get_repo_feedback_policy(

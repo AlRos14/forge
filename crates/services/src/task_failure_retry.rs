@@ -1346,6 +1346,7 @@ mod tests {
             TaskRepo::create(
                 &*db,
                 CreateTask {
+                    repositories: Vec::new(),
                     id: id.clone(),
                     project_id: project_id.clone(),
                     repo_id: None,
@@ -2661,6 +2662,7 @@ mod tests {
         TaskRepo::create(
             &*db,
             CreateTask {
+                repositories: Vec::new(),
                 id: task_id.clone(),
                 project_id: project_id.clone(),
                 repo_id: None,
@@ -2968,6 +2970,7 @@ mod tests {
         TaskRepo::create(
             &*db,
             CreateTask {
+                repositories: Vec::new(),
                 id: task_id.clone(),
                 project_id: project_id.clone(),
                 repo_id: None,
@@ -3296,6 +3299,7 @@ mod tests {
         TaskRepo::create(
             &*db,
             CreateTask {
+                repositories: Vec::new(),
                 id: blocked_task_id.clone(),
                 project_id: project_id.clone(),
                 repo_id: None,
@@ -3399,6 +3403,7 @@ mod tests {
         TaskRepo::create(
             &*db,
             CreateTask {
+                repositories: Vec::new(),
                 id: merge_retry_task_id.clone(),
                 project_id: project_id.clone(),
                 repo_id: None,
@@ -3527,6 +3532,7 @@ mod tests {
         TaskRepo::create(
             &*db,
             CreateTask {
+                repositories: Vec::new(),
                 id: task_id.clone(),
                 project_id,
                 repo_id: None,

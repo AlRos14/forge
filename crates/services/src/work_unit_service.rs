@@ -5,11 +5,13 @@ use std::{path::Path, path::PathBuf, sync::Arc};
 use db::{
     new_uuid_v4, now_rfc3339, ActorRef, AddWorkUnitDependency, AgentRepo, AllocateWorkUnit,
     CreateDomainEvent, CreateExecution, CreateWorkUnit, CreateWorkUnitExecution,
-    CreateWorkUnitIntegration, CreateWorkUnitReviewSubject, Execution, ExecutionRepo,
-    ExecutionStatus, RecordWorkUnitIntegration, RepoRepo, SqliteDb, Task, TaskRepo,
-    TransitionWorkUnit, UpdateWorkUnit, WorkUnit, WorkUnitDependency, WorkUnitExecutionRepo,
-    WorkUnitIntegration, WorkUnitIntegrationOutcome, WorkUnitProvenance, WorkUnitRepo,
-    WorkUnitStatus, WorkUnitWorkspaceRepo, Workspace, WorkspaceRepo, WorkspaceScopeKind,
+    CreateWorkUnitIntegration, CreateWorkUnitRepositoryIntegration, CreateWorkUnitReviewSubject,
+    Execution, ExecutionRepo, ExecutionStatus, RecordWorkUnitIntegration, RepoRepo, SqliteDb, Task,
+    TaskRepo, TaskRepositoryRole, TaskRepositorySetRepo, TransitionWorkUnit, UpdateWorkUnit,
+    WorkUnit, WorkUnitDependency, WorkUnitExecutionRepo, WorkUnitIntegration,
+    WorkUnitIntegrationOutcome, WorkUnitProvenance, WorkUnitRepo, WorkUnitRepositoryIntegration,
+    WorkUnitRepositoryIntegrationOutcome, WorkUnitRepositoryIntegrationRepo, WorkUnitStatus,
+    WorkUnitWorkspaceRepo, Workspace, WorkspaceGroup, WorkspaceRepo, WorkspaceScopeKind,
     WorkspaceStatus,
 };
 use events::EventBus;
@@ -22,7 +24,7 @@ use crate::{
     collaboration_service::{CollaborationActorSource, CollaborationService},
     domain_event_service::DomainEventService,
     task_integration_operation::TaskIntegrationOperationManager,
-    task_service::workspace::{prepare_integration_workspace_for_work_unit, resolve_repo_source},
+    task_service::workspace::{prepare_integration_workspace_for_repository, resolve_repo_source},
     workspace_execution_lock::WorkspaceExecutionLockManager,
     Result, ServiceError,
 };
@@ -36,6 +38,41 @@ pub struct WorkUnitReadiness {
     pub awaiting_integration: bool,
     pub awaiting_acceptance: bool,
     pub awaiting_review_approval: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkUnitIntegrationBatch {
+    pub task_id: String,
+    pub work_unit_id: String,
+    pub repository_revision: i64,
+    pub items: Vec<RepositoryIntegrationResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryIntegrationResult {
+    pub repo_id: String,
+    pub integration_id: String,
+    pub source_sha: String,
+    pub before_sha: Option<String>,
+    pub after_sha: Option<String>,
+    pub outcome: String,
+}
+
+#[derive(Debug)]
+struct PreparedRepositoryIntegration {
+    repo_id: String,
+    source_workspace: Workspace,
+    source_sha: String,
+    target_workspace: Workspace,
+    base_sha: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceGroupMember {
+    repo: db::Repo,
+    role: db::TaskRepositoryRole,
+    base_sha: String,
+    read_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -95,7 +132,18 @@ impl WorkUnitService {
         source: CollaborationActorSource,
         input: CreateWorkUnitInput,
     ) -> Result<WorkUnit> {
-        self.create_with_id(source, input, new_uuid_v4()).await
+        self.create_with_repository_ids(source, input, Vec::new())
+            .await
+    }
+
+    pub async fn create_with_repository_ids(
+        &self,
+        source: CollaborationActorSource,
+        input: CreateWorkUnitInput,
+        repository_ids: Vec<String>,
+    ) -> Result<WorkUnit> {
+        self.create_with_request_digest(source, input, new_uuid_v4(), None, repository_ids)
+            .await
     }
 
     /// Create or replay a WorkUnit by a caller-scoped idempotency key.
@@ -109,6 +157,17 @@ impl WorkUnitService {
         source: CollaborationActorSource,
         input: CreateWorkUnitInput,
         idempotency_key: &str,
+    ) -> Result<WorkUnit> {
+        self.create_idempotent_with_repository_ids(source, input, idempotency_key, Vec::new())
+            .await
+    }
+
+    pub async fn create_idempotent_with_repository_ids(
+        &self,
+        source: CollaborationActorSource,
+        input: CreateWorkUnitInput,
+        idempotency_key: &str,
+        repository_ids: Vec<String>,
     ) -> Result<WorkUnit> {
         if idempotency_key.trim().is_empty() {
             return Err(invalid("WorkUnit idempotency key must not be empty"));
@@ -152,6 +211,7 @@ impl WorkUnitService {
             "review_subject": input.review_subject,
             "artifact_inputs": input.artifact_inputs,
             "review_approval": input.review_approval,
+            "repository_ids": repository_ids,
         }))
         .map_err(|_| invalid("WorkUnit request could not be encoded"))?;
         let request_digest = hex::encode(Sha256::digest(intent));
@@ -160,6 +220,7 @@ impl WorkUnitService {
             input,
             Uuid::from_bytes(id_bytes).to_string(),
             Some(request_digest),
+            repository_ids,
         )
         .await
     }
@@ -170,7 +231,7 @@ impl WorkUnitService {
         input: CreateWorkUnitInput,
         id: String,
     ) -> Result<WorkUnit> {
-        self.create_with_request_digest(source, input, id, None)
+        self.create_with_request_digest(source, input, id, None, Vec::new())
             .await
     }
 
@@ -180,6 +241,7 @@ impl WorkUnitService {
         input: CreateWorkUnitInput,
         id: String,
         request_digest: Option<String>,
+        repository_ids: Vec<String>,
     ) -> Result<WorkUnit> {
         let requested_input = input.clone();
         let CreateWorkUnitInput {
@@ -200,6 +262,7 @@ impl WorkUnitService {
             .collaboration
             .authorize_mutation_source(&task_id, &source)
             .await?;
+        validate_work_unit_repository_ids(&self.db, &task.id, &repository_ids).await?;
         if let Some(existing) = self
             .existing_work_unit_for_create(&id, &actor, &requested_input, request_digest.as_deref())
             .await?
@@ -332,12 +395,12 @@ impl WorkUnitService {
                 "Task still has active Task-scoped repository authority; finish it before creating WorkUnits",
             ));
         }
-        if let Some(integration_workspace) =
-            WorkspaceRepo::get_integration_by_task_id(&*self.db, &task.id).await?
+        for integration_workspace in
+            WorkspaceRepo::list_integrations_by_task(&*self.db, &task.id).await?
         {
             if integration_workspace.status == WorkspaceStatus::Cleaning {
                 return Err(invalid(
-                    "Task integration Workspace is being cleaned and cannot be adopted by WorkUnits",
+                    "a Task repository integration Workspace is being cleaned and cannot be adopted by WorkUnits",
                 ));
             }
             if integration_workspace.cleanup_after.is_some() {
@@ -445,6 +508,7 @@ impl WorkUnitService {
         let work_unit_input = CreateWorkUnit {
                 id,
                 task_id: task_id.clone(),
+                repository_ids,
                 parent_work_unit_id,
                 title,
                 scope,
@@ -598,7 +662,57 @@ impl WorkUnitService {
                 }
                 (None, None)
             };
-            WorkUnitRepo::create_with_review_subject(
+            let repository_subjects = if !reviewed.requires_integration {
+                Vec::new()
+            } else if let Some(result_execution_id) =
+                result_execution_id.as_deref()
+            {
+                ExecutionRepo::list_repository_results(&*self.db, result_execution_id)
+                    .await?
+                    .into_iter()
+                    .map(|result| db::WorkUnitReviewSubjectRepository {
+                        review_work_unit_id: review_work_unit_id.clone(),
+                        task_id: task.id.clone(),
+                        repo_id: result.repo_id,
+                        reviewed_work_unit_id: reviewed.id.clone(),
+                        reviewed_work_unit_version,
+                        result_execution_id: Some(result.execution_id),
+                        result_artifact_id: result_artifact_id.clone(),
+                        result_commit_sha: result.after_sha,
+                        result_workspace_id: Some(result.workspace_id),
+                        workspace_snapshot_digest: result.snapshot_digest,
+                        created_at: now.clone(),
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                let task_repositories = TaskRepo::list_repositories(&*self.db, &task.id).await?;
+                let selected_repository_ids =
+                    WorkUnitRepo::list_repository_ids(&*self.db, &reviewed.id).await?;
+                task_repositories
+                    .into_iter()
+                    .filter(|repository| {
+                        matches!(
+                            repository.role,
+                            db::TaskRepositoryRole::Primary | db::TaskRepositoryRole::Affected
+                        ) && (selected_repository_ids.is_empty()
+                            || selected_repository_ids.contains(&repository.repo_id))
+                    })
+                    .map(|repository| db::WorkUnitReviewSubjectRepository {
+                        review_work_unit_id: review_work_unit_id.clone(),
+                        task_id: task.id.clone(),
+                        repo_id: repository.repo_id,
+                        reviewed_work_unit_id: reviewed.id.clone(),
+                        reviewed_work_unit_version: None,
+                        result_execution_id: None,
+                        result_artifact_id: None,
+                        result_commit_sha: None,
+                        result_workspace_id: None,
+                        workspace_snapshot_digest: None,
+                        created_at: now.clone(),
+                    })
+                    .collect::<Vec<_>>()
+            };
+            WorkUnitRepo::create_with_review_subject_repositories(
                 &*self.db,
                 work_unit_input,
                 CreateWorkUnitReviewSubject {
@@ -615,6 +729,7 @@ impl WorkUnitService {
                     manifest_digest,
                     created_at: now,
                 },
+                &repository_subjects,
                 event,
             )
             .await?
@@ -796,9 +911,9 @@ impl WorkUnitService {
             return Err(db::DbError::VersionConflict.into());
         }
         if requires_integration.is_some_and(|next| next != unit.requires_integration)
-            && (WorkUnitWorkspaceRepo::get_by_work_unit_id(&*self.db, id)
+            && (!WorkUnitWorkspaceRepo::list_by_work_unit_id(&*self.db, id)
                 .await?
-                .is_some()
+                .is_empty()
                 || sqlx::query_scalar::<_, i64>(
                     "SELECT EXISTS(SELECT 1 FROM execution WHERE work_unit_id = ?)",
                 )
@@ -982,12 +1097,27 @@ impl WorkUnitService {
                 let has_result: i64 = sqlx::query_scalar(
                     "SELECT EXISTS(
                         SELECT 1 FROM execution e
-                        JOIN workspace_scope s
-                          ON s.workspace_id = e.workspace_id AND s.task_id = e.task_id
                         WHERE e.work_unit_id = ? AND e.task_id = ?
                           AND e.work_unit_version = ?
-                          AND e.status = 'completed' AND e.after_sha IS NOT NULL
-                          AND s.scope_kind = 'work_unit' AND s.work_unit_id = e.work_unit_id
+                          AND e.status = 'completed'
+                          AND (
+                              EXISTS (
+                                  SELECT 1 FROM execution_repository_result result
+                                  WHERE result.execution_id = e.id
+                                    AND result.task_id = e.task_id
+                                    AND result.after_sha IS NOT NULL
+                              )
+                              OR (
+                                  e.workspace_id IS NOT NULL AND e.after_sha IS NOT NULL
+                                  AND EXISTS (
+                                      SELECT 1 FROM workspace_scope scope
+                                      WHERE scope.workspace_id = e.workspace_id
+                                        AND scope.task_id = e.task_id
+                                        AND scope.scope_kind = 'work_unit'
+                                        AND scope.work_unit_id = e.work_unit_id
+                                  )
+                              )
+                          )
                     )",
                 )
                 .bind(id)
@@ -997,7 +1127,7 @@ impl WorkUnitService {
                 .await?;
                 if has_result == 0 {
                     return Err(invalid(
-                        "Repository WorkUnit requires a completed Execution result SHA",
+                        "Repository WorkUnit requires a completed repository result SHA",
                     ));
                 }
             }
@@ -1462,53 +1592,31 @@ impl WorkUnitService {
         if current.version != expected_version || current.status != WorkUnitStatus::Open {
             return Err(db::DbError::VersionConflict.into());
         }
-        let _workspace_guard = if current.requires_integration {
-            let workspace_id = execution.workspace_id.as_deref().ok_or_else(|| {
-                invalid("repository WorkUnit Execution requires its exact Workspace")
-            })?;
-            Some(self.integration_locks.acquire(workspace_id).await)
-        } else {
-            if execution.workspace_id.is_some() {
-                return Err(invalid(
-                    "non-mutating WorkUnit Execution cannot bind a repository Workspace",
-                ));
-            }
-            None
-        };
+        let mut workspace_lock_keys = vec![format!("work-unit-workspace:{id}")];
+        workspace_lock_keys.extend(
+            WorkUnitWorkspaceRepo::list_by_work_unit_id(&*self.db, id)
+                .await?
+                .into_iter()
+                .map(|workspace| workspace.id),
+        );
+        workspace_lock_keys.sort();
+        workspace_lock_keys.dedup();
+        let mut _workspace_guards = Vec::with_capacity(workspace_lock_keys.len());
+        for lock_key in workspace_lock_keys {
+            _workspace_guards.push(self.integration_locks.acquire(&lock_key).await);
+        }
         let current = WorkUnitRepo::get_by_id(&*self.db, id)
             .await?
             .ok_or_else(|| not_found("work_unit", id))?;
         if current.version != expected_version || current.status != WorkUnitStatus::Open {
             return Err(db::DbError::VersionConflict.into());
         }
-        let workspace_lease = if current.requires_integration {
-            let workspace_id = execution.workspace_id.as_deref().ok_or_else(|| {
-                invalid("repository WorkUnit Execution requires its exact Workspace")
-            })?;
-            let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
-                .await?
-                .ok_or_else(|| not_found("workspace", workspace_id))?;
-            let scope = WorkUnitWorkspaceRepo::get_scope_by_id(&*self.db, workspace_id)
-                .await?
-                .ok_or_else(|| not_found("workspace", workspace_id))?;
-            if scope.task_id != task.id
-                || scope.kind != WorkspaceScopeKind::WorkUnit
-                || scope.work_unit_id.as_deref() != Some(id)
-                || workspace.status != WorkspaceStatus::Ready
-            {
-                return Err(not_found("workspace", workspace_id));
-            }
-            Some(
-                crate::task_service::TaskService::new(
-                    Arc::clone(&self.db),
-                    Arc::clone(&self.event_bus),
-                )
-                .prepare_work_unit_workspace_lease(&task, &current, &workspace, &execution, &actor)
-                .await?,
-            )
-        } else {
-            None
-        };
+        let workspace_leases = crate::task_service::TaskService::new(
+            Arc::clone(&self.db),
+            Arc::clone(&self.event_bus),
+        )
+        .prepare_work_unit_workspace_leases(&task, &current, &execution, &actor)
+        .await?;
         let now = execution.created_at.clone();
         let event = self.event(
             "execution.started", "execution", &execution.id, &task, &actor,
@@ -1521,7 +1629,7 @@ impl WorkUnitService {
                 execution,
                 work_unit_id: id.to_owned(),
                 work_unit_version: expected_version,
-                workspace_lease,
+                workspace_leases,
             },
             event,
         )
@@ -1542,7 +1650,7 @@ impl WorkUnitService {
             "SELECT DISTINCT unit.id FROM work_unit unit
              JOIN task_coordination coordination ON coordination.task_id = unit.task_id
              WHERE unit.task_id = ? AND unit.status = 'open'
-               AND unit.requires_integration = 1 AND unit.assigned_actor_kind = 'agent'
+               AND unit.assigned_actor_kind = 'agent'
                AND coordination.mode != 'manual' AND coordination.revoked_at IS NULL
                AND coordination.team_stale = 0 AND coordination.authorization_version = ?
                AND (
@@ -1564,10 +1672,45 @@ impl WorkUnitService {
         let source = CollaborationActorSource::Human(user_id.to_owned());
         let mut blockers = Vec::new();
         for id in ids {
-            if WorkUnitWorkspaceRepo::get_by_work_unit_id(&*self.db, &id)
-                .await?
-                .is_some()
+            let Some(unit) = WorkUnitRepo::get_by_id(&*self.db, &id).await? else {
+                continue;
+            };
+            let Some(role) = db::canonical_task_role_name(&unit.role) else {
+                continue;
+            };
+            let Some(task_role) =
+                db::TaskRoleRepo::get_by_task_and_role(&*self.db, task_id, &role).await?
+            else {
+                continue;
+            };
+            let formal_review = crate::role_capabilities::current_task_role_has_capability(
+                &self.db,
+                &task_role.id,
+                api_types::TaskRoleCapability::FormalReview,
+            )
+            .await?;
+            if !unit.requires_integration && !formal_review {
+                continue;
+            }
+            let group = WorkspaceRepo::get_group_by_work_unit_id(&*self.db, &id).await?;
+            if group.is_none()
+                && !WorkUnitWorkspaceRepo::list_by_work_unit_id(&*self.db, &id)
+                    .await?
+                    .is_empty()
             {
+                // A V181 single-Workspace WorkUnit is historical evidence. It
+                // has no safe group root to infer, so leave it on its original
+                // execution path.
+                continue;
+            }
+            if formal_review
+                && self
+                    .freeze_review_subject_repositories(&id)
+                    .await?
+                    .is_empty()
+            {
+                // Artifact-only reviews keep the isolated context and
+                // receive no implicit repository WorkspaceGroup.
                 continue;
             }
             match self.readiness(source.clone(), &id).await {
@@ -1578,18 +1721,458 @@ impl WorkUnitService {
                     continue;
                 }
             }
-            if let Err(error) = self.prepare_workspace(source.clone(), &id).await {
+            if let Err(error) = self.prepare_workspace_group(source.clone(), &id).await {
                 blockers.push(format!("workspace_preparation_failed: {id}: {error}"));
             }
         }
         Ok(blockers)
     }
 
-    pub async fn prepare_workspace(
+    async fn workspace_group_members(
+        &self,
+        task: &Task,
+        work_unit: &db::WorkUnit,
+        formal_review: bool,
+    ) -> Result<Vec<WorkspaceGroupMember>> {
+        let task_repositories = TaskRepo::list_repositories(&*self.db, &task.id).await?;
+        let mut members = Vec::new();
+        if formal_review {
+            let subject = self
+                .freeze_review_subject_repositories(&work_unit.id)
+                .await?;
+            for row in subject {
+                let base_sha = row.result_commit_sha.clone().ok_or_else(|| {
+                    invalid("Review subject repository has no exact result commit")
+                })?;
+                if row.result_workspace_id.is_none()
+                    || row.result_execution_id.is_none()
+                    || row.reviewed_work_unit_version.is_none()
+                {
+                    return Err(invalid(
+                        "Review subject repository is not frozen to an exact result Workspace",
+                    ));
+                }
+                let repository = task_repositories
+                    .iter()
+                    .find(|repository| repository.repo_id == row.repo_id)
+                    .filter(|repository| {
+                        matches!(
+                            repository.role,
+                            db::TaskRepositoryRole::Primary | db::TaskRepositoryRole::Affected
+                        )
+                    })
+                    .ok_or_else(|| {
+                        invalid("Review subject repository is not writable in the Task scope")
+                    })?;
+                let repo = RepoRepo::get_by_id(&*self.db, &repository.repo_id)
+                    .await?
+                    .ok_or_else(|| not_found("repo", repository.repo_id.clone()))?;
+                let repo_path = resolve_repo_source(&repo, &self.workspace_root).await?;
+                git::commit_parents(Path::new(&repo_path), &base_sha)
+                    .await
+                    .map_err(|_| {
+                        invalid("Review result commit is unavailable in its repository")
+                    })?;
+                members.push(WorkspaceGroupMember {
+                    repo,
+                    role: repository.role,
+                    base_sha,
+                    read_only: true,
+                });
+            }
+            members.sort_by_key(|member| {
+                task_repositories
+                    .iter()
+                    .find(|repository| repository.repo_id == member.repo.id)
+                    .map(|repository| repository.position)
+                    .unwrap_or(i64::MAX)
+            });
+            return Ok(members);
+        }
+
+        let selected = WorkUnitRepo::list_repository_ids(&*self.db, &work_unit.id).await?;
+        let existing_workspaces =
+            WorkUnitWorkspaceRepo::list_by_work_unit_id(&*self.db, &work_unit.id).await?;
+        let requirements =
+            WorkUnitRepo::list_result_requirement_repositories(&*self.db, &work_unit.id).await?;
+        for repository in &task_repositories {
+            if !matches!(
+                repository.role,
+                db::TaskRepositoryRole::Primary | db::TaskRepositoryRole::Affected
+            ) || (!selected.is_empty() && !selected.contains(&repository.repo_id))
+            {
+                continue;
+            }
+            let repo = RepoRepo::get_by_id(&*self.db, &repository.repo_id)
+                .await?
+                .ok_or_else(|| not_found("repo", repository.repo_id.clone()))?;
+            let repo_path = resolve_repo_source(&repo, &self.workspace_root).await?;
+            let required = requirements
+                .iter()
+                .find(|requirement| requirement.repo_id == repo.id);
+            let previous_base = existing_workspaces
+                .iter()
+                .find(|workspace| workspace.repo_id == repo.id)
+                .and_then(|workspace| workspace.before_sha.clone());
+            let required_base = if let Some(requirement) = required {
+                let base_sha = requirement.result_commit_sha.as_deref().ok_or_else(|| {
+                    invalid("consumed repository result has no exact base commit")
+                })?;
+                git::commit_parents(Path::new(&repo_path), base_sha)
+                    .await
+                    .map_err(|_| {
+                        invalid(
+                            "consumed WorkUnit result commit is not available in the repository",
+                        )
+                    })?;
+                Some(base_sha.to_owned())
+            } else if previous_base.is_none() {
+                let integration = prepare_integration_workspace_for_repository(
+                    &self.db,
+                    &self.workspace_root,
+                    task,
+                    &repo.id,
+                    Some(Arc::clone(&self.repo_cache_locks)),
+                )
+                .await?;
+                if integration.repo_id != repo.id {
+                    return Err(invalid(
+                        "Task integration Workspace does not match its WorkUnit repository",
+                    ));
+                }
+                Some(git::get_current_sha(Path::new(&integration.worktree_path)).await?)
+            } else {
+                None
+            };
+            if required_base
+                .as_deref()
+                .zip(previous_base.as_deref())
+                .is_some_and(|(required, previous)| required != previous)
+            {
+                return Err(invalid(
+                    "existing WorkspaceGroup base differs from its pinned result requirement",
+                ));
+            }
+            let base_sha = match (required_base, previous_base) {
+                (Some(required), _) => required,
+                (None, Some(previous)) => previous,
+                (None, None) => git::get_current_sha(Path::new(&repo_path)).await?,
+            };
+            members.push(WorkspaceGroupMember {
+                repo,
+                role: repository.role,
+                base_sha,
+                read_only: false,
+            });
+        }
+        if members.iter().all(|member| member.read_only) {
+            return Err(invalid(
+                "repository WorkUnit has no writable repository scope",
+            ));
+        }
+        for repository in &task_repositories {
+            if repository.role != db::TaskRepositoryRole::Context {
+                continue;
+            }
+            let repo = RepoRepo::get_by_id(&*self.db, &repository.repo_id)
+                .await?
+                .ok_or_else(|| not_found("repo", repository.repo_id.clone()))?;
+            let repo_path = resolve_repo_source(&repo, &self.workspace_root).await?;
+            let observed_sha = git::get_current_sha(Path::new(&repo_path)).await?;
+            let pin = TaskRepo::pin_context_repository_snapshot(
+                &*self.db,
+                db::CreateTaskRepositoryContextSnapshot {
+                    task_id: task.id.clone(),
+                    repo_id: repo.id.clone(),
+                    commit_sha: observed_sha,
+                    captured_at: now_rfc3339(),
+                },
+            )
+            .await?;
+            git::commit_parents(Path::new(&repo_path), &pin.commit_sha)
+                .await
+                .map_err(|_| invalid("pinned context repository commit is unavailable"))?;
+            members.push(WorkspaceGroupMember {
+                repo,
+                role: repository.role,
+                base_sha: pin.commit_sha,
+                read_only: true,
+            });
+        }
+        Ok(members)
+    }
+
+    async fn freeze_review_subject_repositories(
+        &self,
+        review_work_unit_id: &str,
+    ) -> Result<Vec<db::WorkUnitReviewSubjectRepository>> {
+        let subject = crate::task_rework::get_review_subject(&self.db, review_work_unit_id)
+            .await?
+            .ok_or_else(|| {
+                invalid("Formal WorkUnit review requires its exact persisted subject")
+            })?;
+        let mut repositories =
+            WorkUnitRepo::list_review_subject_repositories(&*self.db, review_work_unit_id).await?;
+        if repositories.is_empty() {
+            let reviewed = WorkUnitRepo::get_by_id(&*self.db, &subject.reviewed_work_unit_id)
+                .await?
+                .filter(|reviewed| reviewed.task_id == subject.task_id)
+                .ok_or_else(|| not_found("work_unit", subject.reviewed_work_unit_id.clone()))?;
+            if subject.result_workspace_id.is_none() && !reviewed.requires_integration {
+                return Ok(repositories);
+            }
+            return Err(invalid("Review subject has no repository result rows"));
+        }
+        if repositories.iter().any(|repository| {
+            repository.result_execution_id.is_none()
+                || repository.reviewed_work_unit_version.is_none()
+        }) {
+            let result_execution_id = subject
+                .result_execution_id
+                .as_deref()
+                .ok_or_else(|| invalid("Review subject has no completed result Execution"))?;
+            let execution = ExecutionRepo::get_by_id(&*self.db, result_execution_id)
+                .await?
+                .filter(|execution| {
+                    execution.task_id == subject.task_id
+                        && execution.work_unit_id.as_deref()
+                            == Some(subject.reviewed_work_unit_id.as_str())
+                        && execution.status == ExecutionStatus::Completed
+                })
+                .ok_or_else(|| {
+                    invalid("Review subject result Execution is not exact and complete")
+                })?;
+            let version = subject
+                .reviewed_work_unit_version
+                .ok_or_else(|| invalid("Review subject has no exact WorkUnit version"))?;
+            if execution.work_unit_version != Some(version) {
+                return Err(invalid("Review subject result Execution version differs"));
+            }
+            let results =
+                ExecutionRepo::list_repository_results(&*self.db, result_execution_id).await?;
+            let mut frozen = Vec::with_capacity(repositories.len());
+            for repository in &repositories {
+                let result = results
+                    .iter()
+                    .find(|result| result.repo_id == repository.repo_id)
+                    .ok_or_else(|| invalid("Review subject repository result is missing"))?;
+                frozen.push(db::WorkUnitReviewSubjectRepository {
+                    reviewed_work_unit_version: Some(version),
+                    result_execution_id: Some(result_execution_id.to_owned()),
+                    result_artifact_id: repository
+                        .result_artifact_id
+                        .clone()
+                        .or_else(|| subject.result_artifact_id.clone()),
+                    result_commit_sha: result.after_sha.clone(),
+                    result_workspace_id: Some(result.workspace_id.clone()),
+                    workspace_snapshot_digest: result.snapshot_digest.clone(),
+                    ..repository.clone()
+                });
+            }
+            WorkUnitRepo::freeze_review_subject_repositories(
+                &*self.db,
+                review_work_unit_id,
+                &frozen,
+            )
+            .await?;
+            repositories =
+                WorkUnitRepo::list_review_subject_repositories(&*self.db, review_work_unit_id)
+                    .await?;
+        }
+        if !crate::task_rework::review_subject_ready(&self.db, review_work_unit_id).await? {
+            return Err(invalid("Review subject repository results are not ready"));
+        }
+        Ok(repositories)
+    }
+
+    async fn prepare_group_member(
+        &self,
+        manager: &WorkspaceManager,
+        task: &Task,
+        work_unit: &db::WorkUnit,
+        group: &WorkspaceGroup,
+        member: &WorkspaceGroupMember,
+    ) -> Result<Workspace> {
+        let expected_path = manager
+            .work_unit_group_worktree_path(&task.id, &work_unit.id, &group.id, &member.repo.id)
+            .map_err(|error| invalid(error.to_string()))?;
+        let mut existing = WorkUnitWorkspaceRepo::list_by_work_unit_id(&*self.db, &work_unit.id)
+            .await?
+            .into_iter()
+            .find(|workspace| workspace.repo_id == member.repo.id);
+        if let Some(workspace) = existing.as_ref() {
+            let scope = WorkUnitWorkspaceRepo::get_scope_by_id(&*self.db, &workspace.id)
+                .await?
+                .ok_or_else(|| not_found("workspace scope", workspace.id.clone()))?;
+            let expected_branch = if member.read_only {
+                format!("detached:{}", member.base_sha)
+            } else {
+                workspace::work_unit_branch_name(&task.id, &work_unit.id, &workspace.id)
+                    .map_err(|error| invalid(error.to_string()))?
+            };
+            if workspace.task_id != task.id
+                || workspace.repo_id != member.repo.id
+                || workspace.before_sha.as_deref() != Some(member.base_sha.as_str())
+                || workspace.branch != expected_branch
+                || scope.kind != WorkspaceScopeKind::WorkUnit
+                || scope.task_id != task.id
+                || scope.work_unit_id.as_deref() != Some(work_unit.id.as_str())
+                || scope.workspace_group_id.as_deref() != Some(group.id.as_str())
+                || Path::new(&workspace.worktree_path) != expected_path.as_path()
+            {
+                return Err(invalid(
+                    "WorkspaceGroup member identity differs from its exact scope",
+                ));
+            }
+            if workspace.status == WorkspaceStatus::Cleaning {
+                return Err(invalid("WorkspaceGroup member cleanup is in progress"));
+            }
+            let repo_path = resolve_repo_source(&member.repo, &self.workspace_root).await?;
+            if !expected_path.exists() {
+                let branch_exists = if member.read_only {
+                    git::commit_parents(Path::new(&repo_path), &member.base_sha)
+                        .await
+                        .is_ok()
+                } else {
+                    git::branch_exists(Path::new(&repo_path), &workspace.branch).await?
+                };
+                if branch_exists {
+                    manager
+                        .recover_group_worktree(
+                            &repo_path,
+                            workspace::GroupWorktreeIdentity {
+                                task_id: &task.id,
+                                work_unit_id: &work_unit.id,
+                                group_id: &group.id,
+                                workspace_id: &workspace.id,
+                                repo_id: &member.repo.id,
+                            },
+                            &workspace.branch,
+                        )
+                        .await
+                        .map_err(|error| invalid(error.to_string()))?;
+                } else {
+                    manager
+                        .create_group_worktree(
+                            &repo_path,
+                            workspace::GroupWorktreeIdentity {
+                                task_id: &task.id,
+                                work_unit_id: &work_unit.id,
+                                group_id: &group.id,
+                                workspace_id: &workspace.id,
+                                repo_id: &member.repo.id,
+                            },
+                            &member.base_sha,
+                            member.read_only,
+                        )
+                        .await
+                        .map_err(|error| invalid(error.to_string()))?;
+                }
+            }
+            if member.read_only {
+                manager
+                    .set_group_worktree_read_only(
+                        &task.id,
+                        &work_unit.id,
+                        &group.id,
+                        &member.repo.id,
+                    )
+                    .await
+                    .map_err(|error| invalid(error.to_string()))?;
+                if git::get_current_sha(&expected_path).await? != member.base_sha
+                    || !git::is_worktree_clean(&expected_path).await?
+                {
+                    return Err(invalid(format!(
+                        "read-only repository {} changed from its pinned result",
+                        member.repo.id
+                    )));
+                }
+            } else if git::get_current_branch(&expected_path).await? != workspace.branch {
+                return Err(invalid(
+                    "WorkspaceGroup writable member is on another branch",
+                ));
+            }
+            WorkspaceRepo::update_status(
+                &*self.db,
+                &workspace.id,
+                WorkspaceStatus::Ready,
+                None,
+                &now_rfc3339(),
+            )
+            .await?;
+            existing = WorkspaceRepo::get_by_id(&*self.db, &workspace.id).await?;
+        } else {
+            let workspace_id = new_uuid_v4();
+            let branch = if member.read_only {
+                format!("detached:{}", member.base_sha)
+            } else {
+                workspace::work_unit_branch_name(&task.id, &work_unit.id, &workspace_id)
+                    .map_err(|error| invalid(error.to_string()))?
+            };
+            let created_at = now_rfc3339();
+            let workspace = WorkUnitWorkspaceRepo::create_for_work_unit(
+                &*self.db,
+                db::CreateWorkUnitWorkspace {
+                    workspace: db::CreateWorkspace {
+                        id: workspace_id.clone(),
+                        task_id: task.id.clone(),
+                        repo_id: member.repo.id.clone(),
+                        worktree_path: expected_path.to_string_lossy().into_owned(),
+                        branch: branch.clone(),
+                        status: WorkspaceStatus::Creating,
+                        before_sha: Some(member.base_sha.clone()),
+                        created_at: created_at.clone(),
+                        updated_at: created_at,
+                    },
+                    work_unit_id: work_unit.id.clone(),
+                    workspace_group_id: group.id.clone(),
+                },
+            )
+            .await?;
+            let repo_path = resolve_repo_source(&member.repo, &self.workspace_root).await?;
+            if let Err(error) = manager
+                .create_group_worktree(
+                    &repo_path,
+                    workspace::GroupWorktreeIdentity {
+                        task_id: &task.id,
+                        work_unit_id: &work_unit.id,
+                        group_id: &group.id,
+                        workspace_id: &workspace.id,
+                        repo_id: &member.repo.id,
+                    },
+                    &member.base_sha,
+                    member.read_only,
+                )
+                .await
+            {
+                let _ = WorkspaceRepo::update_status(
+                    &*self.db,
+                    &workspace.id,
+                    WorkspaceStatus::Error,
+                    Some(error.to_string()),
+                    &now_rfc3339(),
+                )
+                .await;
+                return Err(invalid(error.to_string()));
+            }
+            WorkspaceRepo::update_status(
+                &*self.db,
+                &workspace.id,
+                WorkspaceStatus::Ready,
+                None,
+                &now_rfc3339(),
+            )
+            .await?;
+            existing = WorkspaceRepo::get_by_id(&*self.db, &workspace.id).await?;
+        }
+        existing.ok_or_else(|| not_found("workspace", member.repo.id.clone()))
+    }
+
+    pub async fn prepare_workspace_group(
         &self,
         source: CollaborationActorSource,
         work_unit_id: &str,
-    ) -> Result<Workspace> {
+    ) -> Result<WorkspaceGroup> {
         let (task, _) = self.authorize_work_unit(&source, work_unit_id).await?;
         let _preparation_guard = self
             .integration_locks
@@ -1608,192 +2191,122 @@ impl WorkUnitService {
             )
             .await?;
         let result = async {
-        let unit = WorkUnitRepo::get_by_id(&*self.db, work_unit_id)
-            .await?
-            .ok_or_else(|| not_found("work_unit", work_unit_id))?;
-        if !unit.requires_integration {
-            return Err(invalid(
-                "WorkUnit does not require a repository Workspace or integration",
-            ));
-        }
-        if unit.status != WorkUnitStatus::Open
-            || !self.readiness(source, work_unit_id).await?.runnable
-        {
-            return Err(invalid("WorkUnit is not runnable"));
-        }
-        let integration = prepare_integration_workspace_for_work_unit(
-            &self.db,
-            &self.workspace_root,
-            &task,
-            Some(Arc::clone(&self.repo_cache_locks)),
-        )
-        .await?;
-        let _integration_workspace_guard = self.integration_locks.acquire(&integration.id).await;
-        let repo = RepoRepo::get_by_id(&*self.db, &integration.repo_id)
-            .await?
-            .ok_or_else(|| not_found("repo", integration.repo_id.clone()))?;
-        let repo_path = resolve_repo_source(&repo, &self.workspace_root).await?;
-        let required_base_sha: Option<String> = sqlx::query_scalar(
-            "SELECT result_commit_sha FROM work_unit_result_requirement
-             WHERE work_unit_id = ? AND result_commit_sha IS NOT NULL",
-        )
-        .bind(work_unit_id)
-        .fetch_optional(self.db.pool())
-        .await?;
-        if let Some(base_sha) = required_base_sha.as_deref() {
-            git::commit_parents(Path::new(&repo_path), base_sha)
-                .await
-                .map_err(|_| {
-                    invalid(
-                        "consumed WorkUnit result commit is not available in the repository",
-                    )
-                })?;
-        }
-        let manager = WorkspaceManager::new(self.workspace_root.clone())
-            .with_repo_cache_locks(Arc::clone(&self.repo_cache_locks));
-        if let Some(existing) =
-            WorkUnitWorkspaceRepo::get_by_work_unit_id(&*self.db, work_unit_id).await?
-        {
-            let scope = WorkUnitWorkspaceRepo::get_scope_by_id(&*self.db, &existing.id)
+            let unit = WorkUnitRepo::get_by_id(&*self.db, work_unit_id)
                 .await?
-                .ok_or_else(|| not_found("workspace", existing.id.clone()))?;
-            if scope.kind != WorkspaceScopeKind::WorkUnit
-                || scope.work_unit_id.as_deref() != Some(work_unit_id)
+                .ok_or_else(|| not_found("work_unit", work_unit_id))?;
+            let role = db::canonical_task_role_name(&unit.role)
+                .ok_or_else(|| invalid("WorkUnit role is not a TaskRole"))?;
+            let task_role = db::TaskRoleRepo::get_by_task_and_role(&*self.db, &task.id, &role)
+                .await?
+                .ok_or_else(|| invalid("WorkUnit requires an existing TaskRole"))?;
+            let formal_review = crate::role_capabilities::current_task_role_has_capability(
+                &self.db,
+                &task_role.id,
+                api_types::TaskRoleCapability::FormalReview,
+            )
+            .await?;
+            if formal_review {
+                self.freeze_review_subject_repositories(work_unit_id).await?;
+            }
+            if unit.status != WorkUnitStatus::Open
+                || !self.readiness(source, work_unit_id).await?.runnable
             {
-                return Err(invalid("Workspace scope does not match WorkUnit"));
+                return Err(invalid("WorkUnit is not runnable"));
             }
-            if required_base_sha.as_deref().is_some_and(|required| {
-                existing.before_sha.as_deref() != Some(required)
-            }) {
+            if !unit.requires_integration && !formal_review {
                 return Err(invalid(
-                    "WorkUnit Workspace base does not match the consumed result commit",
+                    "WorkUnit does not require a repository WorkspaceGroup",
                 ));
             }
-            if existing.status == WorkspaceStatus::Cleaning {
+            let members = self
+                .workspace_group_members(&task, &unit, formal_review)
+                .await?;
+            if members.is_empty() {
                 return Err(invalid(
-                    "WorkUnit workspace cleanup is still in progress",
+                    "repository WorkUnit has no exact repository WorkspaceGroup members",
                 ));
             }
-            let branch_exists = git::branch_exists(Path::new(&repo_path), &existing.branch).await?;
-            if existing.status == WorkspaceStatus::Cleaned && !branch_exists {
-                return Err(invalid(
-                    "cleaned WorkUnit Workspace branch is missing; explicit reset or recovery is required",
-                ));
-            }
-            if Path::new(&existing.worktree_path).exists() {
-                git::get_current_sha(Path::new(&existing.worktree_path)).await?;
-                if existing.status == WorkspaceStatus::Cleaned {
-                    let worktree_path = Path::new(&existing.worktree_path);
-                    if git::get_current_branch(worktree_path).await? != existing.branch
-                        || !git::is_worktree_clean(worktree_path).await?
-                    {
-                        return Err(invalid(
-                            "cleaned WorkUnit Workspace does not match its preserved branch; explicit recovery is required",
-                        ));
-                    }
-                }
-            } else if branch_exists {
-                manager
-                    .recover_work_unit_worktree(
-                        &repo_path,
-                        &task.id,
-                        work_unit_id,
-                        &existing.id,
-                        &repo.id,
-                        &existing.branch,
-                    )
-                    .await
-                    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
-            } else {
-                let base = existing
-                    .before_sha
-                    .as_deref()
-                    .ok_or_else(|| invalid("WorkUnit Workspace has no recorded base SHA"))?;
-                manager
-                    .create_work_unit_worktree(
-                        &repo_path,
-                        &task.id,
-                        work_unit_id,
-                        &existing.id,
-                        &repo.id,
-                        base,
-                    )
-                    .await
-                    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
-            }
-            let now = now_rfc3339();
-            WorkspaceRepo::update_status(
+            let manager = WorkspaceManager::new(self.workspace_root.clone())
+                .with_repo_cache_locks(Arc::clone(&self.repo_cache_locks));
+            let existing_workspaces = WorkUnitWorkspaceRepo::list_by_work_unit_id(
                 &*self.db,
-                &existing.id,
-                WorkspaceStatus::Ready,
-                None,
-                &now,
-            )
-            .await?;
-            return WorkspaceRepo::get_by_id(&*self.db, &existing.id)
-                .await?
-                .ok_or_else(|| not_found("workspace", existing.id));
-        }
-        let workspace_id = new_uuid_v4();
-        let before_sha = match required_base_sha {
-            Some(base_sha) => base_sha,
-            None => git::get_current_sha(Path::new(&integration.worktree_path)).await?,
-        };
-        let branch = workspace::work_unit_branch_name(&task.id, work_unit_id, &workspace_id)
-            .map_err(|error| invalid(error.to_string()))?;
-        let path = manager
-            .work_unit_worktree_path(&task.id, work_unit_id, &workspace_id, &repo.id)
-            .map_err(|error| invalid(error.to_string()))?;
-        let now = now_rfc3339();
-        let workspace = WorkUnitWorkspaceRepo::create_for_work_unit(
-            &*self.db,
-            db::CreateWorkUnitWorkspace {
-                workspace: db::CreateWorkspace {
-                    id: workspace_id.clone(),
-                    task_id: task.id.clone(),
-                    repo_id: repo.id,
-                    worktree_path: path.to_string_lossy().into_owned(),
-                    branch,
-                    status: WorkspaceStatus::Creating,
-                    before_sha: Some(before_sha.clone()),
-                    created_at: now.clone(),
-                    updated_at: now,
-                },
-                work_unit_id: work_unit_id.to_owned(),
-            },
-        )
-        .await?;
-        match manager
-            .create_work_unit_worktree(
-                &repo_path,
-                &task.id,
                 work_unit_id,
-                &workspace.id,
-                &integration.repo_id,
-                &before_sha,
             )
-            .await
-        {
-            Ok(_) => {}
-            Err(error) => {
-                let now = now_rfc3339();
-                let _ = WorkspaceRepo::update_status(
-                    &*self.db,
-                    &workspace.id,
-                    WorkspaceStatus::Error,
-                    Some(error.to_string()),
-                    &now,
-                )
-                .await;
-                return Err(invalid(error.to_string()));
-            }
-        };
-        let now = now_rfc3339();
-        WorkspaceRepo::update_status(&*self.db, &workspace.id, WorkspaceStatus::Ready, None, &now)
             .await?;
-        WorkspaceRepo::get_by_id(&*self.db, &workspace.id)
-            .await?
-            .ok_or_else(|| not_found("workspace", workspace.id))
+            let existing_group =
+                WorkspaceRepo::get_group_by_work_unit_id(&*self.db, work_unit_id).await?;
+            let group = if let Some(group) = existing_group {
+                if group.task_id != task.id || group.work_unit_id != unit.id {
+                    return Err(invalid("WorkspaceGroup identity does not match WorkUnit"));
+                }
+                let expected_root = manager
+                    .work_unit_group_path(&task.id, &unit.id, &group.id)
+                    .map_err(|error| invalid(error.to_string()))?;
+                if Path::new(&group.root_path) != expected_root.as_path() {
+                    return Err(invalid("WorkspaceGroup root differs from its exact identity"));
+                }
+                group
+            } else {
+                if !existing_workspaces.is_empty() {
+                    return Err(invalid(
+                        "historical WorkUnit workspaces remain group-less and cannot be rewritten",
+                    ));
+                }
+                let id = new_uuid_v4();
+                let root = manager
+                    .work_unit_group_path(&task.id, &unit.id, &id)
+                    .map_err(|error| invalid(error.to_string()))?;
+                if tokio::fs::try_exists(&root).await.map_err(|error| {
+                    invalid(format!("failed to inspect WorkspaceGroup root: {error}"))
+                })? {
+                    return Err(invalid(
+                        "WorkspaceGroup root already exists without its durable group record",
+                    ));
+                }
+                tokio::fs::create_dir_all(&root).await.map_err(|error| {
+                    invalid(format!("failed to create WorkspaceGroup root: {error}"))
+                })?;
+                WorkspaceRepo::create_group_for_work_unit(
+                    &*self.db,
+                    db::CreateWorkspaceGroup {
+                        id,
+                        task_id: task.id.clone(),
+                        work_unit_id: unit.id.clone(),
+                        root_path: root.to_string_lossy().into_owned(),
+                        created_at: now_rfc3339(),
+                    },
+                )
+                .await?
+            };
+            let expected_repo_ids = members
+                .iter()
+                .map(|member| member.repo.id.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            if existing_workspaces
+                .iter()
+                .any(|workspace| !expected_repo_ids.contains(workspace.repo_id.as_str()))
+            {
+                return Err(invalid(
+                    "WorkspaceGroup contains a repository outside the exact WorkUnit scope",
+                ));
+            }
+            write_workspace_group_instructions(&group, &members).await?;
+            for member in &members {
+                self.prepare_group_member(&manager, &task, &unit, &group, member)
+                    .await?;
+            }
+            let prepared = WorkUnitWorkspaceRepo::list_by_work_unit_id(&*self.db, work_unit_id)
+                .await?;
+            if prepared.len() != members.len()
+                || prepared
+                    .iter()
+                    .any(|workspace| !expected_repo_ids.contains(workspace.repo_id.as_str()))
+            {
+                return Err(invalid(
+                    "WorkspaceGroup repository members do not match the exact Task and WorkUnit scope",
+                ));
+            }
+            Ok::<_, ServiceError>(group)
         }
         .await;
         let finish_result = operation
@@ -1804,21 +2317,21 @@ impl WorkUnitService {
             })
             .await;
         match (result, finish_result) {
-            (Ok(workspace), Ok(_)) => Ok(workspace),
+            (Ok(group), Ok(_)) => Ok(group),
             (Ok(_), Err(error)) => Err(error),
             (Err(error), _) => Err(error),
         }
     }
 
-    /// Integrate one completed WorkUnit Execution's exact committed SHA into
-    /// the Task integration worktree under the durable Task operation claim.
+    /// Integrate each selected writable repository from the WorkUnit's pinned
+    /// repository-set revision under one durable Task operation claim.
     pub async fn integrate(
         &self,
         source: CollaborationActorSource,
         work_unit_id: &str,
         execution_id: &str,
         idempotency_key: &str,
-    ) -> Result<WorkUnitIntegration> {
+    ) -> Result<WorkUnitIntegrationBatch> {
         let (task, actor) = self.authorize_work_unit(&source, work_unit_id).await?;
         let unit = WorkUnitRepo::get_by_id(&*self.db, work_unit_id)
             .await?
@@ -1843,25 +2356,115 @@ impl WorkUnitService {
                 "Integration requires the completed Execution admitted for this WorkUnit revision",
             ));
         }
-        let source_workspace_id = execution
-            .workspace_id
-            .clone()
-            .ok_or_else(|| invalid("WorkUnit Execution has no exact Workspace"))?;
-        let source_workspace = WorkspaceRepo::get_by_id(&*self.db, &source_workspace_id)
-            .await?
-            .ok_or_else(|| not_found("workspace", source_workspace_id.clone()))?;
-        let scope = WorkUnitWorkspaceRepo::get_scope_by_id(&*self.db, &source_workspace_id)
-            .await?
-            .ok_or_else(|| not_found("workspace", source_workspace_id.clone()))?;
-        if scope.kind != WorkspaceScopeKind::WorkUnit
-            || scope.work_unit_id.as_deref() != Some(work_unit_id)
-        {
-            return Err(not_found("workspace", source_workspace_id));
+        let repository_revision =
+            TaskRepositorySetRepo::get_for_work_unit(&*self.db, work_unit_id, &task.id)
+                .await?
+                .ok_or_else(|| invalid("WorkUnit has no pinned repository-set revision"))?;
+        let selected_repo_ids = WorkUnitRepo::list_repository_ids(&*self.db, work_unit_id).await?;
+        let repositories = order_work_unit_integration_repositories(
+            &repository_revision.repositories,
+            &selected_repo_ids,
+        )?;
+        if repositories.is_empty() {
+            return Err(invalid(
+                "WorkUnit integration has no writable repositories in its pinned scope",
+            ));
         }
-        let source_sha = execution
-            .after_sha
-            .clone()
-            .ok_or_else(|| invalid("WorkUnit Execution has no result SHA"))?;
+        let repository_count = repositories.len();
+        let execution_results =
+            ExecutionRepo::list_repository_results(&*self.db, execution_id).await?;
+        let mut prepared = Vec::with_capacity(repository_count);
+        for repository in &repositories {
+            let result = execution_results
+                .iter()
+                .find(|result| result.repo_id == repository.repo_id);
+            let (source_workspace_id, source_sha, result_snapshot_digest) =
+                match result {
+                    Some(result) => (
+                        result.workspace_id.clone(),
+                        result.after_sha.clone().ok_or_else(|| {
+                            invalid("WorkUnit repository result has no result SHA")
+                        })?,
+                        result.snapshot_digest.as_deref(),
+                    ),
+                    None if prepared.is_empty()
+                        && repository_count == 1
+                        && task.repo_id.as_deref() == Some(repository.repo_id.as_str()) =>
+                    {
+                        // Preserve the 0.9.1 scalar Execution representation for
+                        // the historical one-repository path. M2 and later writes
+                        // normally have an exact repository-result row.
+                        (
+                            execution.workspace_id.clone().ok_or_else(|| {
+                                invalid("WorkUnit Execution has no exact Workspace")
+                            })?,
+                            execution
+                                .after_sha
+                                .clone()
+                                .ok_or_else(|| invalid("WorkUnit Execution has no result SHA"))?,
+                            None,
+                        )
+                    }
+                    None => {
+                        return Err(invalid(format!(
+                            "WorkUnit Execution has no exact result for repository {}",
+                            repository.repo_id
+                        )));
+                    }
+                };
+            let source_workspace = WorkspaceRepo::get_by_id(&*self.db, &source_workspace_id)
+                .await?
+                .filter(|workspace| {
+                    workspace.task_id == task.id
+                        && workspace.repo_id == repository.repo_id
+                        && workspace.status == WorkspaceStatus::Ready
+                })
+                .ok_or_else(|| not_found("workspace", source_workspace_id.clone()))?;
+            let scope = WorkUnitWorkspaceRepo::get_scope_by_id(&*self.db, &source_workspace_id)
+                .await?
+                .ok_or_else(|| not_found("workspace", source_workspace_id.clone()))?;
+            if scope.kind != WorkspaceScopeKind::WorkUnit
+                || scope.work_unit_id.as_deref() != Some(work_unit_id)
+                || scope.repo_id != repository.repo_id
+            {
+                return Err(not_found("workspace", source_workspace_id));
+            }
+            let observed_sha =
+                git::get_current_sha(Path::new(&source_workspace.worktree_path)).await?;
+            if observed_sha != source_sha {
+                return Err(invalid(
+                    "WorkUnit repository Workspace no longer matches its exact result commit",
+                ));
+            }
+            if let Some(expected_snapshot) = result_snapshot_digest {
+                let observed_snapshot =
+                    crate::ValidationService::snapshot_digest(&source_workspace.worktree_path)
+                        .await?;
+                if observed_snapshot != expected_snapshot {
+                    return Err(invalid(
+                        "WorkUnit repository Workspace no longer matches its exact result snapshot",
+                    ));
+                }
+            }
+            let target_workspace = prepare_integration_workspace_for_repository(
+                &self.db,
+                &self.workspace_root,
+                &task,
+                &repository.repo_id,
+                Some(Arc::clone(&self.repo_cache_locks)),
+            )
+            .await?;
+            prepared.push(PreparedRepositoryIntegration {
+                repo_id: repository.repo_id.clone(),
+                source_workspace,
+                source_sha,
+                base_sha: target_workspace.before_sha.clone(),
+                target_workspace,
+            });
+        }
+        let first = prepared
+            .first()
+            .ok_or_else(|| invalid("WorkUnit integration has no repository result"))?;
         let previous =
             WorkUnitRepo::get_integration_by_idempotency(&*self.db, &task.id, idempotency_key)
                 .await?;
@@ -1870,11 +2473,82 @@ impl WorkUnitService {
                 previous,
                 work_unit_id,
                 execution_id,
-                &source_sha,
-                &source_workspace_id,
+                &first.source_sha,
+                &first.source_workspace.id,
             )?;
-            if previous.outcome != WorkUnitIntegrationOutcome::Running {
-                return Ok(previous.clone());
+            if matches!(
+                previous.outcome,
+                WorkUnitIntegrationOutcome::Conflict
+                    | WorkUnitIntegrationOutcome::Failed
+                    | WorkUnitIntegrationOutcome::Rejected
+            ) {
+                let mut items = self
+                    .repository_integration_results(&previous.id, work_unit_id, &prepared)
+                    .await?;
+                if items.is_empty()
+                    && repository_count == 1
+                    && prepared[0].repo_id == task.repo_id.as_deref().unwrap_or_default()
+                {
+                    let outcome = match previous.outcome {
+                        WorkUnitIntegrationOutcome::Conflict => "conflict",
+                        WorkUnitIntegrationOutcome::Rejected
+                        | WorkUnitIntegrationOutcome::Failed => "failed",
+                        WorkUnitIntegrationOutcome::Running
+                        | WorkUnitIntegrationOutcome::Success => unreachable!(),
+                    };
+                    items.push(legacy_parent_repository_result(
+                        previous,
+                        &prepared[0].repo_id,
+                        outcome,
+                    ));
+                }
+                self.enqueue_after_integration_checks(&task, &items).await;
+                return Ok(WorkUnitIntegrationBatch {
+                    task_id: task.id,
+                    work_unit_id: work_unit_id.to_owned(),
+                    repository_revision: repository_revision.revision,
+                    items,
+                });
+            }
+            if previous.outcome == WorkUnitIntegrationOutcome::Success {
+                let mut items = self
+                    .repository_integration_results(&previous.id, work_unit_id, &prepared)
+                    .await?;
+                // V183 preserves historical single-repository parent rows and
+                // does not synthesize child rows for them. Keep replaying that
+                // exact 0.9.1 result as a one-item batch.
+                if items.is_empty()
+                    && repository_count == 1
+                    && prepared[0].repo_id == task.repo_id.as_deref().unwrap_or_default()
+                {
+                    let base_sha = prepared[0]
+                        .base_sha
+                        .as_deref()
+                        .unwrap_or(&previous.target_before_sha);
+                    let outcome = if git::get_diff(
+                        Path::new(&prepared[0].target_workspace.worktree_path),
+                        base_sha,
+                    )
+                    .await?
+                    .is_empty()
+                    {
+                        "unchanged"
+                    } else {
+                        "success"
+                    };
+                    items.push(legacy_parent_repository_result(
+                        previous,
+                        &prepared[0].repo_id,
+                        outcome,
+                    ));
+                }
+                self.enqueue_after_integration_checks(&task, &items).await;
+                return Ok(WorkUnitIntegrationBatch {
+                    task_id: task.id,
+                    work_unit_id: work_unit_id.to_owned(),
+                    repository_revision: repository_revision.revision,
+                    items,
+                });
             }
         }
 
@@ -1894,15 +2568,6 @@ impl WorkUnitService {
             .await?;
 
         let result = async {
-            let integration = prepare_integration_workspace_for_work_unit(
-                &self.db,
-                &self.workspace_root,
-                &task,
-                Some(Arc::clone(&self.repo_cache_locks)),
-            )
-            .await?;
-            let _integration_workspace_guard =
-                self.integration_locks.acquire(&integration.id).await;
             let existing =
                 WorkUnitRepo::get_integration_by_idempotency(&*self.db, &task.id, idempotency_key)
                     .await?;
@@ -1911,18 +2576,15 @@ impl WorkUnitService {
                     &existing,
                     work_unit_id,
                     execution_id,
-                    &source_sha,
-                    &source_workspace_id,
+                    &first.source_sha,
+                    &first.source_workspace.id,
                 )?;
-                if existing.target_workspace_id != integration.id {
+                if existing.target_workspace_id != first.target_workspace.id {
                     return Err(db::DbError::IdempotencyConflict.into());
-                }
-                if existing.outcome != WorkUnitIntegrationOutcome::Running {
-                    return Ok(existing);
                 }
                 existing
             } else {
-                let target_path = Path::new(&integration.worktree_path);
+                let target_path = Path::new(&first.target_workspace.worktree_path);
                 if !git::is_worktree_clean(target_path).await? {
                     return Err(invalid(
                         "Task integration workspace has uncommitted changes",
@@ -1951,11 +2613,11 @@ impl WorkUnitService {
                         task_id: task.id.clone(),
                         work_unit_id: work_unit_id.to_owned(),
                         execution_id: execution_id.to_owned(),
-                        source_workspace_id: source_workspace_id.clone(),
-                        source_branch: source_workspace.branch.clone(),
-                        source_sha: source_sha.clone(),
-                        target_workspace_id: integration.id.clone(),
-                        target_branch: integration.branch.clone(),
+                        source_workspace_id: first.source_workspace.id.clone(),
+                        source_branch: first.source_workspace.branch.clone(),
+                        source_sha: first.source_sha.clone(),
+                        target_workspace_id: first.target_workspace.id.clone(),
+                        target_branch: first.target_workspace.branch.clone(),
                         target_before_sha,
                         operation_idempotency_key: idempotency_key.to_owned(),
                         started_at: now.clone(),
@@ -1967,166 +2629,529 @@ impl WorkUnitService {
                 self.domain_events.publish_committed(&write.event);
                 write.record
             };
-
-            let target_path = Path::new(&integration.worktree_path);
-            match classify_integration_recovery(target_path, &record).await? {
-                IntegrationRecovery::Materialized(after_sha) => {
-                    self.record_integration_outcome(
+            let mut items = Vec::with_capacity(prepared.len());
+            let mut parent_result = None;
+            for item in &prepared {
+                let _workspace_guard = self
+                    .integration_locks
+                    .acquire(&item.target_workspace.id)
+                    .await;
+                let existing_child = WorkUnitRepositoryIntegrationRepo::get_by_parent_and_repo(
+                    &*self.db,
+                    &record.id,
+                    &item.repo_id,
+                )
+                .await?;
+                let was_terminal_before_retry = existing_child.as_ref().is_some_and(|child| {
+                    matches!(
+                        child.outcome,
+                        WorkUnitRepositoryIntegrationOutcome::Conflict
+                            | WorkUnitRepositoryIntegrationOutcome::Failed
+                            | WorkUnitRepositoryIntegrationOutcome::Rejected
+                            | WorkUnitRepositoryIntegrationOutcome::Unchanged
+                    )
+                });
+                let child = self
+                    .prepare_repository_integration(
+                        &task,
+                        &actor,
+                        &source,
+                        &unit,
+                        execution_id,
+                        repository_revision.revision,
+                        &record,
+                        item,
+                    )
+                    .await?;
+                let result = self
+                    .integrate_repository(&task, &actor, &source, item, child)
+                    .await?;
+                let should_stop = matches!(result.outcome.as_str(), "conflict" | "failed");
+                items.push(result);
+                if should_stop
+                    && integration_failure_should_stop_batch(
+                        &items
+                            .last()
+                            .expect("just appended repository result")
+                            .outcome,
+                        was_terminal_before_retry,
+                    )
+                {
+                    break;
+                }
+            }
+            if items.len() == prepared.len()
+                && items
+                    .iter()
+                    .all(|item| matches!(item.outcome.as_str(), "success" | "unchanged"))
+            {
+                let primary_result = items
+                    .iter()
+                    .find(|item| Some(item.repo_id.as_str()) == task.repo_id.as_deref())
+                    .or_else(|| items.first())
+                    .ok_or_else(|| invalid("WorkUnit integration returned no repository items"))?;
+                let updated_parent = self
+                    .record_integration_outcome(
                         &record,
                         &task,
                         &actor,
                         &source,
                         work_unit_id,
                         WorkUnitIntegrationOutcome::Success,
-                        Some(after_sha),
+                        primary_result.after_sha.clone(),
                         None,
                     )
-                    .await
-                }
-                IntegrationRecovery::Mismatch(kind) => {
-                    self.record_integration_outcome(
-                        &record,
-                        &task,
-                        &actor,
-                        &source,
-                        work_unit_id,
-                        WorkUnitIntegrationOutcome::Failed,
-                        None,
-                        Some(serde_json::json!({ "kind": kind }).to_string()),
-                    )
-                    .await
-                }
-                IntegrationRecovery::Retry => {
-                    if !git::is_worktree_clean(target_path).await? {
-                        return self
-                            .record_integration_outcome(
-                                &record,
-                                &task,
-                                &actor,
-                                &source,
-                                work_unit_id,
-                                WorkUnitIntegrationOutcome::Failed,
-                                None,
-                                Some(r#"{"kind":"target_worktree_dirty"}"#.to_owned()),
-                            )
-                            .await;
-                    }
-                    match git::merge(target_path, &record.source_sha).await {
-                        Ok(()) => {
-                            let after_sha = git::get_current_sha(target_path).await?;
-                            if git::is_worktree_clean(target_path).await? {
-                                self.record_integration_outcome(
-                                    &record,
-                                    &task,
-                                    &actor,
-                                    &source,
-                                    work_unit_id,
-                                    WorkUnitIntegrationOutcome::Success,
-                                    Some(after_sha),
-                                    None,
-                                )
-                                .await
-                            } else {
-                                self.record_integration_outcome(
-                                    &record,
-                                    &task,
-                                    &actor,
-                                    &source,
-                                    work_unit_id,
-                                    WorkUnitIntegrationOutcome::Failed,
-                                    None,
-                                    Some(
-                                        r#"{"kind":"target_worktree_dirty_after_merge"}"#
-                                            .to_owned(),
-                                    ),
-                                )
-                                .await
-                            }
-                        }
-                        Err(git::GitError::MergeConflict { .. }) => {
-                            recover_interrupted_merge(target_path, &record).await?;
+                    .await?;
+                parent_result = Some(updated_parent);
+            } else if prepared.len() == 1 {
+                let single_result = items
+                    .first()
+                    .ok_or_else(|| invalid("single-repository integration returned no result"))?;
+                let parent_outcome = match single_result.outcome.as_str() {
+                    "conflict" => Some(WorkUnitIntegrationOutcome::Conflict),
+                    "failed" => Some(WorkUnitIntegrationOutcome::Failed),
+                    _ => None,
+                };
+                if let Some(parent_outcome) = parent_outcome {
+                    if record.outcome == WorkUnitIntegrationOutcome::Running {
+                        let child = WorkUnitRepositoryIntegrationRepo::get_by_parent_and_repo(
+                            &*self.db,
+                            &record.id,
+                            &single_result.repo_id,
+                        )
+                        .await?
+                        .ok_or_else(|| {
+                            invalid("single-repository integration child result is missing")
+                        })?;
+                        parent_result = Some(
                             self.record_integration_outcome(
                                 &record,
                                 &task,
                                 &actor,
                                 &source,
                                 work_unit_id,
-                                WorkUnitIntegrationOutcome::Conflict,
+                                parent_outcome,
                                 None,
-                                Some(r#"{"kind":"merge_conflict"}"#.to_owned()),
+                                child.conflict_metadata_json,
                             )
-                            .await
-                        }
-                        Err(_error) => {
-                            if git::get_merge_head(target_path).await?.is_some() {
-                                recover_interrupted_merge(target_path, &record).await?;
-                            }
-                            let head = git::get_current_sha(target_path).await?;
-                            if head != record.target_before_sha
-                                || !git::is_worktree_clean(target_path).await?
-                            {
-                                self.record_integration_outcome(
-                                    &record,
-                                    &task,
-                                    &actor,
-                                    &source,
-                                    work_unit_id,
-                                    WorkUnitIntegrationOutcome::Failed,
-                                    None,
-                                    Some(r#"{"kind":"target_head_mismatch"}"#.to_owned()),
-                                )
-                                .await
-                            } else {
-                                self.record_integration_outcome(
-                                    &record,
-                                    &task,
-                                    &actor,
-                                    &source,
-                                    work_unit_id,
-                                    WorkUnitIntegrationOutcome::Failed,
-                                    None,
-                                    Some(r#"{"kind":"git_failure"}"#.to_owned()),
-                                )
-                                .await
-                            }
-                        }
+                            .await?,
+                        );
+                    } else {
+                        // Keep the terminal scalar parent outcome on historical
+                        // single-repository replays, matching the 0.9.1 row and
+                        // response contract.
+                        parent_result = Some(record.clone());
                     }
                 }
             }
+            Ok::<_, ServiceError>((record, items, parent_result))
         }
         .await;
 
         let operation_status = match &result {
-            Ok(record) if record.outcome == WorkUnitIntegrationOutcome::Success => {
+            Ok((_, _, Some(parent))) if parent.outcome == WorkUnitIntegrationOutcome::Success => {
                 db::TaskIntegrationOperationStatus::Succeeded
             }
-            Ok(record) if record.outcome == WorkUnitIntegrationOutcome::Conflict => {
+            Ok((_, _, Some(parent))) if parent.outcome == WorkUnitIntegrationOutcome::Conflict => {
                 db::TaskIntegrationOperationStatus::Conflict
+            }
+            Ok((_, _, Some(_))) => db::TaskIntegrationOperationStatus::Failed,
+            Ok((_, items, None)) if items.iter().any(|item| item.outcome == "conflict") => {
+                db::TaskIntegrationOperationStatus::Conflict
+            }
+            Ok((_, items, None)) if items.iter().any(|item| item.outcome == "failed") => {
+                db::TaskIntegrationOperationStatus::Failed
             }
             Ok(_) | Err(_) => db::TaskIntegrationOperationStatus::Failed,
         };
         let finish_result = operation.finish(operation_status).await;
         match (result, finish_result) {
-            (Ok(record), Ok(_)) => {
-                // C3 hook: queue the Task's pinned `after_integration` catalog
-                // checks against the exact integration Workspace. Best effort and
-                // idempotent; the durable request, not this call, is authoritative.
-                if record.outcome == WorkUnitIntegrationOutcome::Success {
-                    if let Err(error) =
-                        crate::validation_post_integration::enqueue_after_integration(
-                            &self.db,
-                            &self.event_bus,
-                            &record.task_id,
-                        )
-                        .await
-                    {
-                        tracing::warn!(task_id = %record.task_id, %error, "after-integration validation enqueue failed");
-                    }
-                }
-                Ok(record)
+            (Ok((parent, items, _)), Ok(_)) => {
+                self.enqueue_after_integration_checks(&task, &items).await;
+                Ok(WorkUnitIntegrationBatch {
+                    task_id: parent.task_id,
+                    work_unit_id: parent.work_unit_id,
+                    repository_revision: repository_revision.revision,
+                    items,
+                })
             }
             (Ok(_), Err(error)) => Err(error),
             (Err(error), _) => Err(error),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_repository_integration(
+        &self,
+        task: &Task,
+        actor: &ActorRef,
+        source: &CollaborationActorSource,
+        unit: &WorkUnit,
+        execution_id: &str,
+        repository_revision: i64,
+        parent: &WorkUnitIntegration,
+        item: &PreparedRepositoryIntegration,
+    ) -> Result<WorkUnitRepositoryIntegration> {
+        if let Some(existing) = WorkUnitRepositoryIntegrationRepo::get_by_parent_and_repo(
+            &*self.db,
+            &parent.id,
+            &item.repo_id,
+        )
+        .await?
+        {
+            validate_repository_integration_replay(
+                &existing,
+                parent,
+                unit,
+                execution_id,
+                repository_revision,
+                item,
+            )?;
+            self.ensure_repository_integration_event(task, actor, source, &existing)
+                .await?;
+            return Ok(existing);
+        }
+        let target_path = Path::new(&item.target_workspace.worktree_path);
+        if !git::is_worktree_clean(target_path).await? {
+            let exact_legacy_interrupted_merge = task.repo_id.as_deref()
+                == Some(item.repo_id.as_str())
+                && item.target_workspace.id == parent.target_workspace_id
+                && item.source_sha == parent.source_sha
+                && git::get_merge_head(target_path).await?.as_deref()
+                    == Some(item.source_sha.as_str())
+                && git::get_current_sha(target_path).await? == parent.target_before_sha;
+            if !exact_legacy_interrupted_merge {
+                return Err(invalid(format!(
+                    "Task integration workspace for repository {} has uncommitted changes",
+                    item.repo_id
+                )));
+            }
+            git::abort_merge(target_path).await.map_err(|error| {
+                invalid(format!(
+                    "interrupted legacy Task integration could not be aborted safely: {error}"
+                ))
+            })?;
+            if git::get_current_sha(target_path).await? != parent.target_before_sha
+                || !git::is_worktree_clean(target_path).await?
+            {
+                return Err(invalid(
+                    "interrupted legacy Task integration did not restore its exact clean target",
+                ));
+            }
+        }
+        // The scalar parent remains the exact 0.9.1 target pin for its primary
+        // repository. Do not replace it with a later HEAD during recovery: an
+        // unrelated target commit between parent admission and child creation
+        // must be recorded as a mismatch, not adopted as the new baseline.
+        let target_before_sha = if task.repo_id.as_deref() == Some(item.repo_id.as_str()) {
+            parent.target_before_sha.clone()
+        } else {
+            git::get_current_sha(target_path).await?
+        };
+        let now = now_rfc3339();
+        let record = WorkUnitRepositoryIntegrationRepo::create(
+            &*self.db,
+            CreateWorkUnitRepositoryIntegration {
+                id: new_uuid_v4(),
+                work_unit_integration_id: parent.id.clone(),
+                task_id: task.id.clone(),
+                work_unit_id: unit.id.clone(),
+                execution_id: execution_id.to_owned(),
+                repository_set_revision: repository_revision,
+                repo_id: item.repo_id.clone(),
+                source_workspace_id: item.source_workspace.id.clone(),
+                source_branch: item.source_workspace.branch.clone(),
+                source_sha: item.source_sha.clone(),
+                target_workspace_id: item.target_workspace.id.clone(),
+                target_branch: item.target_workspace.branch.clone(),
+                target_before_sha,
+                started_at: now.clone(),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await?;
+        self.ensure_repository_integration_event(task, actor, source, &record)
+            .await?;
+        Ok(record)
+    }
+
+    async fn integrate_repository(
+        &self,
+        task: &Task,
+        actor: &ActorRef,
+        source: &CollaborationActorSource,
+        item: &PreparedRepositoryIntegration,
+        mut record: WorkUnitRepositoryIntegration,
+    ) -> Result<RepositoryIntegrationResult> {
+        if matches!(
+            record.outcome,
+            WorkUnitRepositoryIntegrationOutcome::Success
+                | WorkUnitRepositoryIntegrationOutcome::Unchanged
+        ) {
+            return repository_integration_result(&record, item).await;
+        }
+        let target_path = Path::new(&item.target_workspace.worktree_path);
+        if matches!(
+            record.outcome,
+            WorkUnitRepositoryIntegrationOutcome::Conflict
+                | WorkUnitRepositoryIntegrationOutcome::Failed
+                | WorkUnitRepositoryIntegrationOutcome::Rejected
+        ) {
+            // Only rows without a terminal result are retried. A repository
+            // conflict remains durable while a later call continues with
+            // other rows that were still pending.
+            return repository_integration_result(&record, item).await;
+        }
+        if record.outcome == WorkUnitRepositoryIntegrationOutcome::Running {
+            match classify_repository_integration_recovery(target_path, &record).await? {
+                IntegrationRecovery::Materialized(after_sha) => {
+                    let base_sha = item
+                        .base_sha
+                        .as_deref()
+                        .unwrap_or(&record.target_before_sha);
+                    let outcome = if git::get_diff(target_path, base_sha).await?.is_empty() {
+                        WorkUnitRepositoryIntegrationOutcome::Unchanged
+                    } else {
+                        WorkUnitRepositoryIntegrationOutcome::Success
+                    };
+                    record = self
+                        .record_repository_integration_outcome(
+                            task,
+                            actor,
+                            source,
+                            &record,
+                            outcome,
+                            Some(&after_sha),
+                            None,
+                        )
+                        .await?;
+                    return repository_integration_result(&record, item).await;
+                }
+                IntegrationRecovery::Mismatch(kind) => {
+                    record = self
+                        .record_repository_integration_outcome(
+                            task,
+                            actor,
+                            source,
+                            &record,
+                            WorkUnitRepositoryIntegrationOutcome::Failed,
+                            None,
+                            Some(&serde_json::json!({ "kind": kind }).to_string()),
+                        )
+                        .await?;
+                    return repository_integration_result(&record, item).await;
+                }
+                IntegrationRecovery::Retry => {}
+            }
+        }
+        if !git::is_worktree_clean(target_path).await? {
+            record = self
+                .record_repository_integration_outcome(
+                    task,
+                    actor,
+                    source,
+                    &record,
+                    WorkUnitRepositoryIntegrationOutcome::Failed,
+                    None,
+                    Some(r#"{"kind":"target_worktree_dirty"}"#),
+                )
+                .await?;
+            return repository_integration_result(&record, item).await;
+        }
+        match git::merge(target_path, &record.source_sha).await {
+            Ok(()) => {
+                let after_sha = git::get_current_sha(target_path).await?;
+                if git::is_worktree_clean(target_path).await? {
+                    let base_sha = item
+                        .base_sha
+                        .as_deref()
+                        .unwrap_or(&record.target_before_sha);
+                    let outcome = if git::get_diff(target_path, base_sha).await?.is_empty() {
+                        WorkUnitRepositoryIntegrationOutcome::Unchanged
+                    } else {
+                        WorkUnitRepositoryIntegrationOutcome::Success
+                    };
+                    record = self
+                        .record_repository_integration_outcome(
+                            task,
+                            actor,
+                            source,
+                            &record,
+                            outcome,
+                            Some(&after_sha),
+                            None,
+                        )
+                        .await?;
+                } else {
+                    record = self
+                        .record_repository_integration_outcome(
+                            task,
+                            actor,
+                            source,
+                            &record,
+                            WorkUnitRepositoryIntegrationOutcome::Failed,
+                            None,
+                            Some(r#"{"kind":"target_worktree_dirty_after_merge"}"#),
+                        )
+                        .await?;
+                }
+            }
+            Err(git::GitError::MergeConflict { .. }) => {
+                recover_interrupted_repository_merge(target_path, &record).await?;
+                record = self
+                    .record_repository_integration_outcome(
+                        task,
+                        actor,
+                        source,
+                        &record,
+                        WorkUnitRepositoryIntegrationOutcome::Conflict,
+                        None,
+                        Some(r#"{"kind":"merge_conflict"}"#),
+                    )
+                    .await?;
+            }
+            Err(_) => {
+                if git::get_merge_head(target_path).await?.is_some() {
+                    recover_interrupted_repository_merge(target_path, &record).await?;
+                }
+                let head = git::get_current_sha(target_path).await?;
+                let kind = if head != record.target_before_sha
+                    || !git::is_worktree_clean(target_path).await?
+                {
+                    "target_head_mismatch"
+                } else {
+                    "git_failure"
+                };
+                record = self
+                    .record_repository_integration_outcome(
+                        task,
+                        actor,
+                        source,
+                        &record,
+                        WorkUnitRepositoryIntegrationOutcome::Failed,
+                        None,
+                        Some(&serde_json::json!({ "kind": kind }).to_string()),
+                    )
+                    .await?;
+            }
+        }
+        repository_integration_result(&record, item).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn record_repository_integration_outcome(
+        &self,
+        task: &Task,
+        actor: &ActorRef,
+        source: &CollaborationActorSource,
+        record: &WorkUnitRepositoryIntegration,
+        outcome: WorkUnitRepositoryIntegrationOutcome,
+        target_after_sha: Option<&str>,
+        conflict_metadata_json: Option<&str>,
+    ) -> Result<WorkUnitRepositoryIntegration> {
+        let now = now_rfc3339();
+        let updated = WorkUnitRepositoryIntegrationRepo::transition(
+            &*self.db,
+            &record.id,
+            record.version,
+            outcome,
+            target_after_sha,
+            conflict_metadata_json,
+            (outcome != WorkUnitRepositoryIntegrationOutcome::Running).then_some(now.as_str()),
+            &now,
+        )
+        .await?;
+        self.ensure_repository_integration_event(task, actor, source, &updated)
+            .await?;
+        Ok(updated)
+    }
+
+    async fn ensure_repository_integration_event(
+        &self,
+        task: &Task,
+        actor: &ActorRef,
+        source: &CollaborationActorSource,
+        record: &WorkUnitRepositoryIntegration,
+    ) -> Result<()> {
+        let dedupe_key = format!(
+            "work-unit-repository-integration:{}:{}:{}",
+            record.id, record.version, record.outcome
+        );
+        if self
+            .domain_events
+            .get_by_dedupe(&dedupe_key)
+            .await?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let now = record.updated_at.as_str();
+        let mut event = self.event(
+            "work_unit.repository_integration_changed",
+            "work_unit_repository_integration",
+            &record.id,
+            task,
+            actor,
+            serde_json::json!({
+                "task_id": record.task_id,
+                "work_unit_id": record.work_unit_id,
+                "repo_id": record.repo_id,
+                "repository_revision": record.repository_set_revision,
+                "parent_integration_id": record.work_unit_integration_id,
+                "integration_id": record.id,
+                "outcome": record.outcome.to_string(),
+                "version": record.version
+            }),
+            now,
+            source,
+        );
+        event.dedupe_key = Some(dedupe_key);
+        self.domain_events.append(event).await?;
+        Ok(())
+    }
+
+    async fn repository_integration_results(
+        &self,
+        parent_id: &str,
+        work_unit_id: &str,
+        prepared: &[PreparedRepositoryIntegration],
+    ) -> Result<Vec<RepositoryIntegrationResult>> {
+        let mut results = Vec::new();
+        for item in prepared {
+            let Some(record) = WorkUnitRepositoryIntegrationRepo::get_by_parent_and_repo(
+                &*self.db,
+                parent_id,
+                &item.repo_id,
+            )
+            .await?
+            else {
+                continue;
+            };
+            if record.work_unit_id != work_unit_id {
+                return Err(db::DbError::IdempotencyConflict.into());
+            }
+            results.push(repository_integration_result(&record, item).await?);
+        }
+        Ok(results)
+    }
+
+    async fn enqueue_after_integration_checks(
+        &self,
+        task: &Task,
+        items: &[RepositoryIntegrationResult],
+    ) {
+        for item in items.iter().filter(|item| item.outcome == "success") {
+            if let Err(error) = crate::validation_post_integration::enqueue_after_integration(
+                &self.db,
+                &self.event_bus,
+                &task.id,
+                &item.repo_id,
+            )
+            .await
+            {
+                tracing::warn!(task_id = %task.id, repo_id = %item.repo_id, %error, "after-integration validation enqueue failed");
+            }
         }
     }
 
@@ -2211,9 +3236,9 @@ impl WorkUnitService {
     }
 
     async fn ensure_dependencies_not_pinned(&self, id: &str) -> Result<()> {
-        if WorkUnitWorkspaceRepo::get_by_work_unit_id(&*self.db, id)
+        if !WorkUnitWorkspaceRepo::list_by_work_unit_id(&*self.db, id)
             .await?
-            .is_some()
+            .is_empty()
         {
             return Err(ServiceError::conflict(
                 "WorkUnit dependencies are fixed after its repository Workspace is prepared",
@@ -2256,6 +3281,229 @@ impl WorkUnitService {
             created_at: now.to_owned(),
         }
     }
+}
+
+fn order_work_unit_integration_repositories(
+    repository_set: &[db::TaskRepositorySetRevisionRepo],
+    selected_repo_ids: &[String],
+) -> Result<Vec<db::TaskRepositorySetRevisionRepo>> {
+    let selected = selected_repo_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    let writable = repository_set
+        .iter()
+        .filter(|repository| {
+            matches!(
+                repository.role,
+                TaskRepositoryRole::Primary | TaskRepositoryRole::Affected
+            )
+        })
+        .filter(|repository| {
+            selected_repo_ids.is_empty() || selected.contains(repository.repo_id.as_str())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !selected_repo_ids.is_empty() && writable.len() != selected_repo_ids.len() {
+        return Err(ServiceError::WorkUnitRepositoriesInvalid);
+    }
+    let mut ordered = writable;
+    ordered.sort_by(|left, right| {
+        let role_order = |role| match role {
+            TaskRepositoryRole::Primary => 0,
+            TaskRepositoryRole::Affected => 1,
+            TaskRepositoryRole::Context => 2,
+        };
+        (role_order(left.role), left.position, left.repo_id.as_str()).cmp(&(
+            role_order(right.role),
+            right.position,
+            right.repo_id.as_str(),
+        ))
+    });
+    Ok(ordered)
+}
+
+fn validate_repository_integration_replay(
+    existing: &WorkUnitRepositoryIntegration,
+    parent: &WorkUnitIntegration,
+    unit: &WorkUnit,
+    execution_id: &str,
+    repository_revision: i64,
+    item: &PreparedRepositoryIntegration,
+) -> Result<()> {
+    if existing.work_unit_integration_id != parent.id
+        || existing.task_id != unit.task_id
+        || existing.work_unit_id != unit.id
+        || existing.execution_id != execution_id
+        || existing.repository_set_revision != repository_revision
+        || existing.repo_id != item.repo_id
+        || existing.source_workspace_id != item.source_workspace.id
+        || existing.source_sha != item.source_sha
+        || existing.target_workspace_id != item.target_workspace.id
+    {
+        return Err(db::DbError::IdempotencyConflict.into());
+    }
+    Ok(())
+}
+
+async fn classify_repository_integration_recovery(
+    target_path: &Path,
+    record: &WorkUnitRepositoryIntegration,
+) -> Result<IntegrationRecovery> {
+    if let Some(merge_head) = git::get_merge_head(target_path).await? {
+        if merge_head != record.source_sha {
+            return Ok(IntegrationRecovery::Mismatch(
+                "interrupted_merge_source_mismatch",
+            ));
+        }
+        if git::get_current_sha(target_path).await? != record.target_before_sha {
+            return Ok(IntegrationRecovery::Mismatch("target_head_mismatch"));
+        }
+        recover_interrupted_repository_merge(target_path, record).await?;
+        return Ok(IntegrationRecovery::Retry);
+    }
+
+    let head = git::get_current_sha(target_path).await?;
+    if head == record.target_before_sha {
+        return Ok(IntegrationRecovery::Retry);
+    }
+    if !git::is_worktree_clean(target_path).await? {
+        return Ok(IntegrationRecovery::Mismatch("target_head_mismatch"));
+    }
+    if head == record.source_sha
+        && git::is_ancestor(target_path, &record.target_before_sha, &record.source_sha).await?
+    {
+        return Ok(IntegrationRecovery::Materialized(head));
+    }
+    let parents = git::commit_parents(target_path, &head).await?;
+    if parents.len() == 2
+        && parents[0] == record.target_before_sha
+        && parents[1] == record.source_sha
+    {
+        return Ok(IntegrationRecovery::Materialized(head));
+    }
+    Ok(IntegrationRecovery::Mismatch("target_head_mismatch"))
+}
+
+async fn recover_interrupted_repository_merge(
+    target_path: &Path,
+    record: &WorkUnitRepositoryIntegration,
+) -> Result<()> {
+    if git::get_merge_head(target_path).await?.as_deref() != Some(&record.source_sha) {
+        return Err(invalid(
+            "interrupted repository integration does not match its pinned source",
+        ));
+    }
+    if git::get_current_sha(target_path).await? != record.target_before_sha {
+        return Err(invalid(
+            "interrupted repository integration target HEAD changed; recovery is required",
+        ));
+    }
+    git::abort_merge(target_path).await.map_err(|error| {
+        invalid(format!(
+            "interrupted repository integration could not be aborted safely: {error}"
+        ))
+    })?;
+    if git::get_current_sha(target_path).await? != record.target_before_sha
+        || !git::is_worktree_clean(target_path).await?
+    {
+        return Err(invalid(
+            "interrupted repository integration did not restore its pinned clean target",
+        ));
+    }
+    Ok(())
+}
+
+async fn repository_integration_result(
+    record: &WorkUnitRepositoryIntegration,
+    item: &PreparedRepositoryIntegration,
+) -> Result<RepositoryIntegrationResult> {
+    let outcome = match record.outcome {
+        WorkUnitRepositoryIntegrationOutcome::Running => "pending",
+        WorkUnitRepositoryIntegrationOutcome::Success => {
+            let base_sha = item
+                .base_sha
+                .as_deref()
+                .unwrap_or(&record.target_before_sha);
+            if git::get_diff(Path::new(&item.target_workspace.worktree_path), base_sha)
+                .await?
+                .is_empty()
+            {
+                "unchanged"
+            } else {
+                "success"
+            }
+        }
+        WorkUnitRepositoryIntegrationOutcome::Unchanged => "unchanged",
+        WorkUnitRepositoryIntegrationOutcome::Conflict => "conflict",
+        WorkUnitRepositoryIntegrationOutcome::Failed
+        | WorkUnitRepositoryIntegrationOutcome::Rejected => "failed",
+    };
+    Ok(RepositoryIntegrationResult {
+        repo_id: record.repo_id.clone(),
+        integration_id: record.id.clone(),
+        source_sha: record.source_sha.clone(),
+        before_sha: Some(record.target_before_sha.clone()),
+        after_sha: record.target_after_sha.clone(),
+        outcome: outcome.to_owned(),
+    })
+}
+
+fn legacy_parent_repository_result(
+    parent: &WorkUnitIntegration,
+    repo_id: &str,
+    outcome: &str,
+) -> RepositoryIntegrationResult {
+    RepositoryIntegrationResult {
+        repo_id: repo_id.to_owned(),
+        integration_id: parent.id.clone(),
+        source_sha: parent.source_sha.clone(),
+        before_sha: Some(parent.target_before_sha.clone()),
+        after_sha: parent.target_after_sha.clone(),
+        outcome: outcome.to_owned(),
+    }
+}
+
+fn integration_failure_should_stop_batch(outcome: &str, terminal_before_retry: bool) -> bool {
+    matches!(outcome, "conflict" | "failed") && !terminal_before_retry
+}
+
+async fn validate_work_unit_repository_ids(
+    db: &SqliteDb,
+    task_id: &str,
+    repository_ids: &[String],
+) -> Result<()> {
+    let mut selected = std::collections::HashSet::with_capacity(repository_ids.len());
+    if repository_ids
+        .iter()
+        .any(|repo_id| !selected.insert(repo_id.as_str()))
+    {
+        return Err(ServiceError::WorkUnitRepositoriesInvalid);
+    }
+    if repository_ids.is_empty() {
+        return Ok(());
+    }
+    let repository_set = TaskRepositorySetRepo::get_current(db, task_id)
+        .await?
+        .ok_or(ServiceError::WorkUnitRepositoriesInvalid)?;
+    let writable: std::collections::HashSet<&str> = repository_set
+        .repositories
+        .iter()
+        .filter(|repository| {
+            matches!(
+                repository.role,
+                TaskRepositoryRole::Primary | TaskRepositoryRole::Affected
+            )
+        })
+        .map(|repository| repository.repo_id.as_str())
+        .collect();
+    if repository_ids
+        .iter()
+        .any(|repo_id| !writable.contains(repo_id.as_str()))
+    {
+        return Err(ServiceError::WorkUnitRepositoriesInvalid);
+    }
+    Ok(())
 }
 
 fn work_unit_provenance_intent(provenance: Option<&WorkUnitProvenance>) -> serde_json::Value {
@@ -2302,71 +3550,6 @@ fn validate_integration_replay(
     Ok(())
 }
 
-async fn classify_integration_recovery(
-    target_path: &Path,
-    record: &WorkUnitIntegration,
-) -> Result<IntegrationRecovery> {
-    if let Some(merge_head) = git::get_merge_head(target_path).await? {
-        if merge_head != record.source_sha {
-            return Ok(IntegrationRecovery::Mismatch(
-                "interrupted_merge_source_mismatch",
-            ));
-        }
-        if git::get_current_sha(target_path).await? != record.target_before_sha {
-            return Ok(IntegrationRecovery::Mismatch("target_head_mismatch"));
-        }
-        recover_interrupted_merge(target_path, record).await?;
-        return Ok(IntegrationRecovery::Retry);
-    }
-
-    let head = git::get_current_sha(target_path).await?;
-    if head == record.target_before_sha {
-        return Ok(IntegrationRecovery::Retry);
-    }
-    if !git::is_worktree_clean(target_path).await? {
-        return Ok(IntegrationRecovery::Mismatch("target_head_mismatch"));
-    }
-    if head == record.source_sha
-        && git::is_ancestor(target_path, &record.target_before_sha, &record.source_sha).await?
-    {
-        return Ok(IntegrationRecovery::Materialized(head));
-    }
-    let parents = git::commit_parents(target_path, &head).await?;
-    if parents.len() == 2
-        && parents[0] == record.target_before_sha
-        && parents[1] == record.source_sha
-    {
-        return Ok(IntegrationRecovery::Materialized(head));
-    }
-    Ok(IntegrationRecovery::Mismatch("target_head_mismatch"))
-}
-
-async fn recover_interrupted_merge(target_path: &Path, record: &WorkUnitIntegration) -> Result<()> {
-    if git::get_merge_head(target_path).await?.as_deref() != Some(&record.source_sha) {
-        return Err(invalid(
-            "interrupted integration merge does not match the pinned source",
-        ));
-    }
-    if git::get_current_sha(target_path).await? != record.target_before_sha {
-        return Err(invalid(
-            "interrupted integration target HEAD changed; recovery is required",
-        ));
-    }
-    git::abort_merge(target_path).await.map_err(|error| {
-        invalid(format!(
-            "interrupted integration merge could not be aborted safely: {error}"
-        ))
-    })?;
-    if git::get_current_sha(target_path).await? != record.target_before_sha
-        || !git::is_worktree_clean(target_path).await?
-    {
-        return Err(invalid(
-            "interrupted integration merge did not restore its pinned clean target",
-        ));
-    }
-    Ok(())
-}
-
 fn not_found(entity: &'static str, id: impl Into<String>) -> ServiceError {
     ServiceError::NotFound {
         entity,
@@ -2378,6 +3561,51 @@ fn invalid(message: impl Into<String>) -> ServiceError {
     ServiceError::InvalidOperation {
         message: message.into(),
     }
+}
+
+async fn write_workspace_group_instructions(
+    group: &WorkspaceGroup,
+    members: &[WorkspaceGroupMember],
+) -> Result<()> {
+    let root = Path::new(&group.root_path);
+    if !root.is_dir() {
+        return Err(invalid("WorkspaceGroup root is unavailable"));
+    }
+    let mut index = "# Forge workspace group\n\nEach repository is a sibling directory. "
+        .to_owned()
+        + "Only repositories marked writable may be changed. Read-only repositories "
+        + "are pinned inputs and must remain unchanged.\n\n"
+        + "Before editing a repository, read its own `AGENTS.md` and `CLAUDE.md` "
+        + "when present. These group instructions are generated outside the repositories.\n\n"
+        + "| Directory | Task repository role | Access | Base commit |\n"
+        + "|---|---|---|---|\n";
+    for member in members {
+        let role = match member.role {
+            db::TaskRepositoryRole::Primary => "primary",
+            db::TaskRepositoryRole::Affected => "affected",
+            db::TaskRepositoryRole::Context => "context",
+        };
+        let access = if member.read_only {
+            "read-only"
+        } else {
+            "writable"
+        };
+        index.push_str(&format!(
+            "| `{}` | {} | {} | `{}` |\n",
+            member.repo.id, role, access, member.base_sha
+        ));
+    }
+    let instructions = "# Forge workspace instructions\n\nThe current directory contains sibling repository worktrees. Read `FORGE_WORKSPACE.md` first.\n\nChange files only in repositories marked writable there. Treat read-only repositories as pinned inputs. Before editing a repository, read its own `AGENTS.md` and `CLAUDE.md` when present.\n";
+    tokio::fs::write(root.join("FORGE_WORKSPACE.md"), index)
+        .await
+        .map_err(|error| invalid(format!("failed to write WorkspaceGroup index: {error}")))?;
+    tokio::fs::write(root.join("AGENTS.md"), instructions)
+        .await
+        .map_err(|error| invalid(format!("failed to write WorkspaceGroup AGENTS.md: {error}")))?;
+    tokio::fs::write(root.join("CLAUDE.md"), instructions)
+        .await
+        .map_err(|error| invalid(format!("failed to write WorkspaceGroup CLAUDE.md: {error}")))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2501,6 +3729,114 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    async fn integrate_parent(
+        service: &WorkUnitService,
+        db: &SqliteDb,
+        source: CollaborationActorSource,
+        work_unit_id: &str,
+        execution_id: &str,
+        idempotency_key: &str,
+    ) -> WorkUnitIntegration {
+        let batch = service
+            .integrate(source, work_unit_id, execution_id, idempotency_key)
+            .await
+            .expect("WorkUnit integration batch");
+        assert_eq!(batch.work_unit_id, work_unit_id);
+        assert_eq!(batch.items.len(), 1, "single-repository Task result");
+        let task_id = WorkUnitRepo::get_task_id(db, work_unit_id)
+            .await
+            .expect("WorkUnit Task lookup")
+            .expect("WorkUnit Task exists");
+        WorkUnitRepo::get_integration_by_idempotency(db, &task_id, idempotency_key)
+            .await
+            .expect("parent integration lookup")
+            .expect("parent integration exists")
+    }
+
+    #[test]
+    fn multirepo_integration_primary_first_then_affected_position() {
+        let revision = |repo_id: &str, role, position| db::TaskRepositorySetRevisionRepo {
+            task_id: "task".to_owned(),
+            revision: 7,
+            repo_id: repo_id.to_owned(),
+            role,
+            position,
+        };
+        let repositories = vec![
+            revision("affected-late", TaskRepositoryRole::Affected, 4),
+            revision("context", TaskRepositoryRole::Context, 0),
+            revision("affected-first", TaskRepositoryRole::Affected, 1),
+            revision("primary", TaskRepositoryRole::Primary, 9),
+        ];
+        let ordered = order_work_unit_integration_repositories(&repositories, &[])
+            .expect("writable repositories order");
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|repository| repository.repo_id.as_str())
+                .collect::<Vec<_>>(),
+            ["primary", "affected-first", "affected-late"]
+        );
+        assert!(
+            order_work_unit_integration_repositories(&repositories, &["context".to_owned()])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn multirepo_integration_conflict_preserves_success_and_retries_pending_only() {
+        fn attempted_repositories<'a>(rows: &[(&'a str, &'a str, bool)]) -> Vec<&'a str> {
+            let mut attempted = Vec::new();
+            for &(repo_id, outcome, terminal_before_retry) in rows {
+                attempted.push(repo_id);
+                if integration_failure_should_stop_batch(outcome, terminal_before_retry) {
+                    break;
+                }
+            }
+            attempted
+        }
+
+        let successful = RepositoryIntegrationResult {
+            repo_id: "primary".to_owned(),
+            integration_id: "primary-integration".to_owned(),
+            source_sha: "a".repeat(40),
+            before_sha: Some("b".repeat(40)),
+            after_sha: Some("c".repeat(40)),
+            outcome: "success".to_owned(),
+        };
+        let conflict = RepositoryIntegrationResult {
+            repo_id: "affected-first".to_owned(),
+            integration_id: "conflicted-integration".to_owned(),
+            source_sha: "d".repeat(40),
+            before_sha: Some("e".repeat(40)),
+            after_sha: None,
+            outcome: "conflict".to_owned(),
+        };
+        let first_attempt = attempted_repositories(&[
+            ("primary", "success", false),
+            ("affected-first", "conflict", false),
+            ("affected-later", "pending", false),
+        ]);
+        assert_eq!(first_attempt, ["primary", "affected-first"]);
+
+        // The first replay returns the durable success and conflict without
+        // changing either row, then reaches the still-pending repository.
+        let retry_attempt = attempted_repositories(&[
+            ("primary", "success", true),
+            ("affected-first", "conflict", true),
+            ("affected-later", "pending", false),
+        ]);
+        assert_eq!(
+            retry_attempt,
+            ["primary", "affected-first", "affected-later"]
+        );
+        assert_eq!(successful.outcome, "success");
+        let success_sha = "c".repeat(40);
+        assert_eq!(successful.after_sha.as_deref(), Some(success_sha.as_str()));
+        assert_eq!(conflict.outcome, "conflict");
+        assert_eq!(conflict.after_sha, None);
     }
 
     #[tokio::test]
@@ -2659,6 +3995,7 @@ mod tests {
                 lifecycle_state: db::TaskLifecycleState::Ready,
                 is_automation: false,
                 priority: 0,
+                repositories: Vec::new(),
                 subtask_order: None,
                 merge_config: None,
                 created_at: now.clone(),
@@ -2747,10 +4084,10 @@ mod tests {
             .await
             .expect("manual mode remains manual");
         assert!(
-            WorkUnitWorkspaceRepo::get_by_work_unit_id(&*db, &units[0].id)
+            WorkUnitWorkspaceRepo::list_by_work_unit_id(&*db, &units[0].id)
                 .await
-                .expect("workspace")
-                .is_none()
+                .expect("workspaces")
+                .is_empty()
         );
         let task = TaskRepo::get_by_id(&*db, &task_id, false)
             .await
@@ -2779,10 +4116,10 @@ mod tests {
             .await
             .expect("unlinked work remains manual");
         assert!(
-            WorkUnitWorkspaceRepo::get_by_work_unit_id(&*db, &units[0].id)
+            WorkUnitWorkspaceRepo::list_by_work_unit_id(&*db, &units[0].id)
                 .await
-                .expect("workspace")
-                .is_none()
+                .expect("workspaces")
+                .is_empty()
         );
         let quality = coordination
             .create_quality_request(
@@ -2837,10 +4174,10 @@ mod tests {
                 .await
                 .expect("closed authority fence");
             assert!(
-                WorkUnitWorkspaceRepo::get_by_work_unit_id(&*db, &units[0].id)
+                WorkUnitWorkspaceRepo::list_by_work_unit_id(&*db, &units[0].id)
                     .await
-                    .expect("workspace")
-                    .is_none()
+                    .expect("workspaces")
+                    .is_empty()
             );
         }
         let blockers = service
@@ -2848,25 +4185,29 @@ mod tests {
             .await
             .expect("authorized preparation");
         assert!(blockers.is_empty(), "{blockers:?}");
-        let workspace = WorkUnitWorkspaceRepo::get_by_work_unit_id(&*db, &units[0].id)
+        let workspace = WorkUnitWorkspaceRepo::list_by_work_unit_id(&*db, &units[0].id)
             .await
-            .expect("workspace")
+            .expect("workspaces")
+            .into_iter()
+            .next()
             .expect("prepared exact scope");
         assert_eq!(workspace.before_sha.as_deref(), Some(base_sha.as_str()));
         assert!(
-            WorkUnitWorkspaceRepo::get_by_work_unit_id(&*db, &units[1].id)
+            WorkUnitWorkspaceRepo::list_by_work_unit_id(&*db, &units[1].id)
                 .await
-                .expect("workspace")
-                .is_none()
+                .expect("workspaces")
+                .is_empty()
         );
         service
             .prepare_coordination_workspaces(&task_id, &human_id, 2)
             .await
             .expect("idempotent preparation");
         assert_eq!(
-            WorkUnitWorkspaceRepo::get_by_work_unit_id(&*db, &units[0].id)
+            WorkUnitWorkspaceRepo::list_by_work_unit_id(&*db, &units[0].id)
                 .await
-                .expect("workspace")
+                .expect("workspaces")
+                .into_iter()
+                .next()
                 .expect("row")
                 .id,
             workspace.id
@@ -2874,7 +4215,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn integration_pins_success_and_aborts_conflict_without_losing_workunit_workspace() {
+    async fn multirepo_integration_single_repo_preserves_0_9_1_workspace_and_response() {
         let temp = TempDir::new().expect("temporary directory");
         let database_path = temp.path().join("pr5-integration.db");
         let database_url = format!("sqlite://{}", database_path.display());
@@ -3029,6 +4370,7 @@ mod tests {
                 lifecycle_state: db::TaskLifecycleState::Ready,
                 is_automation: false,
                 priority: 0,
+                repositories: Vec::new(),
                 subtask_order: None,
                 merge_config: None,
                 created_at: now.clone(),
@@ -3178,6 +4520,7 @@ mod tests {
                     requires_integration: true,
                     provenance: None,
                     artifact_input_ids: Vec::new(),
+                    repository_ids: Vec::new(),
                     review_approval_gate_id: None,
                     review_approval_line_id: None,
                     created_by: ActorRef::Human(human_id.to_owned()),
@@ -3195,19 +4538,40 @@ mod tests {
             .expect("WorkUnit")
             .record;
             let workspace_id = new_uuid_v4();
-            let branch = workspace::work_unit_branch_name(task_id, &unit_id, &workspace_id)
-                .expect("branch name");
-            let path = manager
-                .create_work_unit_worktree(
+            let workspace_group_id = new_uuid_v4();
+            let group_root = manager
+                .work_unit_group_path(task_id, &unit_id, &workspace_group_id)
+                .expect("WorkUnit WorkspaceGroup root");
+            tokio::fs::create_dir_all(&group_root)
+                .await
+                .expect("WorkUnit WorkspaceGroup root creates");
+            WorkspaceRepo::create_group_for_work_unit(
+                db,
+                db::CreateWorkspaceGroup {
+                    id: workspace_group_id.clone(),
+                    task_id: task_id.to_owned(),
+                    work_unit_id: unit_id.clone(),
+                    root_path: group_root.to_string_lossy().into_owned(),
+                    created_at: now.clone(),
+                },
+            )
+            .await
+            .expect("WorkUnit WorkspaceGroup");
+            let (path, branch) = manager
+                .create_group_worktree(
                     &repository_path.to_string_lossy(),
-                    task_id,
-                    &unit_id,
-                    &workspace_id,
-                    repo_id,
+                    workspace::GroupWorktreeIdentity {
+                        task_id,
+                        work_unit_id: &unit_id,
+                        group_id: &workspace_group_id,
+                        workspace_id: &workspace_id,
+                        repo_id,
+                    },
                     base_sha,
+                    false,
                 )
                 .await
-                .expect("WorkUnit worktree");
+                .expect("WorkUnit group worktree");
             let workspace = WorkUnitWorkspaceRepo::create_for_work_unit(
                 db,
                 db::CreateWorkUnitWorkspace {
@@ -3223,6 +4587,7 @@ mod tests {
                         updated_at: now.clone(),
                     },
                     work_unit_id: unit_id.clone(),
+                    workspace_group_id,
                 },
             )
             .await
@@ -3374,6 +4739,7 @@ mod tests {
                 requires_integration: false,
                 provenance: None,
                 artifact_input_ids: Vec::new(),
+                repository_ids: Vec::new(),
                 review_approval_gate_id: None,
                 review_approval_line_id: None,
                 created_by: ActorRef::Human(human_id.clone()),
@@ -3420,7 +4786,7 @@ mod tests {
             blocked_readiness.unsatisfied_dependency_ids,
             vec![first_unit.id.clone()]
         );
-        let first = service
+        let first_batch = service
             .integrate(
                 CollaborationActorSource::Human(human_id.clone()),
                 &first_unit.id,
@@ -3428,20 +4794,24 @@ mod tests {
                 "integrate-first-result",
             )
             .await
-            .expect("clean integration");
+            .expect("single-repository WorkUnit integration response");
+        assert_eq!(first_batch.task_id, task_id);
+        assert_eq!(first_batch.work_unit_id, first_unit.id);
+        assert_eq!(first_batch.repository_revision, 1);
+        assert_eq!(first_batch.items.len(), 1);
+        assert_eq!(first_batch.items[0].repo_id, repo_id);
+        assert_eq!(first_batch.items[0].outcome, "success");
+        let first =
+            WorkUnitRepo::get_integration_by_idempotency(&*db, &task_id, "integrate-first-result")
+                .await
+                .expect("parent integration lookup")
+                .expect("parent integration exists");
+        assert_ne!(first_batch.items[0].integration_id, first.id);
         assert_eq!(first.outcome, WorkUnitIntegrationOutcome::Success);
         assert_eq!(first.source_sha, first_sha);
         assert_eq!(first.source_workspace_id, first_workspace.id);
         assert_eq!(first.target_workspace_id, integration_workspace.id);
         assert_eq!(first.target_before_sha, base_sha);
-        let started_notification = committed_notifications
-            .recv()
-            .await
-            .expect("integration-started notification");
-        let completed_notification = committed_notifications
-            .recv()
-            .await
-            .expect("integration-completed notification");
         let durable_notification_ids = sqlx::query_scalar::<_, String>(
             "SELECT id FROM domain_event
              WHERE entity_type = 'work_unit_integration' AND entity_id = ?
@@ -3453,11 +4823,23 @@ mod tests {
         .await
         .expect("durable integration events");
         assert_eq!(durable_notification_ids.len(), 2);
-        assert_eq!(started_notification.entity_id, durable_notification_ids[0]);
-        assert_eq!(
-            completed_notification.entity_id,
-            durable_notification_ids[1]
-        );
+        let mut observed_parent_event_ids = std::collections::HashSet::new();
+        for _ in 0..4 {
+            let notification = committed_notifications
+                .recv()
+                .await
+                .expect("integration notification");
+            observed_parent_event_ids.insert(notification.entity_id);
+            if durable_notification_ids
+                .iter()
+                .all(|event_id| observed_parent_event_ids.contains(event_id))
+            {
+                break;
+            }
+        }
+        assert!(durable_notification_ids
+            .iter()
+            .all(|event_id| observed_parent_event_ids.contains(event_id)));
         let ready_after_integration = service
             .readiness(
                 CollaborationActorSource::Human(human_id.clone()),
@@ -3476,15 +4858,15 @@ mod tests {
             first.target_after_sha.as_deref(),
             Some(after_first.as_str())
         );
-        let replay = service
-            .integrate(
-                CollaborationActorSource::Human(human_id.clone()),
-                &first_unit.id,
-                &first_execution,
-                "integrate-first-result",
-            )
-            .await
-            .expect("idempotent integration replay");
+        let replay = integrate_parent(
+            &service,
+            &db,
+            CollaborationActorSource::Human(human_id.clone()),
+            &first_unit.id,
+            &first_execution,
+            "integrate-first-result",
+        )
+        .await;
         assert_eq!(replay.id, first.id);
         assert_eq!(
             git::get_current_sha(&integration_path).await.unwrap(),
@@ -3551,7 +4933,7 @@ mod tests {
             git::merge(&integration_path, &second_sha).await,
             Err(git::GitError::MergeConflict { .. })
         ));
-        let conflict = service
+        let conflict_batch = service
             .integrate(
                 CollaborationActorSource::Human(human_id.clone()),
                 &second_unit.id,
@@ -3560,53 +4942,53 @@ mod tests {
             )
             .await
             .expect("conflict is recorded");
+        assert_eq!(conflict_batch.items.len(), 1);
+        assert_eq!(conflict_batch.items[0].outcome, "conflict");
+        let conflict =
+            WorkUnitRepo::get_integration_by_idempotency(&*db, &task_id, conflict_idempotency_key)
+                .await
+                .expect("parent integration lookup")
+                .expect("parent integration exists");
         assert_eq!(conflict.outcome, WorkUnitIntegrationOutcome::Conflict);
         assert_eq!(conflict.source_sha, second_sha);
         assert_eq!(conflict.source_workspace_id, second_workspace.id);
         assert_eq!(conflict.target_before_sha, before_conflict);
+        let child =
+            WorkUnitRepositoryIntegrationRepo::get_by_parent_and_repo(&*db, &conflict.id, &repo_id)
+                .await
+                .expect("child integration lookup")
+                .expect("child integration exists");
+        assert_eq!(
+            child.outcome,
+            WorkUnitRepositoryIntegrationOutcome::Conflict
+        );
+        assert!(child.conflict_metadata_json.is_some());
         assert!(conflict.conflict_metadata_json.is_some());
-        let conflict_event_id: String = sqlx::query_scalar(
+        let parent_conflict_event_id: String = sqlx::query_scalar(
             "SELECT id FROM domain_event
              WHERE entity_type = 'work_unit_integration' AND entity_id = ?
-               AND event_type = 'work_unit.integration_conflicted'",
+               AND event_type = 'work_unit.integration_conflicted'
+             ORDER BY sequence DESC LIMIT 1",
         )
         .bind(&conflict.id)
         .fetch_one(db.pool())
         .await
-        .expect("exact WorkUnitIntegration conflict event");
+        .expect("legacy single-repo parent conflict event");
+        let conflict_event_id: String = sqlx::query_scalar(
+            "SELECT id FROM domain_event
+             WHERE entity_type = 'work_unit_repository_integration' AND entity_id = ?
+               AND event_type = 'work_unit.repository_integration_changed'
+             ORDER BY sequence DESC LIMIT 1",
+        )
+        .bind(&child.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("exact repo integration conflict event");
         let conflict_event = db::DomainEventRepo::get_event(&*db, &conflict_event_id)
             .await
             .expect("conflict event lookup")
             .expect("conflict event");
-        let retry_service = crate::task_failure_retry::TaskFailureRetryService::new(
-            Arc::clone(&db),
-            Arc::clone(&event_bus),
-        );
-        assert_eq!(
-            retry_service
-                .process_domain_event(&conflict_event)
-                .await
-                .expect("consume exact WorkUnitIntegration conflict"),
-            1
-        );
-        assert_eq!(
-            retry_service
-                .process_domain_event(&conflict_event)
-                .await
-                .expect("replay exact WorkUnitIntegration conflict"),
-            1
-        );
-        let integration_attempt: i64 = sqlx::query_scalar(
-            "SELECT attempt_number FROM task_failure_retry_receipt
-             WHERE task_id = ? AND failure_kind = 'work_unit_integration_failed'
-               AND failure_ref = ?",
-        )
-        .bind(&task_id)
-        .bind(&conflict.id)
-        .fetch_one(db.pool())
-        .await
-        .expect("exact WorkUnitIntegration retry attempt");
-        assert_eq!(integration_attempt, 1);
+        assert_eq!(conflict_event.entity_id, child.id);
         assert_eq!(
             git::get_current_sha(&integration_path).await.unwrap(),
             before_conflict
@@ -3625,7 +5007,7 @@ mod tests {
             )
             .await
             .expect("conflict replay");
-        assert_eq!(conflict_replay.id, conflict.id);
+        assert_eq!(conflict_replay.items[0].integration_id, child.id);
         assert_eq!(
             git::get_current_sha(&integration_path).await.unwrap(),
             before_conflict
@@ -3807,15 +5189,15 @@ mod tests {
             &human_id,
         )
         .await;
-        let recovered_untouched = service
-            .integrate(
-                CollaborationActorSource::Human(human_id.clone()),
-                &recovery_unit.id,
-                &recovery_execution,
-                "recover-before-git",
-            )
-            .await
-            .expect("retry from the pinned clean target");
+        let recovered_untouched = integrate_parent(
+            &service,
+            &db,
+            CollaborationActorSource::Human(human_id.clone()),
+            &recovery_unit.id,
+            &recovery_execution,
+            "recover-before-git",
+        )
+        .await;
         assert_eq!(recovered_untouched.id, untouched_attempt.id);
         assert_eq!(
             recovered_untouched.outcome,
@@ -3863,15 +5245,15 @@ mod tests {
         let materialized_head = git::get_current_sha(&integration_path)
             .await
             .expect("materialized target SHA");
-        let recovered_materialized = service
-            .integrate(
-                CollaborationActorSource::Human(human_id.clone()),
-                &materialized_unit.id,
-                &materialized_execution,
-                "recover-after-git",
-            )
-            .await
-            .expect("materialized merge converges to success");
+        let recovered_materialized = integrate_parent(
+            &service,
+            &db,
+            CollaborationActorSource::Human(human_id.clone()),
+            &materialized_unit.id,
+            &materialized_execution,
+            "recover-after-git",
+        )
+        .await;
         assert_eq!(recovered_materialized.id, materialized_attempt.id);
         assert_eq!(
             recovered_materialized.outcome,
@@ -3881,15 +5263,15 @@ mod tests {
             recovered_materialized.target_after_sha.as_deref(),
             Some(materialized_head.as_str())
         );
-        let replay_materialized = service
-            .integrate(
-                CollaborationActorSource::Human(human_id.clone()),
-                &materialized_unit.id,
-                &materialized_execution,
-                "recover-after-git",
-            )
-            .await
-            .expect("already recorded materialized result is idempotent");
+        let replay_materialized = integrate_parent(
+            &service,
+            &db,
+            CollaborationActorSource::Human(human_id.clone()),
+            &materialized_unit.id,
+            &materialized_execution,
+            "recover-after-git",
+        )
+        .await;
         assert_eq!(replay_materialized.id, materialized_attempt.id);
         assert_eq!(
             git::get_current_sha(&integration_path).await.unwrap(),
@@ -3934,26 +5316,123 @@ mod tests {
         let unexpected_head = git::commit_all(&integration_path, "unattributed target change")
             .await
             .expect("external target commit");
-        let mismatch = service
-            .integrate(
-                CollaborationActorSource::Human(human_id.clone()),
-                &mismatch_unit.id,
-                &mismatch_execution,
-                "recover-unexpected-head",
-            )
-            .await
-            .expect("unexpected target fails closed as a durable outcome");
+        let mismatch = integrate_parent(
+            &service,
+            &db,
+            CollaborationActorSource::Human(human_id.clone()),
+            &mismatch_unit.id,
+            &mismatch_execution,
+            "recover-unexpected-head",
+        )
+        .await;
         assert_eq!(mismatch.id, mismatch_attempt.id);
         assert_eq!(mismatch.outcome, WorkUnitIntegrationOutcome::Failed);
         assert!(mismatch
             .conflict_metadata_json
             .as_deref()
             .is_some_and(|metadata| metadata.contains("target_head_mismatch")));
+        let mismatch_child =
+            WorkUnitRepositoryIntegrationRepo::get_by_parent_and_repo(&*db, &mismatch.id, &repo_id)
+                .await
+                .expect("mismatch child lookup")
+                .expect("mismatch child exists");
+        assert_eq!(
+            mismatch_child.outcome,
+            WorkUnitRepositoryIntegrationOutcome::Failed
+        );
+        assert!(mismatch_child
+            .conflict_metadata_json
+            .as_deref()
+            .is_some_and(|metadata| metadata.contains("target_head_mismatch")));
+        assert!(
+            db::DomainEventRepo::get_event(&*db, &parent_conflict_event_id)
+                .await
+                .expect("parent conflict event lookup")
+                .is_some()
+        );
         assert_eq!(
             git::get_current_sha(&integration_path).await.unwrap(),
             unexpected_head,
             "recovery never changes an unattributed target head"
         );
+
+        // V183 does not invent child rows for a pre-M3 scalar success. A
+        // replay still uses the old parent identity and exact primary repo.
+        let legacy_parent_id = new_uuid_v4();
+        let legacy_started_at = now_rfc3339();
+        let legacy_parent = WorkUnitRepo::begin_integration(
+            &*db,
+            CreateWorkUnitIntegration {
+                id: legacy_parent_id.clone(),
+                task_id: task_id.clone(),
+                work_unit_id: first_unit.id.clone(),
+                execution_id: first_execution.clone(),
+                source_workspace_id: first_workspace.id.clone(),
+                source_branch: first_workspace.branch.clone(),
+                source_sha: first_sha.clone(),
+                target_workspace_id: integration_workspace.id.clone(),
+                target_branch: integration_workspace.branch.clone(),
+                target_before_sha: base_sha.clone(),
+                operation_idempotency_key: "legacy-success-replay".to_owned(),
+                started_at: legacy_started_at.clone(),
+                created_at: legacy_started_at.clone(),
+            },
+            event(
+                "work_unit.integration_started",
+                "work_unit_integration",
+                &legacy_parent_id,
+                &task_id,
+                &human_id,
+            ),
+        )
+        .await
+        .expect("legacy parent begins")
+        .record;
+        let legacy_finished_at = now_rfc3339();
+        let legacy_parent = WorkUnitRepo::record_integration(
+            &*db,
+            RecordWorkUnitIntegration {
+                id: legacy_parent.id.clone(),
+                expected_version: legacy_parent.version,
+                outcome: WorkUnitIntegrationOutcome::Success,
+                target_after_sha: Some(after_first.clone()),
+                conflict_metadata_json: None,
+                finished_at: legacy_finished_at.clone(),
+                updated_at: legacy_finished_at,
+            },
+            event(
+                "work_unit.integration_succeeded",
+                "work_unit_integration",
+                &legacy_parent_id,
+                &task_id,
+                &human_id,
+            ),
+        )
+        .await
+        .expect("legacy parent success persists")
+        .record;
+        let legacy_replay = service
+            .integrate(
+                CollaborationActorSource::Human(human_id.clone()),
+                &first_unit.id,
+                &first_execution,
+                "legacy-success-replay",
+            )
+            .await
+            .expect("legacy scalar result projects to a repository item");
+        assert_eq!(legacy_replay.items.len(), 1);
+        assert_eq!(legacy_replay.items[0].integration_id, legacy_parent.id);
+        assert_eq!(legacy_replay.items[0].repo_id, repo_id);
+        assert_eq!(legacy_replay.items[0].source_sha, first_sha);
+        assert_eq!(legacy_replay.items[0].outcome, "success");
+        assert!(WorkUnitRepositoryIntegrationRepo::get_by_parent_and_repo(
+            &*db,
+            &legacy_parent.id,
+            &repo_id,
+        )
+        .await
+        .expect("no synthetic child lookup")
+        .is_none());
 
         let cleanup = crate::workspace_cleanup::WorkspaceCleanupScheduler::new(
             Arc::clone(&db),
@@ -4011,13 +5490,20 @@ mod tests {
             )
             .await
             .expect("open repository WorkUnit");
-        let original_workspace = service
-            .prepare_workspace(
+        service
+            .prepare_workspace_group(
                 CollaborationActorSource::Human(human_id.clone()),
                 &retryable_unit.id,
             )
             .await
-            .expect("WorkUnit Workspace prepares");
+            .expect("WorkUnit WorkspaceGroup prepares");
+        let original_workspace =
+            WorkUnitWorkspaceRepo::list_by_work_unit_id(&*db, &retryable_unit.id)
+                .await
+                .expect("WorkUnit repository workspaces")
+                .into_iter()
+                .find(|workspace| workspace.repo_id == task.repo_id.as_deref().unwrap())
+                .expect("primary repository Workspace prepares");
         let first_attempt = running_repository_execution(
             &db,
             &task_id,
@@ -4082,10 +5568,10 @@ mod tests {
         .await
         .expect("failed attempt remains historical");
         assert!(
-            db::WorkspaceLeaseRepo::get_active_for_work_unit(&*db, &retryable_unit.id,)
+            db::WorkspaceLeaseRepo::list_active_for_work_unit(&*db, &retryable_unit.id,)
                 .await
                 .expect("failed attempt lease lookup")
-                .is_none()
+                .is_empty()
         );
         let failed_lease_status: String =
             sqlx::query_scalar("SELECT status FROM workspace_lease WHERE execution_id = ?")
@@ -4137,13 +5623,20 @@ mod tests {
                 .status,
             WorkspaceStatus::Cleaned
         );
-        let recovered_workspace = service
-            .prepare_workspace(
+        service
+            .prepare_workspace_group(
                 CollaborationActorSource::Human(human_id.clone()),
                 &retryable_unit.id,
             )
             .await
-            .expect("Cleaned WorkUnit Workspace recovers from its branch");
+            .expect("Cleaned WorkspaceGroup member recovers from its branch");
+        let recovered_workspace =
+            WorkUnitWorkspaceRepo::list_by_work_unit_id(&*db, &retryable_unit.id)
+                .await
+                .expect("recovered WorkUnit repository workspaces")
+                .into_iter()
+                .find(|workspace| workspace.repo_id == task.repo_id.as_deref().unwrap())
+                .expect("recovered primary repository Workspace");
         assert_eq!(recovered_workspace.id, original_workspace.id);
         assert_eq!(recovered_workspace.branch, original_workspace.branch);
         assert_eq!(
@@ -4176,9 +5669,11 @@ mod tests {
             .await
             .expect("retry binds to the recovered Workspace");
         let retry_lease =
-            db::WorkspaceLeaseRepo::get_active_for_work_unit(&*db, &retryable_unit.id)
+            db::WorkspaceLeaseRepo::list_active_for_work_unit(&*db, &retryable_unit.id)
                 .await
                 .expect("retried WorkUnit lease lookup")
+                .into_iter()
+                .next()
                 .expect("retry receives exact active lease");
         assert_eq!(
             retry_lease.workspace_id.as_deref(),
@@ -4209,10 +5704,10 @@ mod tests {
         .await
         .expect("retry attempt can stop");
         assert!(
-            db::WorkspaceLeaseRepo::get_active_for_work_unit(&*db, &retryable_unit.id)
+            db::WorkspaceLeaseRepo::list_active_for_work_unit(&*db, &retryable_unit.id)
                 .await
                 .expect("retry lease lookup")
-                .is_none()
+                .is_empty()
         );
         let retry_lease_status: String =
             sqlx::query_scalar("SELECT status FROM workspace_lease WHERE execution_id = ?")
@@ -4294,12 +5789,17 @@ mod tests {
         .await
         .expect("missing-branch cleanup claim commits")
         .expect("completed WorkUnit has no active execution or lease");
+        let missing_branch_group =
+            WorkspaceRepo::get_group_by_work_unit_id(&*db, &missing_branch_unit.id)
+                .await
+                .expect("WorkspaceGroup lookup")
+                .expect("single-repository WorkUnit has its persisted WorkspaceGroup");
         manager
-            .cleanup_work_unit_worktree(
+            .cleanup_group_worktree(
                 &repository_path.to_string_lossy(),
                 &task_id,
                 &missing_branch_unit.id,
-                &missing_branch_workspace.id,
+                &missing_branch_group.id,
                 &repo_id,
             )
             .await

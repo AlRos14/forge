@@ -8,7 +8,11 @@ import type {
 } from '@/types/generated'
 import { TaskPhaseThreePanel } from './task-phase-three-panel'
 
-const queries = vi.hoisted(() => ({ fallback: {} as Record<string, unknown>, microFixes: {} as Record<string, unknown>, replans: {} as Record<string, unknown> }))
+const queries = vi.hoisted(() => ({
+  fallback: {} as Record<string, unknown>,
+  microFixes: {} as Record<string, unknown>,
+  replans: {} as Record<string, unknown>,
+}))
 
 vi.mock('@/api/hooks', () => ({
   useTaskFallbackReceiptsQuery: () => queries.fallback,
@@ -16,7 +20,15 @@ vi.mock('@/api/hooks', () => ({
   useTaskCoordinatorReplansQuery: () => queries.replans,
 }))
 
-const task = { id: 'task-1' } as unknown as Task
+const task = {
+  id: 'task-1',
+  project_id: 'project-1',
+  repo_id: null,
+  repositories: [],
+  repository_set_revision: 0,
+  repository_set_digest: null,
+  repository_merge_batches: [],
+} as unknown as Task
 
 const fallbackReceipt = {
   id: 'fallback-1',

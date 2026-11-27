@@ -1,4 +1,5 @@
 use super::*;
+use db::TaskRepositorySetRepo;
 
 pub async fn get_task_workspace(
     State(state): State<AppState>,
@@ -6,7 +7,16 @@ pub async fn get_task_workspace(
     user: AuthenticatedUser,
 ) -> ApiResult<Json<WorkspaceResponse>> {
     require_task_visible(&state, &id, &user).await?;
-    let workspace = WorkspaceRepo::get_integration_by_task_id(&*state.db, &id)
+    let repository_set = TaskRepositorySetRepo::get_current(&*state.db, &id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("task repository-set revision", id.clone()))?;
+    let primary_repo_id = repository_set
+        .repositories
+        .iter()
+        .find(|repository| repository.role == db::TaskRepositoryRole::Primary)
+        .map(|repository| repository.repo_id.as_str())
+        .ok_or_else(|| ApiError::not_found("workspace", id.clone()))?;
+    let workspace = WorkspaceRepo::get_integration_by_task_repo(&*state.db, &id, primary_repo_id)
         .await?
         .ok_or_else(|| ApiError::not_found("workspace", id))?;
     Ok(Json(workspace_response(workspace)))

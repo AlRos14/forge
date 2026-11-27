@@ -3,8 +3,8 @@ use serde_json::Value;
 use ts_rs::TS;
 
 use crate::{
-    ActorRef, TaskDispatchIntentResponse, TaskLifecycleResponse, TaskRoleCapability,
-    TaskRoleConfiguration,
+    ActorRef, TaskDispatchIntentResponse, TaskLifecycleResponse, TaskRepositoryInput,
+    TaskRoleCapability, TaskRoleConfiguration,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -258,6 +258,9 @@ pub struct TaskCoordinationPlanWorkUnitResponse {
     pub review_subject_key: Option<String>,
     pub acceptance: Vec<String>,
     pub artifact_inputs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(as = "Option<Vec<String>>", optional)]
+    pub repository_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -289,6 +292,9 @@ pub struct TaskCoordinationPlanResponse {
     pub envelope_digest: String,
     pub objective_digest: String,
     pub work_units: Vec<TaskCoordinationPlanWorkUnitResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub repository_set: Option<Vec<TaskRepositoryInput>>,
     pub proposal_id: Option<String>,
     pub decision_id: Option<String>,
     pub materialization: Option<TaskCoordinationMaterializationResponse>,

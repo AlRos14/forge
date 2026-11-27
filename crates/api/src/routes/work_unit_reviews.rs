@@ -29,7 +29,10 @@ pub async fn submit(
     let report = crate::routes::collaboration::artifact_response(report, true)?;
     Ok(Json(SubmitReviewReportResponse {
         review_execution: ReviewExecutionResponse {
-            execution: crate::routes::execution_response(execution),
+            execution: crate::routes::execution_response_with_repository_results(
+                &state.db, execution,
+            )
+            .await?,
             report: Some(report.clone()),
         },
         report,

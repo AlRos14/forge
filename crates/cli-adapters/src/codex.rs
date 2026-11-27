@@ -671,8 +671,11 @@ impl CodexAdapter {
         let auto_commit = config.auto_commit.unwrap_or(true)
             && ctx.has_repository_workspace
             && ctx.role != "project_copilot";
+        let group_worktrees =
+            executors::workspace_group_writable_paths(Path::new(&ctx.worktree_path));
         // Commit reminder: if completed but worktree is dirty, nudge Codex once
-        if auto_commit
+        if group_worktrees.is_none()
+            && auto_commit
             && outcome == ExecutionOutcome::Completed
             && let Ok(false) = git::is_worktree_clean(Path::new(&ctx.worktree_path)).await
         {
@@ -733,7 +736,10 @@ impl CodexAdapter {
         if !auto_commit {
             return Ok(ExecutionResult {
                 status: ExecutionOutcome::Completed,
-                after_sha: if !ctx.has_repository_workspace || ctx.role == "project_copilot" {
+                after_sha: if group_worktrees.is_some()
+                    || !ctx.has_repository_workspace
+                    || ctx.role == "project_copilot"
+                {
                     None
                 } else {
                     git::get_current_sha(Path::new(&ctx.worktree_path))
@@ -750,9 +756,32 @@ impl CodexAdapter {
             });
         }
         let subject = crate::commit::build_commit_subject(Some(&ctx.description), &ctx.task_id);
-        let after_sha =
-            match crate::commit::commit_worktree_changes(Path::new(&ctx.worktree_path), &subject)
-                .await
+        let after_sha = if let Some(worktrees) = group_worktrees {
+            for worktree in worktrees {
+                if let Err(error) =
+                    crate::commit::commit_worktree_changes(&worktree, &subject, &ctx.agent_config)
+                        .await
+                {
+                    return Ok(ExecutionResult {
+                        status: ExecutionOutcome::Failed,
+                        after_sha: None,
+                        agent_session_id,
+                        summary,
+                        error: Some(error.to_string()),
+                        usage: usage.map(|usage| usage_with_model(usage, &config)),
+                        account_usage,
+                        ..Default::default()
+                    });
+                }
+            }
+            None
+        } else {
+            match crate::commit::commit_worktree_changes(
+                Path::new(&ctx.worktree_path),
+                &subject,
+                &ctx.agent_config,
+            )
+            .await
             {
                 Ok(Some(sha)) => Some(sha),
                 Ok(None) => git::get_current_sha(Path::new(&ctx.worktree_path))
@@ -770,7 +799,8 @@ impl CodexAdapter {
                         ..Default::default()
                     });
                 }
-            };
+            }
+        };
 
         Ok(ExecutionResult {
             status: ExecutionOutcome::Completed,

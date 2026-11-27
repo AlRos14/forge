@@ -308,6 +308,7 @@ async fn install_demo_tasks(
         TaskRepo::create(
             db,
             CreateTask {
+                repositories: Vec::new(),
                 id: task_id.clone(),
                 project_id: project_id.to_owned(),
                 repo_id: Some(repo_id.to_owned()),

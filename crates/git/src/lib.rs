@@ -51,6 +51,38 @@ async fn run_git(cwd: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Fixed identity for deterministic Git operations that Forge itself makes
+/// (integration and merge commits). Reserved, non-routable domain.
+pub const FORGE_SYSTEM_NAME: &str = "Forge";
+pub const FORGE_SYSTEM_EMAIL: &str = "forge@agents.forge.invalid";
+
+/// Like [`run_git`], but any commit it creates is authored and committed by
+/// the Forge system identity rather than the machine's global identity.
+async fn run_git_as_forge(cwd: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env("GIT_AUTHOR_NAME", FORGE_SYSTEM_NAME)
+        .env("GIT_AUTHOR_EMAIL", FORGE_SYSTEM_EMAIL)
+        .env("GIT_COMMITTER_NAME", FORGE_SYSTEM_NAME)
+        .env("GIT_COMMITTER_EMAIL", FORGE_SYSTEM_EMAIL)
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Err(GitError::CommandFailed {
+            command: format!("git {}", args.join(" ")),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        });
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 async fn run_git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let output = Command::new("git")
         .args(args)
@@ -652,7 +684,7 @@ pub async fn checkout_branch(repo_path: &Path, branch_name: &str) -> Result<()> 
 
 /// Attempt to merge a branch into the current worktree HEAD.
 pub async fn merge(worktree_path: &Path, target_branch: &str) -> Result<()> {
-    let result = run_git(worktree_path, &["merge", target_branch, "--no-edit"]).await;
+    let result = run_git_as_forge(worktree_path, &["merge", target_branch, "--no-edit"]).await;
     match result {
         Ok(_) => Ok(()),
         Err(GitError::CommandFailed { stdout, stderr, .. })
@@ -766,7 +798,7 @@ pub async fn stage_all(path: &Path) -> Result<()> {
 
 /// Commit currently staged changes.
 pub async fn commit_with_message(path: &Path, message: &str) -> Result<String> {
-    run_git(path, &["commit", "-m", message]).await?;
+    run_git_as_forge(path, &["commit", "-m", message]).await?;
     get_current_sha(path).await
 }
 
@@ -789,7 +821,7 @@ pub async fn count_commits_between(path: &Path, before_sha: &str, after_sha: &st
 
 /// Rebase the current branch onto `onto_branch`.
 pub async fn rebase(worktree_path: &Path, onto_branch: &str) -> Result<()> {
-    let result = run_git(worktree_path, &["rebase", onto_branch]).await;
+    let result = run_git_as_forge(worktree_path, &["rebase", onto_branch]).await;
     match result {
         Ok(_) => Ok(()),
         Err(GitError::CommandFailed { stdout, stderr, .. })
@@ -819,7 +851,7 @@ pub async fn abort_rebase(worktree_path: &Path) -> Result<()> {
 
 /// Continue a paused rebase (after conflict resolution).
 pub async fn continue_rebase(worktree_path: &Path) -> Result<()> {
-    run_git(worktree_path, &["rebase", "--continue"]).await?;
+    run_git_as_forge(worktree_path, &["rebase", "--continue"]).await?;
     Ok(())
 }
 
@@ -986,6 +1018,30 @@ mod tests {
         commit_all(&repo_path, "initial commit").await.unwrap();
 
         (dir, repo_path)
+    }
+
+    #[tokio::test]
+    async fn forge_merge_commit_uses_system_identity() {
+        let (_dir, repo) = setup_repo().await;
+        run_git(&repo, &["checkout", "-q", "-b", "side"])
+            .await
+            .unwrap();
+        fs::write(repo.join("side.txt"), "side").await.unwrap();
+        commit_all(&repo, "side").await.unwrap();
+        run_git(&repo, &["checkout", "-q", "-"]).await.unwrap();
+        fs::write(repo.join("main.txt"), "main").await.unwrap();
+        commit_all(&repo, "main").await.unwrap();
+
+        merge(&repo, "side").await.unwrap();
+
+        let author = run_git(&repo, &["log", "-1", "--format=%an <%ae>"])
+            .await
+            .unwrap();
+        let committer = run_git(&repo, &["log", "-1", "--format=%cn <%ce>"])
+            .await
+            .unwrap();
+        assert_eq!(author, "Forge <forge@agents.forge.invalid>");
+        assert_eq!(committer, author);
     }
 
     #[tokio::test]

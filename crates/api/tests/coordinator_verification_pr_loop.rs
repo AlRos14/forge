@@ -323,9 +323,96 @@ async fn task_pr_reads_are_paged_and_action_decisions_check_version() {
     assert!(actions.items.is_empty());
     assert!(actions.next_cursor.is_none());
 
+    let collaboration = services::collaboration_service::CollaborationService::new(
+        std::sync::Arc::clone(&f.harness.state.db),
+        std::sync::Arc::clone(&f.harness.state.event_bus),
+    );
+    let proposal = collaboration
+        .create_proposal(
+            services::collaboration_service::CollaborationActorSource::Human(
+                "test-user-id".to_owned(),
+            ),
+            services::collaboration_service::CreateProposalInput {
+                task_id: f.task_id.clone(),
+                target: db::ProposalTarget {
+                    kind: db::ProposalTargetKind::Task,
+                    id: f.task_id.clone(),
+                },
+                action: "merge".to_owned(),
+                reason: "Authorize the synthetic route fixture with an exact Gate input".to_owned(),
+                target_version: None,
+                target_digest: None,
+                required_policy_ref: None,
+                required_policy_version: None,
+                required_policy_digest: None,
+                supersedes_proposal_id: None,
+                artifact_ids: Vec::new(),
+            },
+        )
+        .await
+        .expect("merge Proposal");
+    let decision = collaboration
+        .record_decision(
+            services::collaboration_service::CreateDecisionInput {
+                task_id: f.task_id.clone(),
+                proposal_id: proposal.id.clone(),
+                proposal_version: proposal.content_version,
+                outcome: db::DecisionOutcome::Approve,
+                rationale: "Approve the synthetic route fixture's exact Proposal".to_owned(),
+                policy_ref: None,
+                policy_version: None,
+                policy_digest: None,
+            },
+            vec![
+                services::collaboration_service::CollaborationActorSource::Human(
+                    "test-user-id".to_owned(),
+                ),
+            ],
+        )
+        .await
+        .expect("exact Human Decision");
+    let gate_engine = services::gate_engine::GateEngine::new(
+        std::sync::Arc::clone(&f.harness.state.db),
+        std::sync::Arc::clone(&f.harness.state.event_bus),
+    );
+    let (merge_gate, _) = gate_engine
+        .create_gate_with_initial_policy(
+            &f.task_id,
+            "merge_readiness",
+            db::GateScopeKind::Task,
+            &f.task_id,
+            services::gate_engine::GatePolicyDocument {
+                schema_version: 1,
+                scope_requirement: None,
+                review: None,
+                validations: Vec::new(),
+                decisions: vec![services::gate_engine::DecisionRequirement {
+                    proposal_id: proposal.id,
+                    proposal_version: decision.proposal_version,
+                    decision_id: decision.id,
+                    outcome: db::DecisionOutcome::Approve,
+                    policy_ref: None,
+                    policy_version: None,
+                    policy_digest: None,
+                    permitted_deciders: vec![db::ActorRef::Human("test-user-id".to_owned())],
+                }],
+                work_units: Vec::new(),
+            },
+        )
+        .await
+        .expect("merge-readiness Gate");
+    let gate_evaluation = gate_engine
+        .evaluate_active(&merge_gate.id)
+        .await
+        .expect("exact merge-readiness evaluation");
+    assert_eq!(
+        gate_evaluation.evaluation.outcome,
+        db::GateEvaluationOutcome::Satisfied
+    );
+
     // The route's stale-version check is intentionally exercised with a
-    // synthetic persisted row. Creating a valid action requires the complete
-    // merge/publish/Gate/Proposal graph, which this API lane does not create.
+    // synthetic persisted row. Its TaskMerge rows still carry a real, current
+    // GateEvaluation so the database's exact-input guard remains enabled.
     sqlx::query("PRAGMA foreign_keys = OFF")
         .execute(f.harness.state.db.pool())
         .await
@@ -346,6 +433,93 @@ async fn task_pr_reads_are_paged_and_action_decisions_check_version() {
         .execute(f.harness.state.db.pool())
         .await
         .expect("disable feedback guard for synthetic route fixture");
+    sqlx::query("DROP TRIGGER IF EXISTS remote_pr_admission_insert_guard")
+        .execute(f.harness.state.db.pool())
+        .await
+        .expect("disable admission guard for synthetic route fixture");
+    sqlx::query("DROP TRIGGER IF EXISTS task_merge_gate_admission_guard")
+        .execute(f.harness.state.db.pool())
+        .await
+        .expect("disable Gate guard for synthetic route fixture");
+    sqlx::query("DROP TRIGGER IF EXISTS task_integration_operation_remote_admission_guard")
+        .execute(f.harness.state.db.pool())
+        .await
+        .expect("disable merge scope guard for synthetic route fixture");
+    for (merge_id, publish_id, metadata_id) in [
+        (
+            "feedback-admission-newest",
+            "publish-feedback-newest",
+            "metadata-feedback-newest",
+        ),
+        (
+            "feedback-admission-oldest",
+            "publish-feedback-oldest",
+            "metadata-feedback-oldest",
+        ),
+        (
+            "merge-newest",
+            "publish-merge-newest",
+            "metadata-merge-newest",
+        ),
+        (
+            "merge-oldest",
+            "publish-merge-oldest",
+            "metadata-merge-oldest",
+        ),
+        (
+            "synthetic-admission",
+            "publish-synthetic",
+            "metadata-synthetic",
+        ),
+        (
+            "synthetic-admission-terminal",
+            "publish-synthetic-terminal",
+            "metadata-synthetic-terminal",
+        ),
+    ] {
+        let now = db::now_rfc3339();
+        sqlx::query(
+            "INSERT INTO task_integration_operation (
+                id, task_id, repo_id, repository_merge_batch_id, kind, owner_id,
+                status, version, created_at, updated_at, finished_at,
+                gate_evaluation_id, remote_waiting, parent_operation_id, result_event_id
+             ) VALUES (?, ?, ?, NULL, 'task_merge', 'synthetic-owner',
+                'succeeded', 1, ?, ?, ?, ?, 1, NULL, NULL)",
+        )
+        .bind(merge_id)
+        .bind(&f.task_id)
+        .bind(&f.repo_id)
+        .bind(&now)
+        .bind(&now)
+        .bind(&now)
+        .bind(&gate_evaluation.evaluation.id)
+        .execute(f.harness.state.db.pool())
+        .await
+        .expect("synthetic merge operation creates");
+        sqlx::query(
+            "INSERT INTO remote_pr_admission (
+                task_merge_operation_id, publish_operation_id, metadata_id, task_id,
+                repo_id, provider_config_id, provider_type, provider_config_revision,
+                provider_config_digest, remote_repo_identity, source_branch, target_branch,
+                admitted_source_sha, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, 'github', ?, ?, ?, 'task/test', 'main', ?, ?, ?)",
+        )
+        .bind(merge_id)
+        .bind(publish_id)
+        .bind(metadata_id)
+        .bind(&f.task_id)
+        .bind(&f.repo_id)
+        .bind(format!("config-{merge_id}"))
+        .bind(&now)
+        .bind("a".repeat(64))
+        .bind("https://example.invalid/synthetic.git")
+        .bind("synthetic-source-sha")
+        .bind(&now)
+        .bind(&now)
+        .execute(f.harness.state.db.pool())
+        .await
+        .expect("synthetic route admission creates");
+    }
     let newest = "2026-01-02T00:00:00Z";
     let oldest = "2026-01-01T00:00:00Z";
     for (id, admission, item, digest, ingested_at) in [

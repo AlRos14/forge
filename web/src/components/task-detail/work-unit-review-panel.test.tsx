@@ -13,6 +13,11 @@ function task(): Task {
   return {
     id: 'task-1',
     project_id: 'project-1',
+    repo_id: null,
+    repositories: [],
+    repository_set_revision: 0,
+    repository_set_digest: null,
+    repository_merge_batches: [],
     task_roles: [
       {
         id: 'role-reviewer',
@@ -50,6 +55,8 @@ function reviewUnit(): WorkUnitResponse {
   return {
     id: 'unit-review',
     task_id: 'task-1',
+    repository_ids: [],
+    integrations: [],
     parent_work_unit_id: null,
     title: 'Review implementation',
     scope: 'Check the implementation against the exact result.',
@@ -84,24 +91,46 @@ function reviewUnit(): WorkUnitResponse {
       result_commit_sha: 'abc123',
       result_workspace_id: 'workspace-1',
       workspace_snapshot_digest: 'snapshot-1',
+      repository_results: [
+        {
+          repo_id: 'repo-api',
+          reviewed_work_unit_version: 2,
+          result_execution_id: 'execution-2',
+          result_artifact_id: 'artifact-2',
+          result_commit_sha: 'abc123',
+          result_workspace_id: 'workspace-api',
+          workspace_snapshot_digest: 'snapshot-api',
+        },
+        {
+          repo_id: 'repo-web',
+          reviewed_work_unit_version: 2,
+          result_execution_id: 'execution-2',
+          result_artifact_id: 'artifact-2',
+          result_commit_sha: 'def456',
+          result_workspace_id: 'workspace-web',
+          workspace_snapshot_digest: 'snapshot-web',
+        },
+      ],
     },
   } as WorkUnitResponse
 }
 
 describe('Human WorkUnit review report', () => {
+  it('multirepo_result_review_panel_lists_subject_repos', () => {
+    render(<WorkUnitHumanReviewPanel task={task()} unit={reviewUnit()} currentUserId="user-1" />)
+
+    const repositories = screen.getByLabelText('Reviewed repository results')
+    expect(repositories.textContent).toContain('repo-api · commit abc123')
+    expect(repositories.textContent).toContain('repo-web · commit def456')
+  })
+
   it('submits the report against the exact frozen WorkUnit version', async () => {
     mocks.submit.mockReset().mockResolvedValue({
       review_execution: { execution: { id: 'review-execution-1', task_id: 'task-1' } },
       report: { id: 'report-1' },
     })
 
-    render(
-      <WorkUnitHumanReviewPanel
-        task={task()}
-        unit={reviewUnit()}
-        currentUserId="user-1"
-      />,
-    )
+    render(<WorkUnitHumanReviewPanel task={task()} unit={reviewUnit()} currentUserId="user-1" />)
 
     expect(screen.getByText(/WorkUnit unit-implementation v2/)).toBeTruthy()
     fireEvent.change(screen.getByLabelText('Human review verdict'), {

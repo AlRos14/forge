@@ -18,6 +18,18 @@ pub struct CreateTaskRequest {
     #[ts(type = "number | null")]
     #[ts(optional = nullable)]
     pub priority: Option<i64>,
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub repositories: Option<Vec<crate::TaskRepositoryInput>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct UpdateTaskRepositoriesRequest {
+    #[ts(type = "number")]
+    pub expected_version: i64,
+    pub repositories: Vec<crate::TaskRepositoryInput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
@@ -175,6 +187,10 @@ pub struct UpdateProjectRequest {
     #[serde(default, deserialize_with = "deserialize_project_hooks")]
     #[ts(optional = nullable)]
     pub project_hooks: Option<Vec<ProjectHookRule>>,
+    #[serde(default, deserialize_with = "deserialize_optional_update_field")]
+    #[ts(type = "string | null")]
+    #[ts(optional)]
+    pub primary_repo_id: Option<Option<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

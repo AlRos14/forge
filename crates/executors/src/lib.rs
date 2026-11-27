@@ -4,6 +4,7 @@ pub mod adapter;
 pub mod command;
 pub mod config;
 pub mod effective_policy;
+pub mod git_identity;
 pub mod log_reader;
 pub mod log_schema;
 mod log_storage;
@@ -35,6 +36,41 @@ pub use process_group::ProcessGroupChild;
 pub use shell::{is_pid_alive, ShellExecutor};
 
 use async_trait::async_trait;
+use std::path::{Path, PathBuf};
+
+/// Return writable repository children for a Forge workspace group root.
+/// `None` identifies the legacy one-repository Workspace path. An empty list
+/// identifies a group with no writable repositories, such as a review group.
+pub fn workspace_group_writable_paths(worktree_path: &Path) -> Option<Vec<PathBuf>> {
+    if worktree_path
+        .parent()
+        .and_then(Path::file_name)
+        .is_none_or(|name| name != "groups")
+    {
+        return None;
+    }
+    let mut paths = Vec::new();
+    let Ok(entries) = std::fs::read_dir(worktree_path) else {
+        return Some(paths);
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return Some(Vec::new());
+        };
+        let path = entry.path();
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir())
+            || !path.join(".git").exists()
+            || std::fs::metadata(&path)
+                .map(|metadata| metadata.permissions().readonly())
+                .unwrap_or(true)
+        {
+            continue;
+        }
+        paths.push(path);
+    }
+    paths.sort();
+    Some(paths)
+}
 
 /// Context passed to an executor when running a task.
 #[derive(Debug, Clone)]

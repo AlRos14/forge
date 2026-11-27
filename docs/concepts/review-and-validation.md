@@ -21,7 +21,7 @@ HarnessSession, or fake System Actor. It records:
 
 * the command or check identity;
 * bounded environment and configuration summary;
-* workspace and commit identity;
+* exact Workspace repository, workspace and commit identity;
 * start and finish times;
 * status and exit code;
 * a log or output reference.
@@ -36,6 +36,12 @@ An Actor may perform validation-related cognitive work through ordinary
 WorkUnit work: for example, reproducing a failure, investigating its cause, or
 interpreting scanner output. That is distinct from the deterministic
 ValidationRun and may itself produce an Artifact or Evidence.
+
+For a multi-repository Task, review and validation continue to name the exact
+repository Workspace and commit. Only changed writable repositories become
+subjects of merge-readiness checks; each result stays bound to its `repo_id`
+instead of satisfying a check for another repository. A single-repository
+Task retains its existing scalar candidate and Gate behavior.
 
 ### Catalog checks
 
@@ -56,10 +62,11 @@ and must be re-authorized. A check without a pin is rejected with
 
 Requests are durable `validation_check_request` rows consumed by the
 `ValidationCheckRunner` inside the Forge process, not in a coordinator turn or
-an Agent daemon. The runner resolves the exact subject (an accepted WorkUnit
-result or the Task integration Workspace), defers while a worker lease is
-active, takes the Workspace execution lock, and runs the pinned command through
-the same core as legacy checks. The resulting `ValidationRun` records
+an Agent daemon. Each request names a `repo_id` and resolves that repository's
+exact subject (an accepted WorkUnit result or the Task integration Workspace),
+defers while a worker lease is active, takes the Workspace execution lock, and
+runs the pinned command through the same core as legacy checks. The resulting
+`ValidationRun` records its `repo_id` from the exact Workspace, along with
 `run_origin`, `catalog_check_id`, `definition_digest` and the request, with
 identity `catalog:{check_key}@{definition_digest[0..16]}`. If the Workspace
 changes after the request was queued, the request fails with

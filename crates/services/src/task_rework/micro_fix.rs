@@ -67,9 +67,8 @@ struct MicroFixReviewWorkUnitInput<'a> {
     receipt: &'a MicroFixReceipt,
     result_execution_id: &'a str,
     result_work_unit_version: i64,
-    result_commit_sha: &'a str,
-    result_workspace_id: &'a str,
-    snapshot_digest: &'a str,
+    repository_results: &'a [db::ExecutionRepositoryResult],
+    primary_repo_id: Option<&'a str>,
     coordination: &'a TaskCoordination,
     envelope: &'a CoordinationEnvelope,
 }
@@ -254,7 +253,13 @@ impl TaskReworkService {
         }
 
         let source = sqlx::query(
-            "SELECT subject.result_commit_sha,reviewer_role.id AS review_role_id,
+            "SELECT COALESCE(subject.result_commit_sha,(
+                        SELECT repository.result_commit_sha
+                        FROM work_unit_review_subject_repository repository
+                        WHERE repository.review_work_unit_id=subject.review_work_unit_id
+                        ORDER BY repository.repo_id LIMIT 1
+                    )) AS result_commit_sha,
+                    reviewer_role.id AS review_role_id,
                     review_unit.assigned_actor_kind,review_unit.assigned_actor_id
              FROM task_rework_receipt rework
              JOIN task_coordination_request request
@@ -495,20 +500,33 @@ impl TaskReworkService {
         else {
             return Ok(false);
         };
-        let result_commit_sha = execution.after_sha.as_deref().ok_or_else(|| {
+        let repository_results =
+            ExecutionRepo::list_repository_results(&*self.db, &execution.id).await?;
+        if repository_results.is_empty() {
+            return Err(ServiceError::invalid_operation(
+                "micro-fix correction Execution has no repository results",
+            ));
+        }
+        let primary_repo_id = crate::task_rework::work_unit_primary_repo_id(
+            &self.db,
+            work_unit_id,
+            &execution.task_id,
+        )
+        .await?
+        .ok_or_else(|| {
+            ServiceError::invalid_operation("micro-fix WorkUnit has no primary repository")
+        })?;
+        let primary_result = repository_results
+            .iter()
+            .find(|row| row.repo_id == primary_repo_id)
+            .ok_or_else(|| {
+                ServiceError::invalid_operation("micro-fix correction has no exact repo result")
+            })?;
+        let result_commit_sha = primary_result.after_sha.as_deref().ok_or_else(|| {
             ServiceError::invalid_operation(
-                "micro-fix correction Execution has no resulting commit",
+                "micro-fix correction repository result has no resulting commit",
             )
         })?;
-        let workspace_id = execution.workspace_id.as_deref().ok_or_else(|| {
-            ServiceError::invalid_operation(
-                "micro-fix correction Execution has no repository Workspace",
-            )
-        })?;
-        let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
-            .await?
-            .filter(|workspace| workspace.task_id == execution.task_id)
-            .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
         let advanced = if receipt.bounds_outcome == MicroFixBoundsOutcome::Pending {
             let coordination =
                 TaskCoordinationRepo::get_task_coordination(&*self.db, &execution.task_id)
@@ -555,12 +573,69 @@ impl TaskReworkService {
             }
             let declared_paths: Vec<String> = serde_json::from_str(&receipt.declared_paths_json)
                 .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
-            let diff = git_numstat(
-                &workspace.worktree_path,
-                &receipt.reviewed_commit_sha,
-                result_commit_sha,
-            )
-            .await?;
+            let required_repositories =
+                WorkUnitRepo::list_result_requirement_repositories(&*self.db, work_unit_id).await?;
+            if required_repositories.len() != repository_results.len()
+                || required_repositories.iter().any(|required| {
+                    !repository_results
+                        .iter()
+                        .any(|result| result.repo_id == required.repo_id)
+                })
+            {
+                return Err(ServiceError::invalid_operation(
+                    "micro-fix result repo set differs from its pinned result requirements",
+                ));
+            }
+            let mut diff = Vec::new();
+            for required in &required_repositories {
+                let result = repository_results
+                    .iter()
+                    .find(|result| result.repo_id == required.repo_id)
+                    .expect("repository result set was checked");
+                let base_sha = required.result_commit_sha.as_deref().ok_or_else(|| {
+                    ServiceError::invalid_operation(format!(
+                        "micro-fix has no exact pinned base for repository {}",
+                        required.repo_id
+                    ))
+                })?;
+                let result_sha = result.after_sha.as_deref().ok_or_else(|| {
+                    ServiceError::invalid_operation(format!(
+                        "micro-fix has no exact result commit for repository {}",
+                        required.repo_id
+                    ))
+                })?;
+                let workspace = WorkspaceRepo::get_by_id(&*self.db, &result.workspace_id)
+                    .await?
+                    .filter(|workspace| {
+                        workspace.task_id == execution.task_id
+                            && workspace.repo_id == required.repo_id
+                            && workspace.status == db::WorkspaceStatus::Ready
+                    })
+                    .ok_or_else(|| {
+                        ServiceError::not_found("workspace", result.workspace_id.clone())
+                    })?;
+                let current_head =
+                    git::get_current_sha(std::path::Path::new(&workspace.worktree_path)).await?;
+                if current_head != result_sha {
+                    return Err(ServiceError::invalid_operation(format!(
+                        "micro-fix repository {} Workspace no longer matches its exact result",
+                        required.repo_id
+                    )));
+                }
+                let snapshot_digest =
+                    crate::ValidationService::snapshot_digest(&workspace.worktree_path).await?;
+                if result
+                    .snapshot_digest
+                    .as_deref()
+                    .is_some_and(|expected| expected != snapshot_digest)
+                {
+                    return Err(ServiceError::invalid_operation(format!(
+                        "micro-fix repository {} Workspace no longer matches its exact snapshot",
+                        required.repo_id
+                    )));
+                }
+                diff.extend(git_numstat(&workspace.worktree_path, base_sha, result_sha).await?);
+            }
             let changed_files = i64::try_from(diff.len()).unwrap_or(i64::MAX);
             let changed_lines = diff.iter().fold(0_i64, |total, entry| {
                 total
@@ -647,8 +722,13 @@ impl TaskReworkService {
                 .filter(|unit| unit.task_id == execution.task_id)
                 .ok_or_else(|| ServiceError::not_found("work_unit", work_unit_id.to_owned()))?;
             if work_unit.status == WorkUnitStatus::Completed {
-                self.ensure_micro_fix_formal_review(&advanced, &execution, &workspace)
-                    .await?;
+                self.ensure_micro_fix_formal_review(
+                    &advanced,
+                    &execution,
+                    &repository_results,
+                    Some(primary_repo_id.as_str()),
+                )
+                .await?;
             }
         }
         Ok(true)
@@ -676,7 +756,10 @@ impl TaskReworkService {
         let execution_id: Option<String> = sqlx::query_scalar(
             "SELECT id FROM execution
              WHERE task_id=? AND work_unit_id=? AND status='completed'
-               AND after_sha IS NOT NULL
+               AND EXISTS(
+                   SELECT 1 FROM execution_repository_result result
+                   WHERE result.execution_id=execution.id
+               )
              ORDER BY work_unit_version DESC, created_at DESC, id DESC LIMIT 1",
         )
         .bind(&work_unit.task_id)
@@ -693,12 +776,15 @@ impl TaskReworkService {
         &self,
         receipt: &MicroFixReceipt,
         execution: &db::Execution,
-        workspace: &db::Workspace,
+        repository_results: &[db::ExecutionRepositoryResult],
+        primary_repo_id: Option<&str>,
     ) -> Result<()> {
         if execution.work_unit_id.as_deref() != Some(receipt.fix_work_unit_id.as_str())
             || execution.task_id != receipt.task_id
-            || execution.after_sha.as_deref() != receipt.result_commit_sha.as_deref()
-            || execution.workspace_id.as_deref() != Some(workspace.id.as_str())
+            || repository_results.is_empty()
+            || !repository_results
+                .iter()
+                .any(|result| result.after_sha.as_deref() == receipt.result_commit_sha.as_deref())
         {
             return Err(ServiceError::invalid_operation(
                 "micro-fix formal review must use its exact bounded result Execution",
@@ -754,14 +840,33 @@ impl TaskReworkService {
                 message: "the micro-fix authorization changed before its formal review".to_owned(),
             });
         }
-        let current_head = git::get_current_sha(Path::new(&workspace.worktree_path)).await?;
-        if current_head != receipt.result_commit_sha.as_deref().unwrap_or_default() {
-            return Err(ServiceError::invalid_operation(
-                "micro-fix review Workspace no longer matches its bounded result commit",
-            ));
+        for result in repository_results {
+            let workspace = WorkspaceRepo::get_by_id(&*self.db, &result.workspace_id)
+                .await?
+                .filter(|workspace| {
+                    workspace.task_id == receipt.task_id
+                        && workspace.repo_id == result.repo_id
+                        && workspace.status == db::WorkspaceStatus::Ready
+                })
+                .ok_or_else(|| ServiceError::not_found("workspace", result.workspace_id.clone()))?;
+            let current_head = git::get_current_sha(Path::new(&workspace.worktree_path)).await?;
+            if result.after_sha.as_deref() != Some(current_head.as_str()) {
+                return Err(ServiceError::invalid_operation(format!(
+                    "micro-fix review repository {} no longer matches its bounded result commit",
+                    result.repo_id
+                )));
+            }
+            if let Some(expected_digest) = result.snapshot_digest.as_deref() {
+                let snapshot_digest =
+                    crate::ValidationService::snapshot_digest(&workspace.worktree_path).await?;
+                if snapshot_digest != expected_digest {
+                    return Err(ServiceError::invalid_operation(format!(
+                        "micro-fix review repository {} no longer matches its bounded result snapshot",
+                        result.repo_id
+                    )));
+                }
+            }
         }
-        let snapshot_digest =
-            crate::ValidationService::snapshot_digest(&workspace.worktree_path).await?;
 
         let existing_rework_review: Option<String> =
             if receipt.source_kind == MicroFixSourceKind::ReviewFindings {
@@ -777,31 +882,27 @@ impl TaskReworkService {
                 None
             };
         let review_work_unit_id = if let Some(review_work_unit_id) = existing_rework_review {
-            let subject_matches: bool = sqlx::query_scalar(
-                "SELECT EXISTS(
-                    SELECT 1 FROM work_unit_review_subject subject
-                    WHERE subject.review_work_unit_id=? AND subject.task_id=?
-                      AND subject.reviewed_work_unit_id=?
-                      AND subject.reviewed_work_unit_version=?
-                      AND subject.result_execution_id=?
-                      AND subject.result_commit_sha=?
-                      AND subject.result_workspace_id=?
-                      AND subject.workspace_snapshot_digest=?
-                )",
-            )
-            .bind(&review_work_unit_id)
-            .bind(&receipt.task_id)
-            .bind(&receipt.fix_work_unit_id)
-            .bind(execution.work_unit_version)
-            .bind(&execution.id)
-            .bind(receipt.result_commit_sha.as_deref())
-            .bind(&workspace.id)
-            .bind(&snapshot_digest)
-            .fetch_one(self.db.pool())
-            .await?;
-            if !subject_matches {
+            let subject = crate::task_rework::get_review_subject(&self.db, &review_work_unit_id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::not_found("review subject", review_work_unit_id.clone())
+                })?;
+            if subject.repositories.len() != repository_results.len()
+                || subject.repositories.iter().any(|subject_repository| {
+                    !repository_results.iter().any(|result| {
+                        subject_repository.repo_id == result.repo_id
+                            && subject_repository.result_execution_id.as_deref()
+                                == Some(execution.id.as_str())
+                            && subject_repository.result_workspace_id.as_deref()
+                                == Some(result.workspace_id.as_str())
+                            && subject_repository.result_commit_sha == result.after_sha
+                            && subject_repository.workspace_snapshot_digest
+                                == result.snapshot_digest
+                    })
+                })
+            {
                 return Err(ServiceError::invalid_operation(
-                    "the existing micro-fix review unit does not bind its exact bounded result",
+                    "the existing micro-fix review unit does not bind every exact bounded repository result",
                 ));
             }
             review_work_unit_id
@@ -812,12 +913,8 @@ impl TaskReworkService {
                 result_work_unit_version: execution
                     .work_unit_version
                     .expect("completed WorkUnit Execution is versioned"),
-                result_commit_sha: receipt
-                    .result_commit_sha
-                    .as_deref()
-                    .expect("bounds receipt has result commit"),
-                result_workspace_id: &workspace.id,
-                snapshot_digest: &snapshot_digest,
+                repository_results,
+                primary_repo_id,
                 coordination: &coordination,
                 envelope: &envelope,
             })
@@ -893,21 +990,18 @@ impl TaskReworkService {
                 });
             }
         }
-        let subject = sqlx::query_scalar::<_, String>(
-            "SELECT line.id FROM work_unit_review_line line
+        let subject_row = sqlx::query(
+            "SELECT line.id, line.current_commit_sha, line.current_workspace_id,
+                    line.current_snapshot_digest
+             FROM work_unit_review_line line
              WHERE line.task_id=? AND line.current_work_unit_id=?
                AND line.current_work_unit_version=? AND line.current_result_execution_id=?
-               AND line.current_commit_sha=? AND line.current_workspace_id=?
-               AND line.current_snapshot_digest=?
              ORDER BY line.created_at,line.id LIMIT 1",
         )
         .bind(&receipt.task_id)
         .bind(&receipt.fix_work_unit_id)
         .bind(execution.work_unit_version)
         .bind(&execution.id)
-        .bind(receipt.result_commit_sha.as_deref())
-        .bind(&workspace.id)
-        .bind(&snapshot_digest)
         .fetch_optional(self.db.pool())
         .await?
         .ok_or_else(|| {
@@ -915,6 +1009,20 @@ impl TaskReworkService {
                 "micro-fix formal review has no exact durable review line",
             )
         })?;
+        let line_commit_sha: Option<String> = subject_row.try_get("current_commit_sha")?;
+        let line_workspace_id: Option<String> = subject_row.try_get("current_workspace_id")?;
+        let line_snapshot_digest: Option<String> =
+            subject_row.try_get("current_snapshot_digest")?;
+        if !repository_results.iter().any(|result| {
+            result.after_sha == line_commit_sha
+                && result.workspace_id == line_workspace_id.as_deref().unwrap_or_default()
+                && result.snapshot_digest == line_snapshot_digest
+        }) {
+            return Err(ServiceError::invalid_operation(
+                "micro-fix formal review line does not identify one exact repository result",
+            ));
+        }
+        let subject: String = subject_row.try_get("id")?;
         self.ensure_micro_fix_review_gate(&receipt.task_id, &receipt.fix_work_unit_id, &subject)
             .await
     }
@@ -927,9 +1035,8 @@ impl TaskReworkService {
             receipt,
             result_execution_id,
             result_work_unit_version,
-            result_commit_sha,
-            result_workspace_id,
-            snapshot_digest,
+            repository_results,
+            primary_repo_id,
             coordination,
             envelope,
         } = input;
@@ -957,11 +1064,11 @@ impl TaskReworkService {
                 code: "micro_fix.authorization_stale",
                 message: "the micro-fix authorization has no Human authorizer".to_owned(),
             })?;
+        let primary_result = primary_repo_id
+            .and_then(|repo_id| repository_results.iter().find(|row| row.repo_id == repo_id));
         let scope = format!(
-            "Formally review the bounded micro-fix result for WorkUnit {}. Compare the exact result commit {} with reviewed commit {}. Review only these coordinator findings: {}. Declared paths: {}.",
+            "Formally review the bounded multi-repository micro-fix result for WorkUnit {}. Compare each exact repository result with its pinned base. Review only these coordinator findings: {}. Declared paths: {}.",
             receipt.fix_work_unit_id,
-            result_commit_sha,
-            receipt.reviewed_commit_sha,
             receipt.finding_refs_json,
             receipt.declared_paths_json,
         );
@@ -986,7 +1093,11 @@ impl TaskReworkService {
                 "micro_fix_receipt_id": receipt.id,
                 "reviewed_work_unit_id": receipt.fix_work_unit_id,
                 "reviewed_execution_id": result_execution_id,
-                "reviewed_commit_sha": result_commit_sha,
+                "reviewed_repositories": repository_results.iter().map(|result| serde_json::json!({
+                    "repo_id": result.repo_id,
+                    "commit_sha": result.after_sha,
+                    "workspace_id": result.workspace_id,
+                })).collect::<Vec<_>>(),
                 "reviewer_task_role_id": role_id,
                 "reviewer_actor_kind": actor.kind().to_string(),
                 "reviewer_actor_id": actor.id(),
@@ -995,9 +1106,26 @@ impl TaskReworkService {
             .to_string(),
             created_at: now_rfc3339(),
         };
-        let write = WorkUnitRepo::create_with_review_subject(
+        let repositories = repository_results
+            .iter()
+            .map(|result| db::WorkUnitReviewSubjectRepository {
+                review_work_unit_id: id.clone(),
+                task_id: receipt.task_id.clone(),
+                repo_id: result.repo_id.clone(),
+                reviewed_work_unit_id: receipt.fix_work_unit_id.clone(),
+                reviewed_work_unit_version: Some(result_work_unit_version),
+                result_execution_id: Some(result_execution_id.to_owned()),
+                result_artifact_id: None,
+                result_commit_sha: result.after_sha.clone(),
+                result_workspace_id: Some(result.workspace_id.clone()),
+                workspace_snapshot_digest: result.snapshot_digest.clone(),
+                created_at: now_rfc3339(),
+            })
+            .collect::<Vec<_>>();
+        let write = WorkUnitRepo::create_with_review_subject_repositories(
             &*self.db,
             db::CreateWorkUnit {
+                repository_ids: repositories.iter().map(|row| row.repo_id.clone()).collect(),
                 id: id.clone(),
                 task_id: receipt.task_id.clone(),
                 parent_work_unit_id: None,
@@ -1025,13 +1153,15 @@ impl TaskReworkService {
                 reviewed_work_unit_version: Some(result_work_unit_version),
                 result_execution_id: Some(result_execution_id.to_owned()),
                 result_artifact_id: None,
-                result_commit_sha: Some(result_commit_sha.to_owned()),
-                result_workspace_id: Some(result_workspace_id.to_owned()),
-                workspace_snapshot_digest: Some(snapshot_digest.to_owned()),
+                result_commit_sha: primary_result.and_then(|result| result.after_sha.clone()),
+                result_workspace_id: primary_result.map(|result| result.workspace_id.clone()),
+                workspace_snapshot_digest: primary_result
+                    .and_then(|result| result.snapshot_digest.clone()),
                 manifest_json: None,
                 manifest_digest: None,
                 created_at: now_rfc3339(),
             },
+            &repositories,
             event,
         )
         .await?;
@@ -1371,6 +1501,17 @@ fn classify_bounds_violation(
     None
 }
 
+#[cfg(test)]
+fn micro_fix_base_sha<'a>(
+    requirements: &'a [db::WorkUnitResultRequirementRepository],
+    repo_id: &str,
+) -> Option<&'a str> {
+    requirements
+        .iter()
+        .find(|requirement| requirement.repo_id == repo_id)
+        .and_then(|requirement| requirement.result_commit_sha.as_deref())
+}
+
 fn is_always_forbidden_control_path(path: &str) -> bool {
     matches!(path, "CLAUDE.md" | "AGENTS.md") || path.starts_with(".github/")
 }
@@ -1546,5 +1687,48 @@ mod tests {
                 "{path} must stay forbidden for every micro-fix"
             );
         }
+    }
+
+    #[test]
+    fn multirepo_result_micro_fix_uses_exact_repo_bases() {
+        let repo_a_sha = "a".repeat(40);
+        let repo_b_sha = "b".repeat(40);
+        let requirements = [
+            db::WorkUnitResultRequirementRepository {
+                work_unit_id: "fix".to_owned(),
+                task_id: "task".to_owned(),
+                repo_id: "repo-a".to_owned(),
+                source_work_unit_id: "source".to_owned(),
+                source_work_unit_version: 2,
+                result_execution_id: "execution".to_owned(),
+                result_artifact_id: None,
+                result_commit_sha: Some(repo_a_sha.clone()),
+                result_workspace_id: Some("workspace-a".to_owned()),
+                workspace_snapshot_digest: Some("a".repeat(64)),
+                created_at: "now".to_owned(),
+            },
+            db::WorkUnitResultRequirementRepository {
+                work_unit_id: "fix".to_owned(),
+                task_id: "task".to_owned(),
+                repo_id: "repo-b".to_owned(),
+                source_work_unit_id: "source".to_owned(),
+                source_work_unit_version: 2,
+                result_execution_id: "execution".to_owned(),
+                result_artifact_id: None,
+                result_commit_sha: Some(repo_b_sha.clone()),
+                result_workspace_id: Some("workspace-b".to_owned()),
+                workspace_snapshot_digest: Some("b".repeat(64)),
+                created_at: "now".to_owned(),
+            },
+        ];
+        assert_eq!(
+            micro_fix_base_sha(&requirements, "repo-a"),
+            Some(repo_a_sha.as_str())
+        );
+        assert_eq!(
+            micro_fix_base_sha(&requirements, "repo-b"),
+            Some(repo_b_sha.as_str())
+        );
+        assert_eq!(micro_fix_base_sha(&requirements, "repo-c"), None);
     }
 }

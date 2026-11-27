@@ -387,3 +387,178 @@ async fn human_reviews_an_exact_work_unit_without_creating_an_execution_manually
         correction.version
     );
 }
+
+#[tokio::test]
+async fn multirepo_result_review_response_lists_each_repo() {
+    let primary_dir = TestDir::new("multirepo-review-response-primary");
+    let primary_path = setup_git_repo(primary_dir.path());
+    let affected_dir = TestDir::new("multirepo-review-response-affected");
+    let affected_path = setup_git_repo(affected_dir.path());
+    let branch_rename = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&affected_path)
+        .args(["branch", "-M", "main"])
+        .output()
+        .expect("git branch rename runs");
+    assert!(
+        branch_rename.status.success(),
+        "affected repo branch becomes main"
+    );
+    let workspace = TestDir::new("multirepo-review-response-workspaces");
+    let harness = test_app(workspace.path(), "multirepo-review-response").await;
+    let (project_id, primary_repo_id) =
+        create_project_and_repo(&harness.app, "Multirepo review response", &primary_path).await;
+    let now = db::now_rfc3339();
+    let affected_repo = db::RepoRepo::create(
+        &*harness.state.db,
+        db::CreateRepo {
+            id: uuid::Uuid::new_v4().to_string(),
+            project_id: project_id.clone(),
+            name: "affected".to_owned(),
+            local_path: Some(affected_path.to_string_lossy().into_owned()),
+            remote_url: affected_path.to_string_lossy().into_owned(),
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch: "main".to_owned(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("affected repository creates");
+    let task: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({
+            "title":"Review two exact repository results",
+            "repositories":[
+                {"repo_id":primary_repo_id,"role":"primary"},
+                {"repo_id":affected_repo.id,"role":"affected"}
+            ]
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let (agent_id, _) =
+        create_shell_agents(&harness.app, workspace.path(), "multirepo-review-response").await;
+    for (role, actor, configuration) in [
+        (
+            "implementer",
+            json!({"kind":"agent","id":agent_id}),
+            json!({}),
+        ),
+        (
+            "reviewer",
+            json!({"kind":"human","id":"test-user-id"}),
+            json!({"capabilities":["formal_review"]}),
+        ),
+    ] {
+        let _: Value = json_request(
+            &harness.app,
+            Method::POST,
+            &format!("/api/v1/tasks/{}/task-roles", task.id),
+            json!({
+                "role":role,
+                "coordination_mode":"independent",
+                "policy":{},
+                "configuration":configuration
+            }),
+            StatusCode::OK,
+        )
+        .await;
+        let _: Value = json_request(
+            &harness.app,
+            Method::POST,
+            &format!("/api/v1/tasks/{}/task-roles/{role}/members", task.id),
+            json!({"actor_ref":actor}),
+            StatusCode::OK,
+        )
+        .await;
+    }
+    let command = format!(
+        "printf primary > {primary}/delivery.txt && git -C {primary} add delivery.txt && git -C {primary} commit -m primary && printf affected > {affected}/delivery.txt && git -C {affected} add delivery.txt && git -C {affected} commit -m affected",
+        primary = primary_repo_id,
+        affected = affected_repo.id,
+    );
+    let implementation = create_allocated_work_unit(
+        &harness.app,
+        &task.id,
+        "implementer",
+        &agent_id,
+        "Deliver both repositories",
+        &command,
+        true,
+    )
+    .await;
+    let initial_execution =
+        launch_work_unit_execution(&harness.app, &task.id, &implementation, Some(&command)).await;
+    let mut completed_execution = None;
+    for _ in 0..400 {
+        let current: ExecutionResponse = empty_request(
+            &harness.app,
+            Method::GET,
+            &format!("/api/v1/executions/{}", initial_execution.id),
+            StatusCode::OK,
+        )
+        .await;
+        if current.status == api_types::ExecutionStatus::Completed {
+            completed_execution = Some(current);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let completed_execution = completed_execution.expect("multi-repository Execution completes");
+    assert_eq!(completed_execution.repository_results.len(), 2);
+    let implementation: WorkUnitResponse = empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/work-units/{}", implementation.id),
+        StatusCode::OK,
+    )
+    .await;
+    let implementation: WorkUnitResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/work-units/{}/status", implementation.id),
+        json!({"expected_version":implementation.version,"status":"completed"}),
+        StatusCode::OK,
+    )
+    .await;
+    let review: WorkUnitResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/work-units", task.id),
+        json!({
+            "title":"Review both repository results",
+            "scope":"Review each exact repository head",
+            "role":"reviewer",
+            "assigned_actor":{"kind":"human","id":"test-user-id"},
+            "requires_integration":false,
+            "review_subject":{"reviewed_work_unit_id":implementation.id}
+        }),
+        StatusCode::CREATED,
+    )
+    .await;
+    let subject = review.review_subject.expect("review subject is returned");
+    assert_eq!(subject.repository_results.len(), 2);
+    for result in completed_execution.repository_results {
+        let subject_result = subject
+            .repository_results
+            .iter()
+            .find(|item| item.repo_id == result.repo_id)
+            .expect("each execution repository has a review subject row");
+        assert_eq!(
+            subject_result.result_execution_id.as_deref(),
+            Some(initial_execution.id.as_str())
+        );
+        assert_eq!(
+            subject_result.result_workspace_id.as_deref(),
+            Some(result.workspace_id.as_str())
+        );
+        assert_eq!(subject_result.result_commit_sha, result.after_sha);
+        assert_eq!(
+            subject_result.workspace_snapshot_digest,
+            result.snapshot_digest
+        );
+    }
+}

@@ -220,6 +220,7 @@ async fn seed_task(harness: &Harness) -> SeededTask {
     db::TaskRepo::create(
         &*harness.state.db,
         db::CreateTask {
+            repositories: Vec::new(),
             id: task_id.clone(),
             project_id,
             repo_id: Some(repo_id.clone()),

@@ -12,7 +12,15 @@ vi.mock('@/api/hooks', () => ({
 }))
 vi.mock('sonner', () => ({ toast: { success: vi.fn(), error: vi.fn() } }))
 
-const task = { id: 'task-1', project_id: 'project-1' } as unknown as Task
+const task = {
+  id: 'task-1',
+  project_id: 'project-1',
+  repo_id: null,
+  repositories: [],
+  repository_set_revision: 0,
+  repository_set_digest: null,
+  repository_merge_batches: [],
+} as unknown as Task
 
 function decision(overrides: Partial<HumanDecisionResponse> = {}): HumanDecisionResponse {
   return {
@@ -24,8 +32,20 @@ function decision(overrides: Partial<HumanDecisionResponse> = {}): HumanDecision
     authorization_version: 1,
     question: 'Ship with the known failure?',
     options: [
-      { id: 'a', label: 'Fix first', description: 'Rework', consequence: 'Delays', authority_effect: 'none' },
-      { id: 'b', label: 'Widen scope', description: 'More', consequence: 'Bigger', authority_effect: 'scope' },
+      {
+        id: 'a',
+        label: 'Fix first',
+        description: 'Rework',
+        consequence: 'Delays',
+        authority_effect: 'none',
+      },
+      {
+        id: 'b',
+        label: 'Widen scope',
+        description: 'More',
+        consequence: 'Bigger',
+        authority_effect: 'scope',
+      },
     ],
     recommended_option_id: 'a',
     recommendation_rationale: 'It is the safest path',
@@ -65,7 +85,10 @@ describe('TaskHumanDecisionCard', () => {
 
   it('shows a conflict message on 409 instead of a generic failure', async () => {
     answer.mutateAsync.mockRejectedValue(
-      new ApiError(JSON.stringify({ code: 'human_decision.version_conflict', message: 'stale' }), 409),
+      new ApiError(
+        JSON.stringify({ code: 'human_decision.version_conflict', message: 'stale' }),
+        409,
+      ),
     )
     render(<TaskHumanDecisionCard task={task} decision={decision()} canAuthority />)
     fireEvent.click(screen.getByRole('button', { name: 'Record answer' }))

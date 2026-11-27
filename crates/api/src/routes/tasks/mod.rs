@@ -20,8 +20,8 @@ use services::{DiffService, ServiceError};
 use crate::{
     errors::{ApiError, ApiResult},
     routes::{
-        auth::AuthenticatedUser, execution_response, parse_csv, task_page_request, task_response,
-        task_response_light, workspace_response, ListParams,
+        auth::AuthenticatedUser, parse_csv, task_page_request, task_response, task_response_light,
+        workspace_response, ListParams,
     },
     state::AppState,
 };
@@ -34,7 +34,10 @@ mod reviews;
 mod roles;
 mod workspace;
 
-pub use crud::{create_task, delete_task, get_task, list_tasks, reorder_subtasks, update_task};
+pub use crud::{
+    create_task, delete_task, get_task, list_tasks, reorder_subtasks, update_task,
+    update_task_repositories,
+};
 pub use dependencies::{add_dependency, list_dependencies, list_dependents, remove_dependency};
 pub use gates::{
     create_task_gate, evaluate_gate, get_gate, get_gate_evaluation, get_task_lifecycle,

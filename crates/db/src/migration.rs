@@ -84,6 +84,10 @@ use std::{
 // V179 preserves the exact PR rework lifecycle receipt when a superseded PR closes remotely.
 // V180 adds the phase-3 fallback and micro-fix receipts (the frozen V176 block,
 // renumbered because V177-V179 already exist).
+// V181 adds Task repository scopes and explicit WorkUnit repository scopes.
+// V182 adds the Task repository context snapshots and WorkUnit repository
+// result requirements. V183 adds versioned Task repository sets, repository
+// integration results, per-repository PR metadata, and exact merge batches.
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 #[derive(Debug, Clone, PartialEq, Eq)]

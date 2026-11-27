@@ -49,6 +49,7 @@ async fn v168_preserves_existing_request_history_and_reference_targets() {
     TaskRepo::create(
         &db,
         CreateTask {
+            repositories: Vec::new(),
             id: task_id.clone(),
             project_id,
             repo_id: None,

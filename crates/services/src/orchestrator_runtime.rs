@@ -14,8 +14,8 @@ use db::{
     OrchestratorWakeExecution, OrchestratorWakeRepo, OrchestratorWakeState, PageRequest,
     ProposalTarget, ProposalTargetKind, RoleMembership, RoleMembershipRepo, RoleMembershipStatus,
     SortBy, SortOrder, TaskCoordinationRepo, TaskCoordinationRequestState, TaskLifecycleRepo,
-    TaskRepo, TaskRole, TaskRoleRepo, WorkUnit, WorkUnitRepo, WorkUnitStatus,
-    WorkUnitWorkspaceRepo, WorkspaceRepo,
+    TaskRepo, TaskRepositorySetRepo, TaskRole, TaskRoleRepo, WorkUnit, WorkUnitRepo,
+    WorkUnitStatus, WorkUnitWorkspaceRepo, WorkspaceRepo,
 };
 use events::{EventBus, ForgeEvent};
 use serde_json::{json, Value};
@@ -1957,11 +1957,21 @@ impl OrchestratorRuntime {
             return Ok(DispatchOutcome::Retried);
         }
         if agent.backend_kind == "native" || agent.executor_type != "codex" {
-            self.fail_wake(
-                &wake,
-                "automatic PR6 dispatch requires a Codex CLI Agent with native read-only sandbox capability",
-            )
-            .await?;
+            let reason = "automatic PR6 dispatch requires a Codex CLI Agent with native read-only sandbox capability";
+            if let Some(request) = coordination_request.as_ref() {
+                let coordination = crate::task_coordination::TaskCoordinationService::new(
+                    Arc::clone(&self.db),
+                    Arc::clone(&self.event_bus),
+                );
+                coordination
+                    .mark_request_failed(
+                        request,
+                        "coordination.coordinator_harness_unsupported",
+                        reason,
+                    )
+                    .await?;
+            }
+            self.fail_wake(&wake, reason).await?;
             return Ok(DispatchOutcome::Retried);
         }
         if let Some(request) = coordination_request.as_ref() {
@@ -2556,11 +2566,26 @@ impl OrchestratorRuntime {
             }));
         }
         let page = recent_page(MAX_CONTEXT_ROWS);
-        let task_integration_workspace =
-            WorkspaceRepo::get_integration_by_task_id(&*self.db, &task.id).await?;
-        let work_unit_workspace = match wake.work_unit_id.as_deref() {
-            Some(id) => WorkUnitWorkspaceRepo::get_by_work_unit_id(&*self.db, id).await?,
-            None => None,
+        let task_integration_workspace = if let Some(repository_set) =
+            TaskRepositorySetRepo::get_current(&*self.db, &task.id).await?
+        {
+            if let Some(primary_repo_id) = repository_set
+                .repositories
+                .iter()
+                .find(|repository| repository.role == db::TaskRepositoryRole::Primary)
+                .map(|repository| repository.repo_id.as_str())
+            {
+                WorkspaceRepo::get_integration_by_task_repo(&*self.db, &task.id, primary_repo_id)
+                    .await?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let work_unit_workspaces = match wake.work_unit_id.as_deref() {
+            Some(id) => WorkUnitWorkspaceRepo::list_by_work_unit_id(&*self.db, id).await?,
+            None => Vec::new(),
         };
         let mut executions = ExecutionRepo::list_by_task(&*self.db, &task.id, page.clone())
             .await?
@@ -2669,13 +2694,23 @@ impl OrchestratorRuntime {
                     "before_sha": workspace.before_sha,
                     "worktree_path": workspace.worktree_path,
                 })),
-                "work_unit": work_unit_workspace.map(|workspace| json!({
+                "work_unit": work_unit_workspaces.iter().find(|workspace| {
+                    task.repo_id.as_deref() == Some(workspace.repo_id.as_str())
+                }).or_else(|| (work_unit_workspaces.len() == 1).then(|| &work_unit_workspaces[0])).map(|workspace| json!({
                     "workspace_id": workspace.id,
                     "status": format!("{:?}", workspace.status),
                     "branch": workspace.branch,
                     "before_sha": workspace.before_sha,
                     "worktree_path": workspace.worktree_path,
                 })),
+                "work_unit_repositories": work_unit_workspaces.iter().map(|workspace| json!({
+                    "repo_id": workspace.repo_id,
+                    "workspace_id": workspace.id,
+                    "status": format!("{:?}", workspace.status),
+                    "branch": workspace.branch,
+                    "before_sha": workspace.before_sha,
+                    "worktree_path": workspace.worktree_path,
+                })).collect::<Vec<_>>(),
             },
             "executions": executions.iter().map(|execution| json!({
                 "id": execution.id,
@@ -4454,8 +4489,9 @@ fn render_orchestrator_prompt(wake: &OrchestratorWake, context: &Value) -> Strin
 mod tests {
     use super::*;
     use db::{
-        CreateProject, CreateRoleMembership, CreateTask, CreateTaskRole, ProjectRepo,
-        RoleMembershipRepo, TaskRepo, TaskRoleRepo, User, UserRepo,
+        AgentProfileRepo, CreateAgentProfile, CreateProject, CreateRoleMembership, CreateTask,
+        CreateTaskRole, ProjectRepo, RoleMembershipRepo, SelectAgentProfile, TaskRepo,
+        TaskRoleRepo, User, UserRepo,
     };
     use sqlx::Row;
 
@@ -4486,6 +4522,52 @@ mod tests {
         .await
         .expect("Human Actor creates");
         id
+    }
+
+    async fn select_test_agent_executor(
+        database: &db::SqliteDb,
+        agent_id: &str,
+        executor_type: &str,
+    ) {
+        let agent = AgentRepo::get_by_id(database, agent_id)
+            .await
+            .expect("Agent loads")
+            .expect("Agent exists");
+        let current_profile = AgentProfileRepo::get_profile(database, &agent.profile_id)
+            .await
+            .expect("selected profile loads")
+            .expect("selected profile exists");
+        let profile_id = new_uuid_v4();
+        let now = now_rfc3339();
+        AgentProfileRepo::create_and_select_profile(
+            database,
+            CreateAgentProfile {
+                id: profile_id.clone(),
+                identity_id: agent_id.to_owned(),
+                backend_kind: current_profile.backend_kind,
+                executor_type: executor_type.to_owned(),
+                provider: current_profile.provider,
+                model: current_profile.model,
+                reasoning_effort: current_profile.reasoning_effort,
+                permission_policy: current_profile.permission_policy,
+                prompt_template: current_profile.prompt_template,
+                capabilities_json: current_profile.capabilities_json,
+                tool_policy_json: current_profile.tool_policy_json,
+                config_json: current_profile.config_json,
+                credential_ref: current_profile.credential_ref,
+                daemon_id: current_profile.daemon_id,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+            SelectAgentProfile {
+                identity_id: agent_id.to_owned(),
+                profile_id,
+                expected_version: agent.version,
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("new immutable profile is selected");
     }
 
     async fn test_admin_user(database: &Arc<db::SqliteDb>, name: &str) -> String {
@@ -4567,6 +4649,7 @@ mod tests {
             TaskRepo::create(
                 &**database,
                 CreateTask {
+                    repositories: Vec::new(),
                     id: id.clone(),
                     project_id: project_id.to_owned(),
                     repo_id: None,
@@ -5372,6 +5455,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multirepo_lifecycle_plan_unsupported_coordination_wake_fails_request_before_attempt() {
+        let fixture = provider_start_fixture_with_options(None, false, None, false).await;
+        sqlx::query("UPDATE orchestrator_wake SET state = 'failed' WHERE id = ?")
+            .bind(&fixture.wake_id)
+            .execute(fixture.database.pool())
+            .await
+            .expect("unrelated setup wake is closed");
+
+        let coordination_service = crate::task_coordination::TaskCoordinationService::new(
+            Arc::clone(&fixture.database),
+            Arc::new(EventBus::new(16)),
+        );
+        let task = TaskRepo::get_by_id(&*fixture.database, &fixture.task_id, false)
+            .await
+            .expect("Task loads")
+            .expect("Task exists");
+        let coordination =
+            TaskCoordinationRepo::get_task_coordination(&*fixture.database, &fixture.task_id)
+                .await
+                .expect("Task coordination loads")
+                .expect("Task coordination exists");
+        let authorized = coordination_service
+            .authorize(
+                &fixture.task_id,
+                &fixture.agent_owner_id,
+                crate::task_coordination::AuthorizationInput {
+                    expected_task_version: task.version,
+                    expected_coordination_version: coordination.authorization_version,
+                    mode: db::TaskCoordinationMode::Proposal,
+                    coordinator_task_role_id: Some(fixture.role_id.clone()),
+                    coordinator_actor: Some(ActorRef::Agent(fixture.agent_id.clone())),
+                    envelope: None,
+                    idempotency_key: "multirepo-plan-wake-authorize".to_owned(),
+                },
+            )
+            .await
+            .expect("Codex CLI coordinator is authorized");
+        let (request, _) = coordination_service
+            .request_turn(
+                &fixture.task_id,
+                &fixture.agent_owner_id,
+                crate::task_coordination::TurnRequestInput {
+                    expected_task_version: authorized.task.version,
+                    expected_coordination_version: authorized.coordination.authorization_version,
+                    brief: crate::task_coordination::CoordinationBrief {
+                        objective: "Exercise a pre-attempt coordinator dispatch failure".to_owned(),
+                        ..crate::task_coordination::CoordinationBrief::default()
+                    },
+                    idempotency_key: "multirepo-plan-wake-request".to_owned(),
+                },
+            )
+            .await
+            .expect("coordination request is durable");
+        let source_event_id: String = sqlx::query_scalar(
+            "SELECT id FROM domain_event
+             WHERE event_type = 'task.coordination_requested' AND entity_id = ?",
+        )
+        .bind(&request.id)
+        .fetch_one(fixture.database.pool())
+        .await
+        .expect("coordination request appends its source event");
+        let source_event = DomainEventRepo::get_event(&*fixture.database, &source_event_id)
+            .await
+            .expect("source event loads")
+            .expect("source event exists");
+        let signal = fixture
+            .runtime
+            .classify_event(&source_event)
+            .await
+            .expect("coordination request classifies")
+            .expect("coordination request wakes its coordinator");
+        assert_eq!(
+            fixture
+                .runtime
+                .admit_signal(&source_event, signal)
+                .await
+                .expect("coordination wake admits"),
+            1
+        );
+        let wake_id: String = sqlx::query_scalar(
+            "SELECT id FROM orchestrator_wake WHERE event_id = ? AND task_id = ?",
+        )
+        .bind(&source_event.id)
+        .bind(&fixture.task_id)
+        .fetch_one(fixture.database.pool())
+        .await
+        .expect("coordination request has exactly one wake");
+        select_test_agent_executor(&fixture.database, &fixture.agent_id, "claude_code").await;
+        let now = now_rfc3339();
+        db::DaemonRepo::update_report(
+            &*fixture.database,
+            db::UpdateDaemonReport {
+                id: fixture.daemon_id.clone(),
+                detected_clis_json: r#"[{"kind":"codex","availability":"authenticated"},{"kind":"claude_code","availability":"authenticated"}]"#.to_owned(),
+                labels_json: None,
+                status: db::DaemonStatus::Online,
+                last_report_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("Claude Code capability is advertised for this dispatch test");
+
+        assert!(matches!(
+            fixture
+                .runtime
+                .dispatch_one()
+                .await
+                .expect("wake dispatch resolves"),
+            DispatchOutcome::Retried
+        ));
+
+        let failed_request =
+            TaskCoordinationRepo::get_task_coordination_request(&*fixture.database, &request.id)
+                .await
+                .expect("failed request loads")
+                .expect("request remains durable");
+        assert_eq!(failed_request.state, TaskCoordinationRequestState::Failed);
+        assert_eq!(
+            failed_request.failure_code.as_deref(),
+            Some("coordination.coordinator_harness_unsupported")
+        );
+        assert!(failed_request
+            .failure_message
+            .as_deref()
+            .is_some_and(|message| message.contains("Codex CLI Agent")));
+        let wake = OrchestratorWakeRepo::get_orchestrator_wake(&*fixture.database, &wake_id)
+            .await
+            .expect("wake loads")
+            .expect("wake remains durable");
+        assert_eq!(wake.state, OrchestratorWakeState::Failed);
+        assert_eq!(
+            wake.last_error.as_deref(),
+            failed_request.failure_message.as_deref()
+        );
+        let failure_event: String = sqlx::query_scalar(
+            "SELECT payload_json FROM domain_event
+             WHERE event_type = 'task.coordination_request_state_changed'
+               AND entity_id = ? ORDER BY sequence DESC LIMIT 1",
+        )
+        .bind(&request.id)
+        .fetch_one(fixture.database.pool())
+        .await
+        .expect("request failure event is emitted");
+        let payload: serde_json::Value =
+            serde_json::from_str(&failure_event).expect("failure event payload is JSON");
+        assert_eq!(
+            payload["failure_code"],
+            "coordination.coordinator_harness_unsupported"
+        );
+        let attempts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM orchestrator_wake_execution WHERE wake_id = ?",
+        )
+        .bind(&wake_id)
+        .fetch_one(fixture.database.pool())
+        .await
+        .expect("wake attempt count loads");
+        assert_eq!(attempts, 0, "dispatch failed before creating an attempt");
+    }
+
+    #[tokio::test]
     async fn pr13_orchestrator_claim_rejects_suspended_membership_after_preflight() {
         assert_orchestrator_provider_claim_rejects_race(
             OrchestratorClaimMutation::SuspendMembership,
@@ -6045,6 +6289,7 @@ mod tests {
         TaskRepo::create(
             &*database,
             CreateTask {
+                repositories: Vec::new(),
                 id: task_id.clone(),
                 project_id,
                 repo_id: None,
@@ -7723,6 +7968,7 @@ mod tests {
         TaskRepo::create(
             &*database,
             CreateTask {
+                repositories: Vec::new(),
                 id: task_id.clone(),
                 project_id,
                 repo_id: None,

@@ -98,6 +98,7 @@ async fn running_non_repository_execution_for_cancel(
     let work_unit = db::WorkUnitRepo::create(
         db,
         db::CreateWorkUnit {
+            repository_ids: Vec::new(),
             id: work_unit_id.clone(),
             task_id: task.id.clone(),
             parent_work_unit_id: None,
@@ -518,6 +519,7 @@ async fn work_unit_leases_bind_exact_execution_workspace_actor_and_revoke_indepe
         let work_unit = db::WorkUnitRepo::create(
             database,
             db::CreateWorkUnit {
+                repository_ids: Vec::new(),
                 id: work_unit_id.clone(),
                 task_id: task.id.clone(),
                 parent_work_unit_id: None,
@@ -547,6 +549,19 @@ async fn work_unit_leases_bind_exact_execution_workspace_actor_and_revoke_indepe
         .expect("WorkUnit creates")
         .record;
         let workspace_id = new_uuid_v4();
+        let workspace_group_id = new_uuid_v4();
+        db::WorkspaceRepo::create_group_for_work_unit(
+            database,
+            db::CreateWorkspaceGroup {
+                id: workspace_group_id.clone(),
+                task_id: task.id.clone(),
+                work_unit_id: work_unit_id.clone(),
+                root_path: format!("/tmp/pr5/{workspace_group_id}"),
+                created_at: now.to_owned(),
+            },
+        )
+        .await
+        .expect("WorkUnit WorkspaceGroup creates");
         let workspace = db::WorkUnitWorkspaceRepo::create_for_work_unit(
             database,
             db::CreateWorkUnitWorkspace {
@@ -562,6 +577,7 @@ async fn work_unit_leases_bind_exact_execution_workspace_actor_and_revoke_indepe
                     updated_at: now.to_owned(),
                 },
                 work_unit_id: work_unit_id.clone(),
+                workspace_group_id,
             },
         )
         .await
@@ -610,7 +626,7 @@ async fn work_unit_leases_bind_exact_execution_workspace_actor_and_revoke_indepe
                 execution,
                 work_unit_id: work_unit.id.clone(),
                 work_unit_version: work_unit.version,
-                workspace_lease: Some(lease),
+                workspace_leases: vec![lease],
             },
             make_work_unit_test_event(
                 &task.id,
@@ -662,17 +678,23 @@ async fn work_unit_leases_bind_exact_execution_workspace_actor_and_revoke_indepe
             .expect("Task Execution count reloads");
     assert_eq!(execution_count_after, execution_count_before);
 
-    let lease_a = db::WorkspaceLeaseRepo::get_active_for_work_unit(&*db, &unit_a.id)
+    let lease_a = db::WorkspaceLeaseRepo::list_active_for_work_unit(&*db, &unit_a.id)
         .await
         .expect("A lease loads")
+        .into_iter()
+        .find(|lease| lease.execution_id == execution_a)
         .expect("A lease is active");
-    let lease_b = db::WorkspaceLeaseRepo::get_active_for_work_unit(&*db, &unit_b.id)
+    let lease_b = db::WorkspaceLeaseRepo::list_active_for_work_unit(&*db, &unit_b.id)
         .await
         .expect("B lease loads")
+        .into_iter()
+        .find(|lease| lease.execution_id == execution_b)
         .expect("B lease is active");
-    let lease_c = db::WorkspaceLeaseRepo::get_active_for_work_unit(&*db, &unit_c.id)
+    let lease_c = db::WorkspaceLeaseRepo::list_active_for_work_unit(&*db, &unit_c.id)
         .await
         .expect("C lease loads")
+        .into_iter()
+        .find(|lease| lease.execution_id == execution_c)
         .expect("C lease is active");
     assert_ne!(lease_a.id, lease_b.id);
     assert_ne!(lease_a.id, lease_c.id);
@@ -767,7 +789,7 @@ async fn work_unit_leases_bind_exact_execution_workspace_actor_and_revoke_indepe
             execution: competing_execution,
             work_unit_id: unit_a.id.clone(),
             work_unit_version: unit_a.version,
-            workspace_lease: Some(competing_lease),
+            workspace_leases: vec![competing_lease],
         },
         make_work_unit_test_event(
             &task.id,
@@ -811,23 +833,27 @@ async fn work_unit_leases_bind_exact_execution_workspace_actor_and_revoke_indepe
         .revoke_active_workspace_lease_for_execution(&task.id, &execution_a)
         .await;
     assert!(
-        db::WorkspaceLeaseRepo::get_active_for_work_unit(&*db, &unit_a.id)
+        db::WorkspaceLeaseRepo::list_active_for_work_unit(&*db, &unit_a.id)
             .await
             .expect("A lease reloads")
-            .is_none()
+            .is_empty()
     );
     assert_eq!(
-        db::WorkspaceLeaseRepo::get_active_for_work_unit(&*db, &unit_b.id)
+        db::WorkspaceLeaseRepo::list_active_for_work_unit(&*db, &unit_b.id)
             .await
             .expect("B lease reloads")
+            .into_iter()
+            .next()
             .expect("B lease remains active")
             .execution_id,
         execution_b
     );
     assert_eq!(
-        db::WorkspaceLeaseRepo::get_active_for_work_unit(&*db, &unit_c.id)
+        db::WorkspaceLeaseRepo::list_active_for_work_unit(&*db, &unit_c.id)
             .await
             .expect("C lease reloads")
+            .into_iter()
+            .next()
             .expect("C lease remains active")
             .execution_id,
         execution_c

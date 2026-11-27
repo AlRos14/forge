@@ -2,6 +2,7 @@ import {
   useProjectValidationChecksQuery,
   useTaskValidationCheckRequestsQuery,
   useTaskValidationComparisonsQuery,
+  useValidationsQuery,
 } from '@/api/hooks'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -12,6 +13,7 @@ import { checkRequestStateLabels, comparisonBadge } from './task-verification'
 export function TaskValidationPanel({ task }: { task: Task }) {
   const requests = useTaskValidationCheckRequestsQuery(task.id)
   const comparisons = useTaskValidationComparisonsQuery(task.id)
+  const validationRuns = useValidationsQuery(task.id)
   const catalog = useProjectValidationChecksQuery(task.project_id)
   const definitionById = new Map((catalog.data?.items ?? []).map((item) => [item.id, item]))
   const items = requests.data?.items ?? []
@@ -43,6 +45,7 @@ export function TaskValidationPanel({ task }: { task: Task }) {
         {items.map((item) => {
           const comparison = comparisonByRequest.get(item.id)
           const definition = definitionById.get(item.check_definition_id)
+          const run = validationRuns.data?.find((candidate) => candidate.id === item.candidate_run_id)
           const badge = comparison ? comparisonBadge(comparison.classification) : null
           return (
             <li key={item.id} className="min-w-0 space-y-2 rounded-md border p-3 text-sm">
@@ -73,6 +76,7 @@ export function TaskValidationPanel({ task }: { task: Task }) {
               {item.reason ? <p className="break-words text-xs text-muted-foreground">{item.reason}</p> : null}
               <details className="text-xs text-muted-foreground">
                 <summary className="w-fit cursor-pointer">Exact references</summary>
+                {run ? <p className="mt-1 break-all">Repository {run.repo_id}</p> : null}
                 <p className="mt-1 break-all">Check definition {item.check_definition_id} (digest {item.definition_digest})</p>
                 <p className="break-all">Commit {item.commit_sha}</p>
                 {item.candidate_run_id ? (

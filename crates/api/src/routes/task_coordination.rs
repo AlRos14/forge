@@ -326,6 +326,7 @@ fn plan_response(view: PlanView) -> ApiResult<TaskCoordinationPlanResponse> {
             review_subject_key: unit.review_subject_key,
             acceptance: unit.acceptance,
             artifact_inputs: unit.artifact_inputs,
+            repository_ids: unit.repository_ids,
         })
         .collect();
     Ok(TaskCoordinationPlanResponse {
@@ -341,6 +342,7 @@ fn plan_response(view: PlanView) -> ApiResult<TaskCoordinationPlanResponse> {
         envelope_digest: view.parsed.envelope_digest,
         objective_digest: view.parsed.objective_digest,
         work_units,
+        repository_set: view.parsed.repository_set,
         proposal_id: view.plan.proposal_id,
         decision_id: view.plan.decision_id,
         materialization: view

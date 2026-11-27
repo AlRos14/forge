@@ -6,13 +6,16 @@ use api_types::{
     TaskRoleResponse, WorkspaceResponse,
 };
 use db::{
-    ActorKind, Agent, CoordinationMode as DbCoordinationMode, Daemon, Execution, Page, PageRequest,
-    Project, Repo, RoleMembership, RoleMembershipRepo, SortBy, SortOrder, Task, TaskLifecycleRepo,
-    TaskLifecycleState as DbTaskLifecycleState, TaskRoleRepo, Workspace, WorkspaceRepo,
+    ActorKind, Agent, CoordinationMode as DbCoordinationMode, Daemon, Execution, ExecutionRepo,
+    Page, PageRequest, PrMetadataRepo, Project, Repo, RoleMembership, RoleMembershipRepo, SortBy,
+    SortOrder, Task, TaskLifecycleRepo, TaskLifecycleState as DbTaskLifecycleState,
+    TaskRepositoryMergeBatchRepo, TaskRepositorySetRepo, TaskRoleRepo, WorkUnitRepo,
+    WorkUnitRepositoryIntegrationRepo, Workspace, WorkspaceRepo,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::Row;
+use std::collections::BTreeMap;
 
 use crate::errors::{ApiError, ApiResult};
 
@@ -170,6 +173,182 @@ pub async fn task_response_light(db: &db::SqliteDb, task: Task) -> ApiResult<Tas
 
 async fn task_response_inner(db: &db::SqliteDb, task: Task) -> ApiResult<TaskResponse> {
     let task_roles = task_roles_response(db, &task.id, false).await?;
+    let repository_set = TaskRepositorySetRepo::get_current(db, &task.id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Task repository-set revision", task.id.clone()))?;
+    let batches = TaskRepositoryMergeBatchRepo::list_by_task(db, &task.id).await?;
+    let mut batch_repositories = BTreeMap::new();
+    let mut repository_merge_batches = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let rows = TaskRepositoryMergeBatchRepo::list_repositories(db, &batch.id).await?;
+        let repositories = rows
+            .into_iter()
+            .map(|row| {
+                let response = api_types::TaskRepositoryMergeResponse {
+                    batch_id: row.batch_id.clone(),
+                    repo_id: row.repo_id.clone(),
+                    state: merge_state_response(row.state),
+                    integration_id: row.work_unit_repository_integration_id.clone(),
+                    task_merge_operation_id: row.task_merge_operation_id.clone(),
+                    pr_metadata_id: row.pr_metadata_id.clone(),
+                    before_sha: row.before_sha.clone(),
+                    after_sha: row.after_sha.clone(),
+                };
+                batch_repositories
+                    .entry(row.repo_id.clone())
+                    .or_insert_with(Vec::new)
+                    .push(response.clone());
+                response
+            })
+            .collect();
+        repository_merge_batches.push(api_types::TaskRepositoryMergeBatchResponse {
+            id: batch.id,
+            task_id: batch.task_id,
+            gate_evaluation_id: batch.gate_evaluation_id,
+            repository_set_revision: batch.repository_set_revision,
+            state: match batch.state {
+                db::TaskRepositoryMergeBatchState::Integrating => {
+                    api_types::TaskRepositoryMergeBatchState::Integrating
+                }
+                db::TaskRepositoryMergeBatchState::Publishing => {
+                    api_types::TaskRepositoryMergeBatchState::Publishing
+                }
+                db::TaskRepositoryMergeBatchState::Open => {
+                    api_types::TaskRepositoryMergeBatchState::Open
+                }
+                db::TaskRepositoryMergeBatchState::Completed => {
+                    api_types::TaskRepositoryMergeBatchState::Completed
+                }
+                db::TaskRepositoryMergeBatchState::Blocked => {
+                    api_types::TaskRepositoryMergeBatchState::Blocked
+                }
+                db::TaskRepositoryMergeBatchState::Failed => {
+                    api_types::TaskRepositoryMergeBatchState::Failed
+                }
+            },
+            version: batch.version,
+            repositories,
+            created_at: batch.created_at,
+            updated_at: batch.updated_at,
+        });
+    }
+    let prs = PrMetadataRepo::list_by_task(db, &task.id).await?;
+    let mut pull_requests_by_id = BTreeMap::new();
+    for pr in prs {
+        if let Some(repo_id) = pr.repo_id.clone() {
+            pull_requests_by_id.insert(
+                pr.id.clone(),
+                api_types::TaskRepositoryPullRequestResponse {
+                    repo_id,
+                    admission_id: pr.task_merge_operation_id.clone(),
+                    pr_metadata_id: pr.id,
+                    provider_type: pr.provider_type,
+                    provider_pr_id: pr.provider_pr_id,
+                    pr_url: pr.pr_url,
+                    pr_state: pr.pr_state,
+                    merge_status: pr.merge_status,
+                    admission_status: pr.admission_status,
+                },
+            );
+        }
+    }
+    let work_units = WorkUnitRepo::list_by_task(db, &task.id).await?;
+    let mut integrations =
+        BTreeMap::<String, (String, api_types::TaskRepositoryIntegrationResponse)>::new();
+    for unit in work_units {
+        for integration in
+            WorkUnitRepositoryIntegrationRepo::list_by_work_unit(db, &unit.id).await?
+        {
+            if integration.repository_set_revision == repository_set.revision {
+                let replace = integrations
+                    .get(&integration.repo_id)
+                    .is_none_or(|(updated_at, _)| updated_at <= &integration.updated_at);
+                if replace {
+                    let outcome = match integration.outcome {
+                        db::WorkUnitRepositoryIntegrationOutcome::Running => "pending",
+                        db::WorkUnitRepositoryIntegrationOutcome::Success => "success",
+                        db::WorkUnitRepositoryIntegrationOutcome::Unchanged => "unchanged",
+                        db::WorkUnitRepositoryIntegrationOutcome::Conflict => "conflict",
+                        db::WorkUnitRepositoryIntegrationOutcome::Failed
+                        | db::WorkUnitRepositoryIntegrationOutcome::Rejected => "failed",
+                    };
+                    integrations.insert(
+                        integration.repo_id.clone(),
+                        (
+                            integration.updated_at.clone(),
+                            api_types::TaskRepositoryIntegrationResponse {
+                                repo_id: integration.repo_id,
+                                integration_id: Some(integration.id),
+                                outcome: outcome.to_owned(),
+                                before_sha: Some(integration.target_before_sha),
+                                after_sha: integration.target_after_sha,
+                            },
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    let primary_repo_id = repository_set
+        .repositories
+        .iter()
+        .find(|repository| repository.role == db::TaskRepositoryRole::Primary)
+        .map(|repository| repository.repo_id.clone());
+    let repositories = repository_set
+        .repositories
+        .into_iter()
+        .map(|repository| {
+            let merge_rows = batch_repositories
+                .get(&repository.repo_id)
+                .into_iter()
+                .flatten()
+                .filter(|row| {
+                    repository_merge_batches.iter().any(|batch| {
+                        batch.id == row.batch_id
+                            && batch.repository_set_revision == repository_set.revision
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let merge = merge_rows.last().cloned();
+            let integration = integrations
+                .get(&repository.repo_id)
+                .map(|(_, integration)| integration.clone());
+            let change_state = if merge.is_some()
+                || integration
+                    .as_ref()
+                    .is_some_and(|integration| integration.outcome == "success")
+            {
+                api_types::TaskRepositoryChangeState::Changed
+            } else if repository.role == db::TaskRepositoryRole::Context
+                || integration
+                    .as_ref()
+                    .is_some_and(|integration| integration.outcome == "unchanged")
+            {
+                api_types::TaskRepositoryChangeState::Unchanged
+            } else {
+                api_types::TaskRepositoryChangeState::Pending
+            };
+            let pull_request = merge
+                .as_ref()
+                .and_then(|row| row.pr_metadata_id.as_ref())
+                .and_then(|metadata_id| pull_requests_by_id.get(metadata_id))
+                .cloned();
+            api_types::TaskRepositoryResponse {
+                repo_id: repository.repo_id.clone(),
+                role: match repository.role {
+                    db::TaskRepositoryRole::Primary => api_types::TaskRepositoryRole::Primary,
+                    db::TaskRepositoryRole::Affected => api_types::TaskRepositoryRole::Affected,
+                    db::TaskRepositoryRole::Context => api_types::TaskRepositoryRole::Context,
+                },
+                position: repository.position,
+                change_state,
+                integration,
+                merge,
+                pull_request,
+            }
+        })
+        .collect();
     let lifecycle = TaskLifecycleRepo::get_task_lifecycle(db, &task.id)
         .await?
         .ok_or_else(|| ApiError::not_found("task lifecycle", task.id.clone()))?;
@@ -191,9 +370,13 @@ async fn task_response_inner(db: &db::SqliteDb, task: Task) -> ApiResult<TaskRes
         created_at: lifecycle.created_at,
         updated_at: lifecycle.updated_at,
     };
-    let workspace = WorkspaceRepo::get_integration_by_task_id(db, &task.id)
-        .await?
-        .map(workspace_response);
+    let workspace = if let Some(primary_repo_id) = primary_repo_id {
+        WorkspaceRepo::get_integration_by_task_repo(db, &task.id, &primary_repo_id)
+            .await?
+            .map(workspace_response)
+    } else {
+        None
+    };
     let execution_observability = task_execution_observability(db, &task.id).await?;
     let external_link = db::ExternalLinkRepo::get_by_task_id(db, &task.id).await?;
 
@@ -201,6 +384,10 @@ async fn task_response_inner(db: &db::SqliteDb, task: Task) -> ApiResult<TaskRes
         id: task.id,
         project_id: task.project_id,
         repo_id: task.repo_id,
+        repositories,
+        repository_set_revision: repository_set.revision,
+        repository_set_digest: repository_set.digest,
+        repository_merge_batches,
         parent_task_id: task.parent_task_id.clone(),
         title: task.title,
         description: task.description,
@@ -217,6 +404,38 @@ async fn task_response_inner(db: &db::SqliteDb, task: Task) -> ApiResult<TaskRes
         created_at: task.created_at,
         updated_at: task.updated_at,
     })
+}
+
+fn merge_state_response(
+    state: db::TaskRepositoryMergeBatchRepoState,
+) -> api_types::TaskRepositoryMergeState {
+    match state {
+        db::TaskRepositoryMergeBatchRepoState::Pending => {
+            api_types::TaskRepositoryMergeState::Pending
+        }
+        db::TaskRepositoryMergeBatchRepoState::Integrating => {
+            api_types::TaskRepositoryMergeState::Integrating
+        }
+        db::TaskRepositoryMergeBatchRepoState::Integrated => {
+            api_types::TaskRepositoryMergeState::Integrated
+        }
+        db::TaskRepositoryMergeBatchRepoState::Publishing => {
+            api_types::TaskRepositoryMergeState::Publishing
+        }
+        db::TaskRepositoryMergeBatchRepoState::Open => api_types::TaskRepositoryMergeState::Open,
+        db::TaskRepositoryMergeBatchRepoState::Merged => {
+            api_types::TaskRepositoryMergeState::Merged
+        }
+        db::TaskRepositoryMergeBatchRepoState::Conflict => {
+            api_types::TaskRepositoryMergeState::Conflict
+        }
+        db::TaskRepositoryMergeBatchRepoState::Closed => {
+            api_types::TaskRepositoryMergeState::Closed
+        }
+        db::TaskRepositoryMergeBatchRepoState::Failed => {
+            api_types::TaskRepositoryMergeState::Failed
+        }
+    }
 }
 
 async fn task_execution_observability(
@@ -441,6 +660,7 @@ pub fn execution_response(execution: Execution) -> ExecutionResponse {
         workspace_id: execution.workspace_id,
         work_unit_id: execution.work_unit_id,
         work_unit_version: execution.work_unit_version,
+        repository_results: Vec::new(),
         usage: None,
         account_usage: None,
         created_at: execution.created_at,
@@ -448,12 +668,31 @@ pub fn execution_response(execution: Execution) -> ExecutionResponse {
     }
 }
 
+pub async fn execution_response_with_repository_results(
+    db: &db::SqliteDb,
+    execution: Execution,
+) -> ApiResult<ExecutionResponse> {
+    let results = ExecutionRepo::list_repository_results(db, &execution.id).await?;
+    let mut response = execution_response(execution);
+    response.repository_results = results
+        .into_iter()
+        .map(|result| api_types::ExecutionRepositoryResultResponse {
+            repo_id: result.repo_id,
+            workspace_id: result.workspace_id,
+            before_sha: result.before_sha,
+            after_sha: result.after_sha,
+            snapshot_digest: result.snapshot_digest,
+        })
+        .collect();
+    Ok(response)
+}
+
 pub async fn execution_response_with_usage(
     db: &db::SqliteDb,
     execution: Execution,
 ) -> ApiResult<ExecutionResponse> {
     let execution_id = execution.id.clone();
-    let mut response = execution_response(execution);
+    let mut response = execution_response_with_repository_results(db, execution).await?;
     response.account_usage = execution_account_usage(db, &execution_id).await?;
     Ok(response)
 }

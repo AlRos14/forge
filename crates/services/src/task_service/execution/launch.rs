@@ -405,33 +405,126 @@ impl TaskService {
             return Err(db::DbError::AgentAtCapacity.into());
         }
 
-        let workspace = if work_unit.requires_integration {
-            let workspace = db::WorkUnitWorkspaceRepo::get_by_work_unit_id(&*self.db, work_unit_id)
-                .await?
+        let group = db::WorkspaceRepo::get_group_by_work_unit_id(&*self.db, work_unit_id).await?;
+        let workspaces =
+            db::WorkUnitWorkspaceRepo::list_by_work_unit_id(&*self.db, work_unit_id).await?;
+        let role = db::canonical_task_role_name(&work_unit.role)
+            .ok_or_else(|| ServiceError::invalid_operation("WorkUnit role is not a TaskRole"))?;
+        let task_role = db::TaskRoleRepo::get_by_task_and_role(&*self.db, &task.id, &role)
+            .await?
+            .ok_or_else(|| ServiceError::invalid_operation("WorkUnit TaskRole does not exist"))?;
+        let formal_review = crate::role_capabilities::current_task_role_has_capability(
+            &self.db,
+            &task_role.id,
+            api_types::TaskRoleCapability::FormalReview,
+        )
+        .await?;
+        let workspace = if let Some(group) = group {
+            if group.task_id != task.id || group.work_unit_id != work_unit.id {
+                return Err(ServiceError::invalid_operation(
+                    "WorkspaceGroup does not belong to the exact WorkUnit",
+                ));
+            }
+            let expected_repo_ids = if formal_review {
+                db::WorkUnitRepo::list_review_subject_repositories(&*self.db, work_unit_id)
+                    .await?
+                    .into_iter()
+                    .map(|repository| repository.repo_id)
+                    .collect::<std::collections::HashSet<_>>()
+            } else {
+                if !work_unit.requires_integration {
+                    return Err(ServiceError::invalid_operation(
+                        "non-mutating WorkUnit cannot bind a writable WorkspaceGroup",
+                    ));
+                }
+                let task_repositories =
+                    db::TaskRepo::list_repositories(&*self.db, &task.id).await?;
+                let selected =
+                    db::WorkUnitRepo::list_repository_ids(&*self.db, work_unit_id).await?;
+                task_repositories
+                    .iter()
+                    .filter(|repository| {
+                        repository.role == db::TaskRepositoryRole::Context
+                            || (matches!(
+                                repository.role,
+                                db::TaskRepositoryRole::Primary | db::TaskRepositoryRole::Affected
+                            ) && (selected.is_empty()
+                                || selected.contains(&repository.repo_id)))
+                    })
+                    .map(|repository| repository.repo_id.clone())
+                    .collect::<std::collections::HashSet<_>>()
+            };
+            if expected_repo_ids.is_empty() || workspaces.len() != expected_repo_ids.len() {
+                return Err(ServiceError::invalid_operation(
+                    "WorkspaceGroup does not contain the exact repository scope",
+                ));
+            }
+            let mut primary_workspace = None;
+            let task_repositories = db::TaskRepo::list_repositories(&*self.db, &task.id).await?;
+            let selected = db::WorkUnitRepo::list_repository_ids(&*self.db, work_unit_id).await?;
+            for child in &workspaces {
+                let scope = db::WorkUnitWorkspaceRepo::get_scope_by_id(&*self.db, &child.id)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("workspace scope", child.id.clone()))?;
+                if !expected_repo_ids.contains(&child.repo_id)
+                    || child.task_id != task.id
+                    || child.status != db::WorkspaceStatus::Ready
+                    || scope.task_id != task.id
+                    || scope.kind != db::WorkspaceScopeKind::WorkUnit
+                    || scope.work_unit_id.as_deref() != Some(work_unit_id)
+                    || scope.workspace_group_id.as_deref() != Some(group.id.as_str())
+                {
+                    return Err(ServiceError::invalid_operation(
+                        "WorkspaceGroup member is not ready in its exact scope",
+                    ));
+                }
+                if child.repo_id == task.repo_id.as_deref().unwrap_or_default()
+                    && !formal_review
+                    && task_repositories.iter().any(|repository| {
+                        repository.repo_id == child.repo_id
+                            && matches!(
+                                repository.role,
+                                db::TaskRepositoryRole::Primary | db::TaskRepositoryRole::Affected
+                            )
+                            && (selected.is_empty() || selected.contains(&repository.repo_id))
+                    })
+                {
+                    primary_workspace = Some(child.clone());
+                }
+            }
+            if formal_review {
+                None
+            } else {
+                primary_workspace
+            }
+        } else if work_unit.requires_integration {
+            let workspace = workspaces
+                .iter()
+                .find(|workspace| workspace.repo_id == task.repo_id.as_deref().unwrap_or_default())
+                .cloned()
                 .ok_or_else(|| {
                     ServiceError::invalid_operation(
-                    "repository WorkUnit must have its exact Workspace prepared before execution",
-                )
+                        "repository WorkUnit has no exact primary Workspace prepared",
+                    )
                 })?;
             let scope = db::WorkUnitWorkspaceRepo::get_scope_by_id(&*self.db, &workspace.id)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("workspace scope", workspace.id.clone()))?;
-            if workspace.task_id != task.id
+            if workspace.repo_id != task.repo_id.as_deref().unwrap_or_default()
+                || workspaces.len() != 1
+                || workspace.task_id != task.id
                 || workspace.status != db::WorkspaceStatus::Ready
                 || scope.task_id != task.id
                 || scope.kind != db::WorkspaceScopeKind::WorkUnit
                 || scope.work_unit_id.as_deref() != Some(work_unit_id)
             {
                 return Err(ServiceError::invalid_operation(
-                    "Workspace is not the ready Workspace for this exact WorkUnit",
+                    "group-less Workspace is not the ready historical single-primary scope",
                 ));
             }
             Some(workspace)
         } else {
-            if db::WorkUnitWorkspaceRepo::get_by_work_unit_id(&*self.db, work_unit_id)
-                .await?
-                .is_some()
-            {
+            if !workspaces.is_empty() {
                 return Err(ServiceError::invalid_operation(
                     "non-repository WorkUnit cannot bind a Workspace",
                 ));

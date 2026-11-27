@@ -327,6 +327,7 @@ impl TaskArgs {
                 priority,
             } => {
                 let request = CreateTaskRequest {
+                    repositories: None,
                     title: title.clone(),
                     description: description.clone(),
                     parent_task_id: None,

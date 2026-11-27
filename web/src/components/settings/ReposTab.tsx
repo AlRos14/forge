@@ -3,6 +3,7 @@ import { toast } from 'sonner'
 import { useQuery } from '@tanstack/react-query'
 import {
   ArrowsClockwise,
+  CaretDown,
   Check,
   CircleNotch,
   CloudArrowDown,
@@ -40,13 +41,117 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { ComboSelect } from '@/components/ui/combo-select'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
 import { productTerm } from '@/lib/i18n'
 import { useAuthStore } from '@/stores/auth'
 import type { CreateRepoRequest, Project, Repo, UpdateRepoRequest } from '@/types/generated'
 
-export function ReposTab({ project, projectId }: { project?: Project; projectId: string }) {
+function AdditionalRepoCard({
+  repo,
+  onEdit,
+  workModeLabel,
+}: {
+  repo: Repo
+  onEdit: (repo: Repo) => void
+  workModeLabel: (mode: Repo['work_mode']) => string
+}) {
+  const provider = repo.pr_provider_status?.provider_type ?? repo.pr_provider ?? 'Not configured'
+  const credentialStatus = repo.pr_provider_status?.has_credential
+    ? repo.pr_provider_status.credential_label
+      ? `Credential connected: ${repo.pr_provider_status.credential_label}`
+      : 'Credential connected'
+    : 'No credential'
+
+  return (
+    <div className="rounded-md border">
+      <div className="flex items-start justify-between gap-3 border-b px-4 py-3">
+        <div className="flex min-w-0 items-start gap-2.5">
+          <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-md border bg-muted">
+            {repo.local_path ? (
+              <FolderOpen size={15} className="text-muted-foreground" />
+            ) : (
+              <CloudArrowDown size={15} className="text-muted-foreground" />
+            )}
+          </span>
+          <div className="min-w-0">
+            <p className="truncate font-semibold leading-tight">{repo.name}</p>
+            <div className="mt-1 flex flex-wrap items-center gap-1.5">
+              <Badge variant="outline" className="text-xs">
+                {repo.local_path ? 'Local' : 'Remote'}
+              </Badge>
+              <Badge variant="secondary" className="text-xs">
+                {repo.work_mode === 'pull_request' ? (
+                  <GitPullRequest size={10} className="mr-1" />
+                ) : (
+                  <GitMerge size={10} className="mr-1" />
+                )}
+                {workModeLabel(repo.work_mode)}
+              </Badge>
+            </div>
+          </div>
+        </div>
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => onEdit(repo)}
+          className="shrink-0 cursor-pointer"
+        >
+          <PencilSimple size={13} className="mr-1.5" />
+          Edit
+        </Button>
+      </div>
+      <div className="grid gap-3 px-4 py-3 sm:grid-cols-2">
+        <div className="min-w-0">
+          <p className="mb-0.5 text-xs text-muted-foreground">Remote URL</p>
+          <p className="break-all font-mono text-xs">{repo.remote_url}</p>
+        </div>
+        <div className="min-w-0">
+          <p className="mb-0.5 text-xs text-muted-foreground">Local path</p>
+          <p className="break-all font-mono text-xs">{repo.local_path ?? 'Not configured'}</p>
+        </div>
+        <div>
+          <p className="mb-0.5 text-xs text-muted-foreground">Work mode</p>
+          <p className="text-xs">{workModeLabel(repo.work_mode)}</p>
+        </div>
+        <div>
+          <p className="mb-0.5 text-xs text-muted-foreground">PR Provider</p>
+          <p className="text-xs capitalize">{provider}</p>
+        </div>
+        <div>
+          <p className="mb-0.5 text-xs text-muted-foreground">SCM credential</p>
+          <p
+            className={`text-xs ${
+              repo.pr_provider_status?.has_credential
+                ? 'text-green-600 dark:text-green-400'
+                : 'text-muted-foreground'
+            }`}
+          >
+            {credentialStatus}
+          </p>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+export function ReposTab({
+  project,
+  projectId,
+  isUpdatingPrimaryRepo,
+  onUpdatePrimaryRepo,
+}: {
+  project?: Project
+  projectId: string
+  isUpdatingPrimaryRepo: boolean
+  onUpdatePrimaryRepo: (repoId: string | null) => void
+}) {
   const isAdmin = useAuthStore((s) => Boolean(s.user?.is_admin))
   const userId = useAuthStore((s) => s.user?.id)
   const membersQuery = useMembersQuery(projectId)
@@ -66,6 +171,11 @@ export function ReposTab({ project, projectId }: { project?: Project; projectId:
   const [repoDialogOpen, setRepoDialogOpen] = useState(false)
   const [repoForm, setRepoForm] = useState<RepoFormState>(emptyRepoForm)
   const [editingRepoId, setEditingRepoId] = useState<string | null>(null)
+  const [primaryRepoDraft, setPrimaryRepoDraft] = useState(project?.primary_repo_id ?? '')
+
+  useEffect(() => {
+    setPrimaryRepoDraft(project?.primary_repo_id ?? '')
+  }, [project?.primary_repo_id])
 
   // Inline branch edit state
   const [branchEditMode, setBranchEditMode] = useState(false)
@@ -81,6 +191,7 @@ export function ReposTab({ project, projectId }: { project?: Project; projectId:
       ),
     )
   const primaryRepo = repos.find((repo) => repo.id === project?.primary_repo_id)
+  const additionalRepos = repos.filter((repo) => repo.id !== project?.primary_repo_id)
   const branchEditorDaemonId = daemons.find((daemon) => daemon.status === 'online')?.id
   const branchEditorDaemon = branchEditorDaemonId
     ? daemons.find((daemon) => daemon.id === branchEditorDaemonId)
@@ -274,9 +385,7 @@ export function ReposTab({ project, projectId }: { project?: Project; projectId:
   const workModeLabel = (mode: Repo['work_mode']) =>
     mode === 'pull_request' ? 'Pull request' : 'Direct merge'
 
-  const isPending = editingRepoId
-    ? updateRepo.isPending
-    : createRepo.isPending
+  const isPending = editingRepoId ? updateRepo.isPending : createRepo.isPending
 
   return (
     <>
@@ -294,6 +403,80 @@ export function ReposTab({ project, projectId }: { project?: Project; projectId:
           onRetry={() => void reposQuery.refetch()}
         />
       )}
+
+      <div className="mb-6 space-y-3 rounded-md border p-4">
+        <div>
+          <label htmlFor="project-primary-repository" className="text-sm font-medium">
+            Primary repository for new Tasks
+          </label>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Changing this affects Tasks created after the update. Existing Tasks keep their repo
+            set.
+          </p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <select
+            id="project-primary-repository"
+            aria-label="Primary repository for new Tasks"
+            className="h-9 min-w-56 flex-1 rounded-md border bg-background px-2 text-sm"
+            value={primaryRepoDraft}
+            disabled={
+              !canManageRepo || reposQuery.isLoading || reposQuery.isError || isUpdatingPrimaryRepo
+            }
+            onChange={(event) => setPrimaryRepoDraft(event.target.value)}
+          >
+            <option value="">No primary repository</option>
+            {repos.map((repo) => (
+              <option key={repo.id} value={repo.id}>
+                {repo.name}
+              </option>
+            ))}
+          </select>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={
+              !canManageRepo ||
+              !project ||
+              reposQuery.isLoading ||
+              reposQuery.isError ||
+              isUpdatingPrimaryRepo ||
+              primaryRepoDraft === (project.primary_repo_id ?? '')
+            }
+            onClick={() => onUpdatePrimaryRepo(primaryRepoDraft || null)}
+          >
+            {isUpdatingPrimaryRepo ? 'Saving…' : 'Save primary repository'}
+          </Button>
+        </div>
+      </div>
+
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h3 className="text-sm font-semibold">Project repositories</h3>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Manage the primary repository and additional repositories for this Project.
+          </p>
+        </div>
+        <DropdownMenu>
+          <DropdownMenuTrigger className="inline-flex h-9 items-center gap-2 rounded-md bg-primary px-3 text-sm font-medium text-primary-foreground shadow-sm transition-colors hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring">
+            <FolderOpen size={14} />
+            Add repository
+            <CaretDown size={12} />
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            {daemons.length > 0 ? (
+              <DropdownMenuItem onClick={openCreateLocalRepo}>
+                <FolderOpen size={14} className="mr-2" />
+                Add local repository
+              </DropdownMenuItem>
+            ) : null}
+            <DropdownMenuItem onClick={openCreateRemoteRepo}>
+              <CloudArrowDown size={14} className="mr-2" />
+              Add remote repository
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
 
       {reposQuery.isLoading ? (
         <div className="rounded-md border p-4 space-y-3">
@@ -323,7 +506,12 @@ export function ReposTab({ project, projectId }: { project?: Project; projectId:
                   )}
                 </span>
                 <div className="min-w-0">
-                  <p className="truncate font-semibold leading-tight">{primaryRepo.name}</p>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <p className="truncate font-semibold leading-tight">{primaryRepo.name}</p>
+                    <Badge variant="outline" className="text-xs">
+                      Primary
+                    </Badge>
+                  </div>
                   <div className="mt-0.5 flex flex-wrap items-center gap-1.5">
                     <Badge variant="outline" className="text-xs">
                       {primaryRepo.local_path ? 'Local' : 'Remote'}
@@ -509,6 +697,10 @@ export function ReposTab({ project, projectId }: { project?: Project; projectId:
           ) : null}
           <IntegrationsTab embedded projectId={projectId} repoRemoteUrl={primaryRepo.remote_url} />
         </>
+      ) : repos.length > 0 ? (
+        <div className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
+          No primary repository is selected. Choose one above to use it for new Tasks.
+        </div>
       ) : (
         <div className="rounded-lg border border-dashed p-8 text-center">
           <div className="mx-auto mb-4 flex h-11 w-11 items-center justify-center rounded-full bg-muted">
@@ -518,20 +710,26 @@ export function ReposTab({ project, projectId }: { project?: Project; projectId:
           <p className="mt-1.5 text-sm text-muted-foreground">
             Add a repository before creating project tasks.
           </p>
-          <div className="mt-4 flex items-center justify-center gap-2">
-            {daemons.length > 0 ? (
-              <Button size="sm" variant="outline" onClick={openCreateLocalRepo}>
-                <FolderOpen size={14} className="mr-1.5" />
-                Add Local Repo
-              </Button>
-            ) : null}
-            <Button size="sm" variant="outline" onClick={openCreateRemoteRepo}>
-              <CloudArrowDown size={14} className="mr-1.5" />
-              Add Remote Repo
-            </Button>
-          </div>
         </div>
       )}
+      {additionalRepos.length > 0 ? (
+        <section
+          className="mt-6 space-y-3"
+          aria-label={primaryRepo ? 'Additional repositories' : 'Project repositories'}
+        >
+          <h3 className="text-sm font-semibold">
+            {primaryRepo ? 'Additional repositories' : 'Project repositories'}
+          </h3>
+          {additionalRepos.map((repo) => (
+            <AdditionalRepoCard
+              key={repo.id}
+              repo={repo}
+              onEdit={openEditRepo}
+              workModeLabel={workModeLabel}
+            />
+          ))}
+        </section>
+      ) : null}
 
       <RepoDialog
         form={repoForm}

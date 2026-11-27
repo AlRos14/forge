@@ -19,11 +19,11 @@ use axum::{
 use db::{
     AgentRepo, AgentStatus, CreateAgent, CreateDomainEvent, CreateExecution, CreateProject,
     CreateRepo, CreateRoleMembership, CreateTask, CreateTaskRole, CreateWorkUnit,
-    CreateWorkUnitExecution, CreateWorkUnitWorkspace, CreateWorkspace, CreateWorkspaceLease,
-    DaemonRepo, DaemonStatus, Execution, ExecutionRepo, ExecutionStatus, ProjectRepo, RepoRepo,
-    RoleMembershipRepo, RoleMembershipStatus, TaskRepo, TaskRoleRepo, UpdateDaemonReport,
-    UpsertDaemon, UserRepo, WorkMode, WorkUnit, WorkUnitExecutionRepo, WorkUnitRepo,
-    WorkUnitWorkspaceRepo, WorkspaceRepo, WorkspaceStatus,
+    CreateWorkUnitExecution, CreateWorkUnitWorkspace, CreateWorkspace, CreateWorkspaceGroup,
+    CreateWorkspaceLease, DaemonRepo, DaemonStatus, Execution, ExecutionRepo, ExecutionStatus,
+    ProjectRepo, RepoRepo, RoleMembershipRepo, RoleMembershipStatus, TaskRepo, TaskRoleRepo,
+    UpdateDaemonReport, UpsertDaemon, UserRepo, WorkMode, WorkUnit, WorkUnitExecutionRepo,
+    WorkUnitRepo, WorkUnitWorkspaceRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
@@ -142,6 +142,7 @@ async fn create_implementation_work_unit(
     WorkUnitRepo::create(
         &*state.db,
         CreateWorkUnit {
+            repository_ids: Vec::new(),
             id: id.clone(),
             task_id: task.id.clone(),
             parent_work_unit_id: None,
@@ -652,6 +653,7 @@ pub async fn seed_running_execution_for_daemon(state: &AppState, daemon_id: &str
     let task = TaskRepo::create(
         &*state.db,
         CreateTask {
+            repositories: Vec::new(),
             id: task_id.clone(),
             project_id: project_id.clone(),
             repo_id: None,
@@ -746,7 +748,7 @@ pub async fn seed_running_execution_for_daemon(state: &AppState, daemon_id: &str
             execution,
             work_unit_id: work_unit.id.clone(),
             work_unit_version: work_unit.version,
-            workspace_lease: None,
+            workspace_leases: Vec::new(),
         },
         test_domain_event(
             "execution.started",
@@ -794,12 +796,6 @@ pub async fn seed_startable_execution_for_daemon(
     let task_id = uuid::Uuid::new_v4().to_string();
     let agent_id = uuid::Uuid::new_v4().to_string();
     let workspace_id = uuid::Uuid::new_v4().to_string();
-    let workspace_path = state
-        .cleanup_scheduler
-        .workspace_root()
-        .join("execution-start")
-        .join(&task_id);
-    std::fs::create_dir_all(&workspace_path).expect("workspace path creates");
 
     ProjectRepo::create(
         &*state.db,
@@ -834,6 +830,7 @@ pub async fn seed_startable_execution_for_daemon(
     let task = TaskRepo::create(
         &*state.db,
         CreateTask {
+            repositories: Vec::new(),
             id: task_id.clone(),
             project_id: project_id.clone(),
             repo_id: Some(repo_id.clone()),
@@ -883,6 +880,29 @@ pub async fn seed_startable_execution_for_daemon(
     .expect("agent creates");
     let executor_snapshot = authorized_daemon_execution_snapshot(state, &agent_id, "shell").await;
     let work_unit = create_implementation_work_unit(state, &task, &agent_id, true).await;
+    let workspace_group_id = uuid::Uuid::new_v4().to_string();
+    // Group and member paths are derived from their persisted identities.
+    let manager =
+        ::workspace::WorkspaceManager::new(state.cleanup_scheduler.workspace_root().to_path_buf());
+    let group_root = manager
+        .work_unit_group_path(&task_id, &work_unit.id, &workspace_group_id)
+        .expect("WorkspaceGroup path");
+    let workspace_path = manager
+        .work_unit_group_worktree_path(&task_id, &work_unit.id, &workspace_group_id, &repo_id)
+        .expect("repository Workspace path");
+    std::fs::create_dir_all(&workspace_path).expect("workspace path creates");
+    WorkspaceRepo::create_group_for_work_unit(
+        &*state.db,
+        CreateWorkspaceGroup {
+            id: workspace_group_id.clone(),
+            task_id: task_id.clone(),
+            work_unit_id: work_unit.id.clone(),
+            root_path: group_root.to_string_lossy().into_owned(),
+            created_at: now.clone(),
+        },
+    )
+    .await
+    .expect("WorkUnit WorkspaceGroup creates");
     let workspace = WorkUnitWorkspaceRepo::create_for_work_unit(
         &*state.db,
         CreateWorkUnitWorkspace {
@@ -898,6 +918,7 @@ pub async fn seed_startable_execution_for_daemon(
                 updated_at: now.clone(),
             },
             work_unit_id: work_unit.id.clone(),
+            workspace_group_id,
         },
     )
     .await
@@ -940,7 +961,7 @@ pub async fn seed_startable_execution_for_daemon(
             execution: execution_input,
             work_unit_id: work_unit.id.clone(),
             work_unit_version: work_unit.version,
-            workspace_lease: Some(CreateWorkspaceLease {
+            workspace_leases: vec![CreateWorkspaceLease {
                 id: uuid::Uuid::new_v4().to_string(),
                 project_id,
                 task_id: task_id.clone(),
@@ -948,7 +969,7 @@ pub async fn seed_startable_execution_for_daemon(
                 workspace_id: Some(workspace.id.clone()),
                 task_version: task.version,
                 execution_id: execution_id.clone(),
-                operation_idempotency_key: execution_id.clone(),
+                operation_idempotency_key: format!("{execution_id}:workspace:{repo_id}"),
                 repository_binding_id: repo_id,
                 base_ref: "main".to_owned(),
                 role: "worker".to_owned(),
@@ -967,7 +988,7 @@ pub async fn seed_startable_execution_for_daemon(
                 expires_at: "2099-01-01T00:00:00+00:00".to_owned(),
                 created_at: now.clone(),
                 updated_at: now.clone(),
-            }),
+            }],
         },
         test_domain_event(
             "execution.started",
@@ -1040,6 +1061,7 @@ pub async fn seed_local_terminal_task(state: &AppState) -> TerminalTaskFixture {
     TaskRepo::create(
         &*state.db,
         CreateTask {
+            repositories: Vec::new(),
             id: task_id.clone(),
             project_id,
             repo_id: Some(repo_id.clone()),

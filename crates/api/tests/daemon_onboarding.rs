@@ -212,9 +212,11 @@ async fn daemon_onboarding_shell_task_flow_end_to_end() {
     );
     assert_eq!(running_execution.role, "implementer");
 
-    let workspace = db::WorkUnitWorkspaceRepo::get_by_work_unit_id(&*state.db, &work_unit.id)
+    let workspace = db::WorkUnitWorkspaceRepo::list_by_work_unit_id(&*state.db, &work_unit.id)
         .await
         .expect("workspace query succeeds")
+        .into_iter()
+        .next()
         .expect("execution preparation created a WorkUnit workspace");
     assert!(std::path::Path::new(&workspace.worktree_path).exists());
 

@@ -4,7 +4,7 @@ use ts_rs::TS;
 
 use crate::{
     ActorRef, AgentStatus, ExecutionRole, ExecutionStatus, ResumePolicy, StopReason,
-    TaskLifecycleResponse, TaskRoleResponse, WorkspaceResponse,
+    TaskLifecycleResponse, TaskRepositoryResponse, TaskRoleResponse, WorkspaceResponse,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -32,6 +32,15 @@ pub struct TaskResponse {
     pub id: String,
     pub project_id: String,
     pub repo_id: Option<String>,
+    #[serde(default)]
+    pub repositories: Vec<TaskRepositoryResponse>,
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub repository_set_revision: i64,
+    #[serde(default)]
+    pub repository_set_digest: Option<String>,
+    #[serde(default)]
+    pub repository_merge_batches: Vec<crate::TaskRepositoryMergeBatchResponse>,
     pub parent_task_id: Option<String>,
     pub title: String,
     pub description: Option<String>,
@@ -292,6 +301,16 @@ pub struct ExecutionLogsResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
+pub struct ExecutionRepositoryResultResponse {
+    pub repo_id: String,
+    pub workspace_id: String,
+    pub before_sha: Option<String>,
+    pub after_sha: Option<String>,
+    pub snapshot_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct ExecutionResponse {
     pub id: String,
     pub task_id: String,
@@ -316,6 +335,8 @@ pub struct ExecutionResponse {
     pub work_unit_id: Option<String>,
     #[ts(type = "number | null")]
     pub work_unit_version: Option<i64>,
+    #[serde(default)]
+    pub repository_results: Vec<ExecutionRepositoryResultResponse>,
     pub usage: Option<Vec<ExecutionUsageResponse>>,
     #[serde(default)]
     #[ts(type = "Record<string, unknown> | null")]

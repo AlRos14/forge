@@ -62,7 +62,7 @@ async fn supersede_in_tx(
 
     let row = sqlx::query(
         "SELECT a.task_id, a.publish_operation_id, a.metadata_id, a.state, a.rework_outcome,
-                a.admitted_source_sha, m.provider_pr_id,
+                a.admitted_source_sha, m.provider_pr_id, m.repo_id AS metadata_repo_id,
                 r.task_id AS request_task_id, r.kind AS request_kind,
                 r.state AS request_state, r.source_subject_id, r.source_subject_digest
          FROM remote_pr_admission a
@@ -82,6 +82,7 @@ async fn supersede_in_tx(
     let rework_outcome: Option<String> = row.try_get("rework_outcome")?;
     let head_sha: String = row.try_get("admitted_source_sha")?;
     let provider_pr_id: Option<String> = row.try_get("provider_pr_id")?;
+    let metadata_repo_id: Option<String> = row.try_get("metadata_repo_id")?;
     let request_task_id: String = row.try_get("request_task_id")?;
     let request_kind: String = row.try_get("request_kind")?;
     let request_state: String = row.try_get("request_state")?;
@@ -109,11 +110,6 @@ async fn supersede_in_tx(
     .await?
     .ok_or(DbError::NotFound)?;
     let lifecycle = super::gate_lifecycle::map_task_lifecycle(&lifecycle_row)?;
-    if lifecycle.state != TaskLifecycleState::Merging
-        || lifecycle.reason_ref.as_deref() != Some(input.task_merge_operation_id.as_str())
-    {
-        return Err(DbError::PrReworkNotAuthorized);
-    }
     let task_version: i64 =
         sqlx::query_scalar("SELECT version FROM task WHERE id = ? AND deleted_at IS NULL")
             .bind(&task_id)
@@ -121,7 +117,8 @@ async fn supersede_in_tx(
             .await?
             .ok_or(DbError::NotFound)?;
     let operation = sqlx::query(
-        "SELECT kind, status, remote_waiting, version FROM task_integration_operation
+        "SELECT kind, status, remote_waiting, version, repository_merge_batch_id
+         FROM task_integration_operation
          WHERE id = ? AND task_id = ?",
     )
     .bind(&input.task_merge_operation_id)
@@ -133,7 +130,22 @@ async fn supersede_in_tx(
     let operation_status: String = operation.try_get("status")?;
     let operation_remote: i64 = operation.try_get("remote_waiting")?;
     let operation_version: i64 = operation.try_get("version")?;
+    let repository_merge_batch_id: Option<String> =
+        operation.try_get("repository_merge_batch_id")?;
     if operation_kind != "task_merge" || operation_status != "running" || operation_remote != 1 {
+        return Err(DbError::PrReworkNotAuthorized);
+    }
+    let exact_merge_reason = match repository_merge_batch_id.as_deref() {
+        Some(batch_id) => {
+            lifecycle.reason_kind.as_deref() == Some("task_repository_merge_batch")
+                && lifecycle.reason_ref.as_deref() == Some(batch_id)
+        }
+        None => {
+            lifecycle.reason_kind.as_deref() == Some("task_merge")
+                && lifecycle.reason_ref.as_deref() == Some(input.task_merge_operation_id.as_str())
+        }
+    };
+    if lifecycle.state != TaskLifecycleState::Merging || !exact_merge_reason {
         return Err(DbError::PrReworkNotAuthorized);
     }
 
@@ -143,6 +155,7 @@ async fn supersede_in_tx(
         input,
         &publish_operation_id,
         &provider_pr_id,
+        metadata_repo_id.as_deref(),
         &head_sha,
     );
     let superseded_event = DomainEventRepo::append_event_in_tx(db, tx, &superseded).await?;
@@ -280,6 +293,7 @@ fn superseded_event_input(
     input: &SupersedeAdmission,
     publish_operation_id: &str,
     provider_pr_id: &str,
+    repo_id: Option<&str>,
     head_sha: &str,
 ) -> CreateDomainEvent {
     CreateDomainEvent {
@@ -303,6 +317,7 @@ fn superseded_event_input(
             "pr_metadata_id": metadata_id,
             "task_merge_operation_id": input.task_merge_operation_id,
             "publish_operation_id": publish_operation_id,
+            "repo_id": repo_id,
             "supersession_id": input.id,
             "provider_pr_id": provider_pr_id,
             "superseded_head_sha": head_sha,

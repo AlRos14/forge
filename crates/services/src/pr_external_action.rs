@@ -46,7 +46,7 @@ use crate::credential_service::Secret;
 use crate::domain_event_service::DomainEventService;
 use crate::pr_feedback::forge_comment_marker;
 use crate::pr_github_client::{GitHubClient, GitHubClientError, GitHubRepoRef};
-use crate::pr_service::PrService;
+use crate::pr_service::{PrService, RemotePrAdmissionKey};
 use crate::{Result, ServiceError};
 
 pub const CODE_NOT_AUTHORIZED: &str = "pr_action.not_authorized";
@@ -237,10 +237,19 @@ impl PrExternalActionService {
     }
 
     async fn create(&self, input: CreatePrExternalAction) -> Result<PrExternalAction> {
+        let admission = self.load_admission(&input.admission_id).await?;
+        let key = RemotePrAdmissionKey::from_admission(&admission)?;
+        if key.task_id != input.task_id {
+            return Err(action_error(
+                CODE_NOT_AUTHORIZED,
+                "the external action does not match its exact Task admission",
+            ));
+        }
         let event = action_event_parts(
             &input.id,
             &input.task_id,
             &input.admission_id,
+            &key.repo_id,
             input.kind,
             "pr.external_action_created",
             if input.authorization_mode == PrFeedbackAuthorization::Automatic {
@@ -808,13 +817,20 @@ impl PrExternalActionService {
         if let Some(target) = &self.push_source_override {
             return Ok(target.clone());
         }
-        let workspace = WorkspaceRepo::get_integration_by_task_id(&*self.db, &admission.task_id)
-            .await?
-            .ok_or_else(|| {
-                ServiceError::invalid_operation(
-                    "the Task has no integration workspace to push from",
-                )
-            })?;
+        let key = RemotePrAdmissionKey::from_admission(admission)?;
+        let workspace =
+            WorkspaceRepo::get_integration_by_task_repo(&*self.db, &key.task_id, &key.repo_id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation(
+                        "the admitted repository has no integration workspace to push from",
+                    )
+                })?;
+        if workspace.repo_id != key.repo_id {
+            return Err(ServiceError::invalid_operation(
+                "the integration workspace does not match the admitted repository",
+            ));
+        }
         Ok((
             PathBuf::from(workspace.worktree_path),
             admission.remote_repo_identity.clone(),
@@ -927,9 +943,20 @@ impl PrExternalActionService {
     // ---- shared helpers -----------------------------------------------
 
     async fn load_admission(&self, admission_id: &str) -> Result<RemotePrAdmission> {
-        TaskIntegrationOperationRepo::get_remote_pr_admission(&*self.db, admission_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("remote PR admission", admission_id.to_owned()))
+        let admission =
+            TaskIntegrationOperationRepo::get_remote_pr_admission(&*self.db, admission_id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::not_found("remote PR admission", admission_id.to_owned())
+                })?;
+        let key = RemotePrAdmissionKey::from_admission(&admission)?;
+        if key.admission_id != admission_id {
+            return Err(action_error(
+                CODE_NOT_AUTHORIZED,
+                "the remote admission key does not match the requested admission",
+            ));
+        }
+        Ok(admission)
     }
 
     /// Resolve the PR number pinned by this admission. A superseded admission
@@ -937,6 +964,7 @@ impl PrExternalActionService {
     /// admission uses its immutable remote history. Never let the mutable
     /// `pr_metadata` projection redirect a queued comment to a later PR.
     async fn pull_number_for_admission(&self, admission: &RemotePrAdmission) -> Result<u64> {
+        let key = RemotePrAdmissionKey::from_admission(admission)?;
         let provider_pr_id = if let Some(supersession_id) = admission.supersession_id.as_deref() {
             PrReworkRepo::get_supersession(&*self.db, supersession_id)
                 .await?
@@ -946,10 +974,13 @@ impl PrExternalActionService {
                 })
                 .map(|supersession| supersession.provider_pr_id)
         } else {
-            let metadata = PrMetadataRepo::get_by_task_id(&*self.db, &admission.task_id).await?;
+            let metadata =
+                PrMetadataRepo::get_by_task_repo(&*self.db, &key.task_id, &key.repo_id).await?;
             match metadata.filter(|metadata| {
-                metadata.task_merge_operation_id.as_deref()
-                    == Some(admission.task_merge_operation_id.as_str())
+                metadata.id == admission.metadata_id
+                    && metadata.repo_id.as_deref() == Some(key.repo_id.as_str())
+                    && metadata.task_merge_operation_id.as_deref()
+                        == Some(key.admission_id.as_str())
             }) {
                 Some(metadata) => metadata.provider_pr_id,
                 None => sqlx::query_scalar::<_, Option<String>>(
@@ -1028,7 +1059,9 @@ impl PrExternalActionService {
             Some(json!({"code": code, "message": message})),
         )
         .await?;
-        let metadata = PrMetadataRepo::get_by_task_id(&*self.db, &admission.task_id).await?;
+        let key = RemotePrAdmissionKey::from_admission(admission)?;
+        let metadata =
+            PrMetadataRepo::get_by_task_repo(&*self.db, &key.task_id, &key.repo_id).await?;
         self.pr
             .mark_reconciliation_required(
                 admission,
@@ -1052,9 +1085,10 @@ impl PrExternalActionService {
         ) {
             return Ok(());
         }
-        let metadata = PrMetadataRepo::get_by_task_id(&*self.db, &admission.task_id)
+        let key = RemotePrAdmissionKey::from_admission(&admission)?;
+        let metadata = PrMetadataRepo::get_by_task_repo(&*self.db, &key.task_id, &key.repo_id)
             .await?
-            .ok_or_else(|| ServiceError::not_found("PR metadata", admission.task_id.clone()))?;
+            .ok_or_else(|| ServiceError::not_found("PR metadata", key.admission_id.clone()))?;
         self.pr
             .apply_publication_failure(&admission, &metadata, reason)
             .await
@@ -1069,7 +1103,23 @@ impl PrExternalActionService {
         result: Option<Value>,
     ) -> Result<PrExternalAction> {
         let state = to.to_string();
-        let event = action_event(action, &format!("pr.external_action_{state}"), &state);
+        let admission = self.load_admission(&action.admission_id).await?;
+        let key = RemotePrAdmissionKey::from_admission(&admission)?;
+        if key.task_id != action.task_id {
+            return Err(action_error(
+                CODE_NOT_AUTHORIZED,
+                "the external action no longer matches its exact Task admission",
+            ));
+        }
+        let event = action_event_parts(
+            &action.id,
+            &action.task_id,
+            &action.admission_id,
+            &key.repo_id,
+            action.kind,
+            &format!("pr.external_action_{state}"),
+            &state,
+        );
         let write = PrExternalActionRepo::transition_pr_external_action(
             &*self.db,
             TransitionPrExternalAction {
@@ -1107,21 +1157,11 @@ fn frozen_policy(admission: &RemotePrAdmission) -> Result<PrFeedbackPolicy> {
 }
 
 /// Domain event of an action (ids and states only).
-fn action_event(action: &PrExternalAction, event_type: &str, state: &str) -> CreateDomainEvent {
-    action_event_parts(
-        &action.id,
-        &action.task_id,
-        &action.admission_id,
-        action.kind,
-        event_type,
-        state,
-    )
-}
-
 fn action_event_parts(
     id: &str,
     task_id: &str,
     admission_id: &str,
+    repo_id: &str,
     kind: PrExternalActionKind,
     event_type: &str,
     state: &str,
@@ -1143,6 +1183,7 @@ fn action_event_parts(
             "task_id": task_id,
             "action_id": id,
             "admission_id": admission_id,
+            "repo_id": repo_id,
             "kind": kind.to_string(),
             "state": state,
         })
@@ -1375,3 +1416,194 @@ async fn git_push_cas(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod multirepo_lane_c_tests {
+    use super::*;
+    use crate::credential_service::CredentialService;
+    use crate::task_integration_operation::tests::{
+        fixture, prepare_pr_admission_with_config, record_test_remote_outcome, PrConfigSetup,
+    };
+    use db::{ExternalFeedbackRepo, PrFeedbackPolicy};
+    use events::EventBus;
+    use sha2::{Digest, Sha256};
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn multirepo_pr_feedback_and_external_action_are_repo_bound() {
+        let temp = TempDir::new().expect("temporary directory");
+        let fixture = fixture(
+            &format!(
+                "sqlite://{}",
+                temp.path().join("repo-bound-pr.db").display()
+            ),
+            temp.path(),
+        )
+        .await;
+        let event_bus = Arc::new(EventBus::new(64));
+        let credentials = Arc::new(CredentialService::new(
+            Arc::clone(&fixture.db),
+            b"lane-c-multirepo-test-key",
+        ));
+        let (_manager, merge, publish, _evaluation, _gate, _policy) =
+            prepare_pr_admission_with_config(
+                &fixture,
+                temp.path(),
+                Arc::clone(&event_bus),
+                Some(PrConfigSetup {
+                    credentials,
+                    policy: PrFeedbackPolicy {
+                        ingest: true,
+                        post_summary: db::PrFeedbackSummaryMode::HumanApproval,
+                        ..PrFeedbackPolicy::default()
+                    },
+                }),
+            )
+            .await
+            .expect("admission freezes repository feedback and action policy");
+        let merge_id = merge.id().to_owned();
+        drop(publish);
+        drop(merge);
+        record_test_remote_outcome(
+            &fixture,
+            &merge_id,
+            "open",
+            Some("repo-bound-open-event"),
+            Some("17"),
+            Some("https://github.example.invalid/pull/17"),
+            Some("source-commit"),
+            None,
+            None,
+        )
+        .await
+        .expect("provider observation opens this admission");
+        let admission =
+            TaskIntegrationOperationRepo::get_remote_pr_admission(&*fixture.db, &merge_id)
+                .await
+                .expect("admission lookup")
+                .expect("admission exists");
+        let key = RemotePrAdmissionKey::from_admission(&admission)
+            .expect("exact Task and repo admission key");
+        let mut unscoped_admission = admission.clone();
+        unscoped_admission.repo_id = None;
+        assert!(RemotePrAdmissionKey::from_admission(&unscoped_admission).is_err());
+
+        let feedback_body = "Please update this repository";
+        let feedback_digest = crate::pr_feedback::body_digest(feedback_body);
+        ExternalFeedbackRepo::ingest_external_feedback(
+            &*fixture.db,
+            vec![db::CreateExternalFeedbackItem {
+                id: new_uuid_v4(),
+                task_id: key.task_id.clone(),
+                admission_id: key.admission_id.clone(),
+                provider_item_id: "review-comment-17".to_owned(),
+                kind: db::ExternalFeedbackKind::IssueComment,
+                author_login: "reviewer".to_owned(),
+                author_association: "MEMBER".to_owned(),
+                review_state: None,
+                path: None,
+                line: None,
+                commit_sha: Some("source-commit".to_owned()),
+                body: feedback_body.to_owned(),
+                body_truncated: false,
+                body_digest: feedback_digest,
+                provider_url: Some("https://github.example.invalid/pull/17#comment".to_owned()),
+                trust_class: db::ExternalFeedbackTrustClass::Trusted,
+                head_state: db::ExternalFeedbackHeadState::Current,
+                ingested_at: db::now_rfc3339(),
+            }],
+        )
+        .await
+        .expect("feedback is accepted for its exact open admission");
+        let feedback = PrService::new(Arc::clone(&fixture.db), Arc::clone(&event_bus))
+            .list_task_external_feedback(&fixture.task_id, None, 20)
+            .await
+            .expect("Task feedback projection")
+            .items;
+        assert_eq!(feedback.len(), 1);
+        assert_eq!(feedback[0].task_id, key.task_id);
+        assert_eq!(feedback[0].repo_id, key.repo_id);
+        assert_eq!(feedback[0].admission_id, key.admission_id);
+
+        let artifact_id = new_uuid_v4();
+        let producer_execution_id = new_uuid_v4();
+        let body = "Repository-specific triage summary";
+        let body_digest = hex::encode(Sha256::digest(body.as_bytes()));
+        let content = format!(
+            "{body}\n{}",
+            crate::pr_feedback::forge_comment_marker(&artifact_id, &body_digest)
+        );
+        let content_digest = hex::encode(Sha256::digest(content.as_bytes()));
+        let now = db::now_rfc3339();
+        let mut tx = fixture
+            .db
+            .pool()
+            .begin()
+            .await
+            .expect("Artifact transaction");
+        sqlx::query(
+            "INSERT INTO execution (
+                 id, task_id, status, created_at, updated_at, actor_kind, actor_id
+             ) VALUES (?, ?, 'completed', ?, ?, 'human', ?)",
+        )
+        .bind(&producer_execution_id)
+        .bind(&fixture.task_id)
+        .bind(&now)
+        .bind(&now)
+        .bind(&fixture.user_id)
+        .execute(&mut *tx)
+        .await
+        .expect("summary producer Execution");
+        sqlx::query(
+            "INSERT INTO artifact_execution_producer (artifact_id, execution_id, task_id)
+             VALUES (?, ?, ?)",
+        )
+        .bind(&artifact_id)
+        .bind(&producer_execution_id)
+        .bind(&fixture.task_id)
+        .execute(&mut *tx)
+        .await
+        .expect("Artifact producer");
+        sqlx::query(
+            "INSERT INTO artifact (
+                 id, task_id, kind, storage_kind, content, metadata_json, digest, created_at
+             ) VALUES (?, ?, 'summary', 'inline', ?, '{}', ?, ?)",
+        )
+        .bind(&artifact_id)
+        .bind(&fixture.task_id)
+        .bind(&content)
+        .bind(&content_digest)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await
+        .expect("repo-bound summary Artifact");
+        tx.commit().await.expect("Artifact and producer commit");
+
+        let service = PrExternalActionService::new(
+            Arc::clone(&fixture.db),
+            Arc::clone(&event_bus),
+            PrService::new(Arc::clone(&fixture.db), Arc::clone(&event_bus)),
+        );
+        let action = service
+            .request_post_comment(&key.admission_id, &artifact_id)
+            .await
+            .expect("repo-bound comment request")
+            .expect("frozen HumanApproval policy creates a proposed action");
+        assert_eq!(action.task_id, key.task_id);
+        assert_eq!(action.admission_id, key.admission_id);
+        assert_eq!(action.state, PrExternalActionState::Proposed);
+        let payload_json: String = sqlx::query_scalar(
+            "SELECT payload_json FROM domain_event
+             WHERE entity_type = 'pr_external_action' AND entity_id = ?
+               AND event_type = 'pr.external_action_created'",
+        )
+        .bind(&action.id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("action event");
+        let payload: Value = serde_json::from_str(&payload_json).expect("action payload JSON");
+        assert_eq!(payload["task_id"], key.task_id);
+        assert_eq!(payload["admission_id"], key.admission_id);
+        assert_eq!(payload["repo_id"], key.repo_id);
+    }
+}

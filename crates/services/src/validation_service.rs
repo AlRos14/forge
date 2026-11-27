@@ -9,8 +9,8 @@ use std::{
 
 use db::{
     new_uuid_v4, now_rfc3339, CreateDomainEvent, CreateEvidence, CreateValidationRun,
-    CreateValidationRunArtifact, Evidence, ExecutionRepo, TaskRepo, ValidationRun,
-    ValidationRunRepo, ValidationRunStatus, WorkspaceRepo, WorkspaceStatus,
+    CreateValidationRunArtifact, Evidence, ExecutionRepo, TaskRepo, ValidationCatalogRepo,
+    ValidationRun, ValidationRunRepo, ValidationRunStatus, WorkspaceRepo, WorkspaceStatus,
 };
 use events::EventBus;
 use sha2::{Digest, Sha256};
@@ -107,6 +107,81 @@ impl ValidationService {
             expected_subject: None,
         })
         .await
+    }
+
+    /// Run the active catalog command for one exact repository and Workspace.
+    /// The caller supplies the commit it resolved; the shared runner rechecks
+    /// both commit and snapshot before executing.
+    pub async fn run_for_repository(
+        &self,
+        task_id: &str,
+        repo_id: &str,
+        check_key: &str,
+        workspace_id: &str,
+        commit_sha: &str,
+    ) -> Result<ValidationRun> {
+        let task = TaskRepo::get_by_id(&*self.db, task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+        let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
+            .await?
+            .filter(|workspace| {
+                workspace.task_id == task_id
+                    && workspace.repo_id == repo_id
+                    && workspace.status == WorkspaceStatus::Ready
+            })
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "ValidationRun requires the exact Ready Workspace for its Task and repository",
+                )
+            })?;
+        let definition = ValidationCatalogRepo::get_active_validation_check_definition(
+            &*self.db,
+            &task.project_id,
+            Some(repo_id),
+            check_key,
+        )
+        .await?
+        .or(
+            ValidationCatalogRepo::get_active_validation_check_definition(
+                &*self.db,
+                &task.project_id,
+                None,
+                check_key,
+            )
+            .await?,
+        )
+        .ok_or_else(|| ServiceError::Coordination {
+            code: "validation.check_unknown",
+            message: format!("no active definition exists for repository check {check_key}"),
+        })?;
+        let observed_commit = read_head(&workspace.worktree_path).await?;
+        if observed_commit != commit_sha {
+            return Err(ServiceError::Coordination {
+                code: "validation.subject_stale",
+                message: "the repository Workspace no longer matches the requested commit"
+                    .to_owned(),
+            });
+        }
+        let snapshot_digest = workspace_snapshot_digest(&workspace.worktree_path).await?;
+        let outcome = self
+            .run_check_core(CheckRunInput {
+                task_id,
+                workspace_id,
+                command: &definition.command,
+                caused_by_execution_id: None,
+                check_identity: format!(
+                    "catalog:{}@{}",
+                    definition.check_key,
+                    &definition.definition_digest[..16]
+                ),
+                evidence_key: format!("catalog:{}", definition.check_key),
+                timeout_seconds: u64::try_from(definition.timeout_seconds).unwrap_or(3600),
+                catalog: None,
+                expected_subject: Some((commit_sha, &snapshot_digest)),
+            })
+            .await?;
+        Ok(outcome.run)
     }
 
     /// Shared execution core of `run_command` and the catalog runner. The

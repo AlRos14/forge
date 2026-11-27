@@ -10,6 +10,24 @@ pub trait TaskRepo: Send + Sync {
         transaction: &mut Transaction<'_, Sqlite>,
         input: CreateTask,
     ) -> Result<Task>;
+    async fn list_repositories(&self, task_id: &str) -> Result<Vec<TaskRepository>>;
+    async fn list_repositories_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        task_id: &str,
+    ) -> Result<Vec<TaskRepository>>;
+    async fn pin_context_repository_snapshot(
+        &self,
+        input: CreateTaskRepositoryContextSnapshot,
+    ) -> Result<TaskRepositoryContextSnapshot>;
+    async fn replace_repositories_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        task_id: &str,
+        expected_version: i64,
+        rows: &[TaskRepositoryWrite],
+        updated_at: &str,
+    ) -> Result<Task>;
     async fn get_by_id(&self, id: &str, include_deleted: bool) -> Result<Option<Task>>;
     async fn get_by_id_in_tx(
         &self,
@@ -703,11 +721,22 @@ pub struct ReserveOrchestratorAction {
 #[async_trait]
 pub trait WorkspaceRepo: Send + Sync {
     async fn create(&self, input: CreateWorkspace) -> Result<Workspace>;
+    async fn create_group_for_work_unit(
+        &self,
+        input: CreateWorkspaceGroup,
+    ) -> Result<WorkspaceGroup>;
+    async fn get_group_by_work_unit_id(&self, work_unit_id: &str)
+        -> Result<Option<WorkspaceGroup>>;
     async fn get_task_id(&self, id: &str) -> Result<Option<String>>;
     async fn get_by_id(&self, id: &str) -> Result<Option<Workspace>>;
-    /// Resolve the Task's explicitly scoped integration Workspace. WorkUnit
-    /// workspaces must be addressed by exact WorkUnit or Workspace identity.
-    async fn get_integration_by_task_id(&self, task_id: &str) -> Result<Option<Workspace>>;
+    /// Resolve the integration Workspace for one exact repository.
+    async fn get_integration_by_task_repo(
+        &self,
+        task_id: &str,
+        repo_id: &str,
+    ) -> Result<Option<Workspace>>;
+    /// List integration Workspaces in repository order for a Task.
+    async fn list_integrations_by_task(&self, task_id: &str) -> Result<Vec<Workspace>>;
     async fn set_cleanup_after(
         &self,
         id: &str,
@@ -748,7 +777,7 @@ pub trait WorkspaceRepo: Send + Sync {
 #[async_trait]
 pub trait WorkUnitWorkspaceRepo: Send + Sync {
     async fn get_scope_by_id(&self, id: &str) -> Result<Option<WorkspaceScope>>;
-    async fn get_by_work_unit_id(&self, work_unit_id: &str) -> Result<Option<Workspace>>;
+    async fn list_by_work_unit_id(&self, work_unit_id: &str) -> Result<Vec<Workspace>>;
     async fn create_for_work_unit(&self, input: CreateWorkUnitWorkspace) -> Result<Workspace>;
     async fn list_by_task(&self, task_id: &str) -> Result<Vec<Workspace>>;
 }
@@ -806,10 +835,36 @@ pub trait WorkUnitRepo: Send + Sync {
         subject: CreateWorkUnitReviewSubject,
         event: CreateDomainEvent,
     ) -> Result<CollaborationWrite<WorkUnit>>;
+    async fn create_with_review_subject_repositories(
+        &self,
+        input: CreateWorkUnit,
+        subject: CreateWorkUnitReviewSubject,
+        repositories: &[WorkUnitReviewSubjectRepository],
+        event: CreateDomainEvent,
+    ) -> Result<CollaborationWrite<WorkUnit>>;
     /// Scope-only lookup for the auth-before-load boundary.
     async fn get_task_id(&self, id: &str) -> Result<Option<String>>;
     async fn get_by_id(&self, id: &str) -> Result<Option<WorkUnit>>;
     async fn list_by_task(&self, task_id: &str) -> Result<Vec<WorkUnit>>;
+    async fn list_repository_ids(&self, work_unit_id: &str) -> Result<Vec<String>>;
+    async fn list_review_subject_repositories(
+        &self,
+        work_unit_id: &str,
+    ) -> Result<Vec<WorkUnitReviewSubjectRepository>>;
+    async fn freeze_review_subject_repositories(
+        &self,
+        review_work_unit_id: &str,
+        rows: &[WorkUnitReviewSubjectRepository],
+    ) -> Result<Vec<WorkUnitReviewSubjectRepository>>;
+    async fn list_result_requirement_repositories(
+        &self,
+        work_unit_id: &str,
+    ) -> Result<Vec<WorkUnitResultRequirementRepository>>;
+    async fn insert_result_requirement_repositories_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        rows: &[WorkUnitResultRequirementRepository],
+    ) -> Result<()>;
     async fn update(
         &self,
         input: UpdateWorkUnit,
@@ -863,6 +918,105 @@ pub trait WorkUnitRepo: Send + Sync {
         input: RecordWorkUnitIntegration,
         event: CreateDomainEvent,
     ) -> Result<CollaborationWrite<WorkUnitIntegration>>;
+}
+
+#[async_trait]
+pub trait TaskRepositorySetRepo: Send + Sync {
+    async fn get_current(&self, task_id: &str) -> Result<Option<TaskRepositorySetRevision>>;
+    async fn create_revision(
+        &self,
+        input: CreateTaskRepositorySetRevision,
+    ) -> Result<TaskRepositorySetRevision>;
+    async fn create_revision_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: CreateTaskRepositorySetRevision,
+    ) -> Result<TaskRepositorySetRevision>;
+    async fn get_revision(
+        &self,
+        task_id: &str,
+        revision: i64,
+    ) -> Result<Option<TaskRepositorySetRevision>>;
+    async fn pin_work_unit(&self, work_unit_id: &str, task_id: &str, revision: i64) -> Result<()>;
+    async fn pin_work_unit_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        work_unit_id: &str,
+        task_id: &str,
+        revision: i64,
+    ) -> Result<()>;
+    /// Resolve the immutable revision pinned when this WorkUnit was created.
+    /// This supplemental reader is needed by integration/review consumers;
+    /// the freeze listed the pin writer but omitted its paired reader.
+    async fn get_for_work_unit(
+        &self,
+        work_unit_id: &str,
+        task_id: &str,
+    ) -> Result<Option<TaskRepositorySetRevision>>;
+}
+
+#[async_trait]
+pub trait WorkUnitRepositoryIntegrationRepo: Send + Sync {
+    async fn create(
+        &self,
+        input: CreateWorkUnitRepositoryIntegration,
+    ) -> Result<WorkUnitRepositoryIntegration>;
+    async fn get_by_id(&self, id: &str) -> Result<Option<WorkUnitRepositoryIntegration>>;
+    async fn get_by_parent_and_repo(
+        &self,
+        work_unit_integration_id: &str,
+        repo_id: &str,
+    ) -> Result<Option<WorkUnitRepositoryIntegration>>;
+    async fn list_by_work_unit(
+        &self,
+        work_unit_id: &str,
+    ) -> Result<Vec<WorkUnitRepositoryIntegration>>;
+    #[allow(clippy::too_many_arguments)]
+    async fn transition(
+        &self,
+        id: &str,
+        expected_version: i64,
+        outcome: WorkUnitRepositoryIntegrationOutcome,
+        target_after_sha: Option<&str>,
+        conflict_metadata_json: Option<&str>,
+        finished_at: Option<&str>,
+        updated_at: &str,
+    ) -> Result<WorkUnitRepositoryIntegration>;
+}
+
+#[async_trait]
+pub trait TaskRepositoryMergeBatchRepo: Send + Sync {
+    async fn create(
+        &self,
+        batch: &TaskRepositoryMergeBatch,
+        repos: &[TaskRepositoryMergeBatchRepoRow],
+    ) -> Result<TaskRepositoryMergeBatch>;
+    async fn get_by_id(&self, batch_id: &str) -> Result<Option<TaskRepositoryMergeBatch>>;
+    async fn list_by_task(&self, task_id: &str) -> Result<Vec<TaskRepositoryMergeBatch>>;
+    async fn list_repositories(
+        &self,
+        batch_id: &str,
+    ) -> Result<Vec<TaskRepositoryMergeBatchRepoRow>>;
+    async fn transition_batch(
+        &self,
+        batch_id: &str,
+        expected_version: i64,
+        state: TaskRepositoryMergeBatchState,
+        updated_at: &str,
+    ) -> Result<TaskRepositoryMergeBatch>;
+    #[allow(clippy::too_many_arguments)]
+    async fn transition_repo(
+        &self,
+        batch_id: &str,
+        repo_id: &str,
+        expected_version: i64,
+        state: TaskRepositoryMergeBatchRepoState,
+        work_unit_repository_integration_id: Option<&str>,
+        task_merge_operation_id: Option<&str>,
+        pr_metadata_id: Option<&str>,
+        before_sha: Option<&str>,
+        after_sha: Option<&str>,
+    ) -> Result<TaskRepositoryMergeBatchRepoRow>;
 }
 
 /// Durable, Task-wide exclusive authority for operations that read or mutate
@@ -927,7 +1081,12 @@ pub trait WorkspaceLeaseRepo: Send + Sync {
     async fn issue(&self, input: CreateWorkspaceLease) -> Result<WorkspaceLease>;
     async fn get_by_id(&self, id: &str) -> Result<Option<WorkspaceLease>>;
     async fn get_active_for_task(&self, task_id: &str) -> Result<Option<WorkspaceLease>>;
-    async fn get_active_for_work_unit(&self, work_unit_id: &str) -> Result<Option<WorkspaceLease>>;
+    async fn list_active_for_work_unit(&self, work_unit_id: &str) -> Result<Vec<WorkspaceLease>>;
+    async fn get_active_for_execution_workspace(
+        &self,
+        execution_id: &str,
+        workspace_id: &str,
+    ) -> Result<Option<WorkspaceLease>>;
     async fn revoke(
         &self,
         id: &str,
@@ -977,6 +1136,15 @@ pub trait RuntimeRepo: Send + Sync {
 #[async_trait]
 pub trait ExecutionRepo: Send + Sync {
     async fn create(&self, input: CreateExecution) -> Result<Execution>;
+    async fn record_repository_results(
+        &self,
+        execution_id: &str,
+        rows: &[ExecutionRepositoryResult],
+    ) -> Result<Vec<ExecutionRepositoryResult>>;
+    async fn list_repository_results(
+        &self,
+        execution_id: &str,
+    ) -> Result<Vec<ExecutionRepositoryResult>>;
     async fn create_with_event(
         &self,
         input: CreateExecution,
@@ -1688,6 +1856,14 @@ pub trait RepoRepo: Send + Sync {
         input: CreateRepo,
         provider_config: Option<CreatePrProviderConfig>,
     ) -> Result<Repo>;
+    /// Create a Repo and its optional PR provider config atomically. The
+    /// Project's first Repo becomes its primary Repo; later Repos are added as
+    /// non-primary Project repositories for multi-repository Tasks.
+    async fn create_with_pr_provider_config(
+        &self,
+        input: CreateRepo,
+        provider_config: Option<CreatePrProviderConfig>,
+    ) -> Result<Repo>;
     async fn get_by_id(&self, id: &str) -> Result<Option<Repo>>;
     async fn list_by_project(&self, project_id: &str, page: PageRequest) -> Result<Page<Repo>>;
     async fn update(&self, input: UpdateRepo) -> Result<Repo>;
@@ -1725,7 +1901,8 @@ pub trait PrProviderConfigRepo: Send + Sync {
 #[async_trait]
 pub trait PrMetadataRepo: Send + Sync {
     async fn create(&self, input: CreatePrMetadata) -> Result<PrMetadata>;
-    async fn get_by_task_id(&self, task_id: &str) -> Result<Option<PrMetadata>>;
+    async fn list_by_task(&self, task_id: &str) -> Result<Vec<PrMetadata>>;
+    async fn get_by_task_repo(&self, task_id: &str, repo_id: &str) -> Result<Option<PrMetadata>>;
     async fn update(&self, input: UpdatePrMetadata) -> Result<PrMetadata>;
     async fn delete(&self, id: &str) -> Result<()>;
 }
@@ -1921,6 +2098,7 @@ pub struct UpdatePrProviderConfig {
 pub struct CreatePrMetadata {
     pub id: String,
     pub task_id: String,
+    pub repo_id: String,
     pub provider_type: String,
     pub provider_pr_id: Option<String>,
     pub pr_url: Option<String>,
@@ -1941,6 +2119,7 @@ pub struct CreateRemotePrAdmission {
     pub publish_operation_id: String,
     pub metadata_id: String,
     pub task_id: String,
+    pub repo_id: String,
     pub provider_config_id: String,
     pub provider_type: String,
     pub provider_config_revision: String,
@@ -2107,9 +2286,27 @@ pub struct CreateWorkspace {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateWorkspaceGroup {
+    pub id: String,
+    pub task_id: String,
+    pub work_unit_id: String,
+    pub root_path: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTaskRepositoryContextSnapshot {
+    pub task_id: String,
+    pub repo_id: String,
+    pub commit_sha: String,
+    pub captured_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateWorkUnitWorkspace {
     pub workspace: CreateWorkspace,
     pub work_unit_id: String,
+    pub workspace_group_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2125,6 +2322,7 @@ pub struct CreateWorkUnit {
     pub requires_integration: bool,
     pub provenance: Option<WorkUnitProvenance>,
     pub artifact_input_ids: Vec<String>,
+    pub repository_ids: Vec<String>,
     pub review_approval_gate_id: Option<String>,
     pub review_approval_line_id: Option<String>,
     pub created_by: ActorRef,
@@ -2151,6 +2349,8 @@ pub struct CreateWorkUnitReviewSubject {
 pub struct CreateTaskIntegrationOperation {
     pub id: String,
     pub task_id: String,
+    pub repo_id: Option<String>,
+    pub repository_merge_batch_id: Option<String>,
     pub kind: TaskIntegrationOperationKind,
     pub owner_id: String,
     pub gate_evaluation_id: Option<String>,
@@ -2237,7 +2437,7 @@ pub struct CreateWorkUnitExecution {
     pub execution: CreateExecution,
     pub work_unit_id: String,
     pub work_unit_version: i64,
-    pub workspace_lease: Option<CreateWorkspaceLease>,
+    pub workspace_leases: Vec<CreateWorkspaceLease>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2346,6 +2546,26 @@ pub struct CreateWorkUnitIntegration {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateWorkUnitRepositoryIntegration {
+    pub id: String,
+    pub work_unit_integration_id: String,
+    pub task_id: String,
+    pub work_unit_id: String,
+    pub execution_id: String,
+    pub repository_set_revision: i64,
+    pub repo_id: String,
+    pub source_workspace_id: String,
+    pub source_branch: String,
+    pub source_sha: String,
+    pub target_workspace_id: String,
+    pub target_branch: String,
+    pub target_before_sha: String,
+    pub started_at: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordWorkUnitIntegration {
     pub id: String,
     pub expected_version: i64,
@@ -2450,6 +2670,7 @@ pub struct CreateTask {
     pub id: String,
     pub project_id: String,
     pub repo_id: Option<String>,
+    pub repositories: Vec<TaskRepositoryWrite>,
     pub parent_task_id: Option<String>,
     pub title: String,
     pub description: Option<String>,
@@ -2460,6 +2681,12 @@ pub struct CreateTask {
     pub merge_config: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRepositoryWrite {
+    pub repo_id: String,
+    pub role: TaskRepositoryRole,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2629,6 +2856,15 @@ pub trait RoleMembershipRepo: Send + Sync {
         &self,
         input: UpdateRoleMembership,
     ) -> std::result::Result<RoleMembership, crate::DbError>;
+    /// Updates a membership and, when `narrowing` still holds inside the same
+    /// `BEGIN IMMEDIATE` transaction, refreshes the Task coordination
+    /// authorization (new version, same mode/envelope/coordinator). Returns the
+    /// refresh event when the refresh was applied.
+    async fn update_with_coordination_narrowing(
+        &self,
+        input: UpdateRoleMembership,
+        narrowing: Option<NarrowTaskCoordinationInput>,
+    ) -> std::result::Result<(RoleMembership, Option<DomainEvent>), crate::DbError>;
 }
 
 #[derive(Debug, Clone)]

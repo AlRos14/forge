@@ -42,6 +42,27 @@ External provenance remains an opaque reference. Old V091 Actor references
 that cannot be resolved unambiguously remain readable as `legacy_actor` and
 cannot be written by new requests.
 
+## Repository scope
+
+A Task may associate repositories as `primary`, `affected`, or `context`. The
+primary repository is mirrored by `Task.repo_id`; primary and affected
+repositories are writable, while context repositories are read-only. A
+WorkUnit may select a subset of the Task's writable repository IDs. An omitted
+or empty WorkUnit selection means all writable Task repositories. A repository
+outside the Task scope or with the context role cannot be selected for writes.
+An explicit WorkUnit selection remains writable for the life of that scope. A
+Task scope update cannot remove one of its selected repositories or change it
+to context. After an Execution exists, Task scope changes require an authorized
+replan. An empty selection continues to mean all writable repositories in the
+current Task scope until its first Execution.
+
+WorkUnit integration runs in `primary` then `affected.position` order. Each
+repository records its own source and target Workspaces, commits, and outcome
+under the existing idempotent parent integration. A conflict or uncertain
+result does not undo successful repository rows. The WorkUnit response keeps
+all child results visible, and retrying the same Execution resumes only pending
+repositories with the same idempotency key.
+
 ## Allocation
 
 `RoleMembership` says which Actors may participate in a TaskRole. WorkUnit
@@ -174,10 +195,15 @@ An assigned Human submits a report through the reviewer WorkUnit's
 `review-report` operation. Forge creates the provenance attempt internally,
 stores the report, and completes the review WorkUnit. Retries reuse the exact
 attempt/report, including recovery after a report was persisted before WorkUnit
-completion. The Human does not select an Execution or a HarnessSession.
+completion. For repository subjects, submission freezes the pending per-repo
+result rows and prepares the exact read-only WorkspaceGroup before admission;
+the Human attempt itself remains workspace-free. The Human does not select an
+Execution or a HarnessSession.
 
 A review WorkUnit may record `work_unit_review_subject`: the exact reviewed
-WorkUnit version, result Execution, commit, Workspace, and snapshot digest. A
+WorkUnit version and, for each writable repo in its result, the result
+Execution, commit, Workspace, and snapshot digest. The scalar subject fields
+remain the primary-repository projection when that repo is selected. A
 correction WorkUnit may record `work_unit_result_requirement`: the exact source
 result it consumes. These are minimal relations, not a workflow DSL. Cognitive
 harnesses receive the exact pinned input context at launch. Shell launches
@@ -219,11 +245,22 @@ A fallback changes only the Actor assignment for the same WorkUnit and TaskRole.
 A micro-fix is an exact finding-bound correction WorkUnit. Its paths must come from the cited findings, and Forge measures the result diff against the reviewed commit. The current limits are three changed files, sixty changed lines, and at most three micro-fixes per Task. Dependency changes and protected control files are out of bounds. A bounds violation does not accept the result: it returns through ordinary correction/review triage. Every micro-fix requires an independent formal review and a fresh Gate evaluation.
 ## Isolation
 
-The Task has an integration workspace; each repository-mutating WorkUnit has
-its own branch/worktree and exact short-lived WorkspaceLease. Scope text helps
-coordination but is not a filesystem security boundary. A Task integration
-branch is written only by an explicit, serialized integration operation.
-Completing a WorkUnit never integrates it automatically.
+The Task has an integration workspace. Each repository-mutating WorkUnit has
+one persisted workspace group rooted outside its repository children. Every
+selected writable repository gets an isolated branch/worktree and exact
+short-lived WorkspaceLease; selected context repositories are exact pinned
+read-only worktrees without leases. A group with exactly one repository starts
+the harness in that repository worktree; otherwise the harness starts at the
+group root. A `FORGE_WORKSPACE.md` at the group root describes each repository
+ID and whether it is writable. Scope text helps coordination but is not a filesystem security
+boundary. A Task integration branch is written only by an explicit, serialized
+integration operation. Completing a WorkUnit never integrates its changes
+automatically.
+
+Execution results and review subjects bind each writable repository to its own
+Workspace, before/after commit, and snapshot digest. The scalar Execution
+workspace and commit fields represent the primary repository only when it is
+selected; historical single-repository responses retain their scalar values.
 
 Integration success, conflict, rejection, and failure are durable operational
 outcomes. A WorkUnit being complete does not silently merge its changes or

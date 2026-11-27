@@ -137,6 +137,16 @@ export function WorkUnitHumanReviewPanel({
           {subject.result_artifact_id ? ` · Artifact ${subject.result_artifact_id}` : ''}
           {subject.result_commit_sha ? ` · commit ${subject.result_commit_sha}` : ''}
         </p>
+        {subject.repository_results.length > 0 ? (
+          <ul aria-label="Reviewed repository results" className="mt-2 space-y-1 text-xs text-muted-foreground">
+            {subject.repository_results.map((result) => (
+              <li key={result.repo_id} className="break-all">
+                {result.repo_id}
+                {result.result_commit_sha ? ` · commit ${result.result_commit_sha}` : ''}
+              </li>
+            ))}
+          </ul>
+        ) : null}
       </div>
       <label className="block space-y-1 text-sm">
         <span>Verdict</span>

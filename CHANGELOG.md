@@ -8,6 +8,74 @@ source version is 0.9.1.
 
 ## [Unreleased]
 
+### Added
+
+- Agent Executions in a repository Workspace now commit under a distinct Git
+  identity (`<role> (<agent name>)`, `agent+<role>.<short agent id>@agents.forge.invalid`)
+  injected through the harness process environment, with deterministic
+  `Agent-Role` and `Agent-Run` commit trailers added by a per-Execution
+  `commit-msg` hook. Agent-configured `GIT_*` identity or `GIT_CONFIG_*`
+  entries cannot override it. Forge's own integration and merge commits use the
+  fixed `Forge <forge@agents.forge.invalid>` identity.
+- Add durable Task repository scopes with `primary`, `affected`, and `context`
+  roles. Task creation inherits the parent Task scope or Project primary unless
+  repositories are supplied; an explicit empty list creates a repo-less Task.
+- `POST /projects/{id}/repos` adds further repositories to a Project that
+  already has a primary Repo instead of returning `409
+  project_already_has_primary_repo`; the first Repo still becomes the primary.
+- Add versioned Task repository replacement, versioned Project primary-repo
+  updates for future Tasks, and writable repository selection for WorkUnits in
+  REST and MCP.
+- Add grouped WorkUnit workspaces and per-repository Execution results,
+  repository-scoped review subjects and rework bases, and exact-repository
+  validation and integration responses. Existing scalar Execution fields
+  remain populated for a selected primary repository.
+- Add durable per-repository integration/merge batches, PR identity and state,
+  exact repository-aware Task dependency handoffs, revision/digest-bound
+  coordinator replan checks, and partial progress/retry projections in REST,
+  MCP, SSE, and the web Task view. Human approval remains required for PR merge.
+- Allow an approved coordinator replan to replace the Task repository set with
+  an exact-Human-approved immutable revision, while preserving historical pins
+  and failing closed when a removed repository still has in-flight work.
+- Open one PR per changed writable repository; unchanged repositories open no PR
+  and require no repository-scoped checks.
+- Allow coordinator `WorkUnitPlan` entries to select an exact writable
+  `repository_ids` subset. Empty or omitted values preserve the legacy plan
+  wire representation and select all writable Task repositories; selections are
+  validated against the effective Task set, shown in REST/MCP plan reads, and
+  persisted with the WorkUnit's immutable repository-set pin.
+
+### Fixed
+
+- Reject coordinator plan WorkUnits that list `repository_ids` with
+  `requires_integration: false` (a non-repository WorkUnit that would run with
+  no Workspace and produce no commits) with
+  `422 coordination.plan_repository_requires_integration`; formal review
+  WorkUnits are exempt. The coordinator prompt now explains
+  `requires_integration` and its example shows `true`.
+- Reject unsupported automatic coordination harnesses during authorization
+  with `coordination.coordinator_harness_unsupported`; a wake that becomes
+  unsupported before an attempt now fails its exact coordination request with
+  the durable request-state event.
+- `PATCH /tasks/{id}/task-roles/{role}/members/{membership_id}` no longer
+  fails with `500` (path extractor mismatch); suspending or ending a
+  RoleMembership works again.
+- Preserve 0.9.1 single-repository TaskMerge, PublishPr, and PR admission when
+  the new repository identity and batch columns are omitted; multi-repository
+  Tasks still require exact repository and batch bindings.
+
+### Changed
+
+- Suspending or ending a Task RoleMembership no longer makes a current
+  coordination authorization stale. When the change only removes an active
+  member and the coordinator stays active, Forge refreshes the authorization in
+  the same transaction (new `authorization_version`, same mode, envelope and
+  coordinator) and records a system-provenance `task.coordination_authorized`
+  event referencing the previous Human authorization. Requests and plans bound
+  to the old version become unusable. Any widening (new or reactivated member,
+  role or capability change, coordinator removal) still returns
+  `coordination.authorization_stale` until a Human re-authorizes.
+
 ## [0.9.1] - 2026-11-18
 
 Packaging fix for 0.9.0. No runtime, API, or schema changes.

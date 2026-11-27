@@ -7,13 +7,13 @@ use std::{
 };
 
 use api::{build_router, AppState};
-use api_types::{ProjectResponse, ProviderEntryResponse, RepoResponse};
+use api_types::{ProjectResponse, ProviderEntryResponse, RepoResponse, TaskResponse};
 use axum::{
     body::{to_bytes, Body},
     http::{Method, Request, StatusCode},
     Router,
 };
-use db::{PrProviderConfigRepo, ProjectRepo};
+use db::{PrProviderConfigRepo, ProjectRepo, RepoRepo, TaskRepo};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -328,6 +328,59 @@ async fn create_repo_sets_and_returns_primary_repo_id() {
 }
 
 #[tokio::test]
+async fn multirepo_task_project_accepts_additional_repositories() {
+    let (app, db) = test_app_with_db().await;
+    let project: ProjectResponse = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/projects",
+        json!({ "name": "repo-additional" }),
+        StatusCode::OK,
+    )
+    .await;
+    let primary: RepoResponse = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/repos", project.id),
+        json!({
+            "name": "primary-repo",
+            "remote_url": "https://example.com/acme/primary-repo.git",
+            "default_branch": "main"
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let affected: RepoResponse = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/repos", project.id),
+        json!({
+            "name": "affected-repo",
+            "remote_url": "https://example.com/acme/affected-repo.git",
+            "default_branch": "main"
+        }),
+        StatusCode::OK,
+    )
+    .await;
+
+    assert_ne!(primary.id, affected.id);
+    let stored = ProjectRepo::get_by_id(&*db, &project.id)
+        .await
+        .expect("load project")
+        .expect("project exists");
+    assert_eq!(stored.primary_repo_id.as_deref(), Some(primary.id.as_str()));
+    let listed: Value = empty_request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/projects/{}/repos", project.id),
+        StatusCode::OK,
+    )
+    .await;
+    let items = listed["items"].as_array().expect("repository list");
+    assert_eq!(items.len(), 2);
+}
+
+#[tokio::test]
 async fn create_task_accepts_primary_repo_without_repo_id() {
     let (app, _db) = test_app_with_db().await;
     let project: ProjectResponse = json_request(
@@ -364,6 +417,99 @@ async fn create_task_accepts_primary_repo_without_repo_id() {
         created.get("repo_id").and_then(Value::as_str).is_some(),
         "unexpected create-task response: {created}"
     );
+}
+
+#[tokio::test]
+async fn multirepo_task_project_patch_updates_primary_repo() {
+    let (app, db) = test_app_with_db().await;
+    let project: ProjectResponse = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/projects",
+        json!({ "name": "multirepo-primary-future-only" }),
+        StatusCode::OK,
+    )
+    .await;
+    let primary: RepoResponse = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/repos", project.id),
+        json!({
+            "name": "initial-primary",
+            "remote_url": "https://example.com/acme/initial-primary.git",
+            "default_branch": "main"
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let existing_task: TaskResponse = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/tasks", project.id),
+        json!({ "title": "Existing task keeps its repository" }),
+        StatusCode::OK,
+    )
+    .await;
+
+    let now = db::now_rfc3339();
+    let next_primary = RepoRepo::create(
+        &*db,
+        db::CreateRepo {
+            id: uuid::Uuid::new_v4().to_string(),
+            project_id: project.id.clone(),
+            name: "future-primary".to_owned(),
+            remote_url: "https://example.com/acme/future-primary.git".to_owned(),
+            local_path: None,
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch: "main".to_owned(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("second repository creates");
+    let current_project = ProjectRepo::get_by_id(&*db, &project.id)
+        .await
+        .expect("load Project before update")
+        .expect("Project exists");
+
+    let updated: ProjectResponse = json_request(
+        &app,
+        Method::PATCH,
+        &format!("/api/v1/projects/{}", project.id),
+        json!({
+            "version": current_project.version,
+            "primary_repo_id": next_primary.id
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        updated.primary_repo_id.as_deref(),
+        Some(next_primary.id.as_str())
+    );
+    assert!(updated.version > current_project.version);
+
+    let existing_task_repositories = TaskRepo::list_repositories(&*db, &existing_task.id)
+        .await
+        .expect("load existing Task repositories");
+    assert_eq!(existing_task_repositories.len(), 1);
+    assert_eq!(existing_task_repositories[0].repo_id, primary.id);
+
+    let future_task: TaskResponse = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/tasks", project.id),
+        json!({ "title": "Future task uses new primary" }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        future_task.repo_id.as_deref(),
+        Some(next_primary.id.as_str())
+    );
+    assert_eq!(future_task.repositories.len(), 1);
+    assert_eq!(future_task.repositories[0].repo_id, next_primary.id);
 }
 
 async fn test_app() -> Router {

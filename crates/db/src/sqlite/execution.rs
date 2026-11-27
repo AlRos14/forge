@@ -3,6 +3,33 @@ use crate::{
     now_rfc3339, ActorKind, AgentExecutionStats, ExecutionStatus, ExecutionTaskRoleAuthority,
     ExecutionTaskRoleAuthorityRepo, PendingProviderStartFailure, RunningExecutionFailure,
 };
+use std::collections::HashSet;
+
+fn map_execution_repository_result(row: SqliteRow) -> Result<crate::ExecutionRepositoryResult> {
+    Ok(crate::ExecutionRepositoryResult {
+        execution_id: row.try_get("execution_id")?,
+        task_id: row.try_get("task_id")?,
+        repo_id: row.try_get("repo_id")?,
+        workspace_id: row.try_get("workspace_id")?,
+        before_sha: row.try_get("before_sha")?,
+        after_sha: row.try_get("after_sha")?,
+        snapshot_digest: row.try_get("snapshot_digest")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+fn same_execution_repository_result(
+    left: &crate::ExecutionRepositoryResult,
+    right: &crate::ExecutionRepositoryResult,
+) -> bool {
+    left.execution_id == right.execution_id
+        && left.task_id == right.task_id
+        && left.repo_id == right.repo_id
+        && left.workspace_id == right.workspace_id
+        && left.before_sha == right.before_sha
+        && left.after_sha == right.after_sha
+        && left.snapshot_digest == right.snapshot_digest
+}
 
 fn map_review_execution_subject(row: SqliteRow) -> Result<ReviewExecutionSubject> {
     Ok(ReviewExecutionSubject {
@@ -261,6 +288,130 @@ impl ExecutionRepo for SqliteDb {
         let execution = Self::create_execution_in_tx(&mut transaction, &input, None).await?;
         transaction.commit().await?;
         Ok(execution)
+    }
+
+    async fn record_repository_results(
+        &self,
+        execution_id: &str,
+        rows: &[crate::ExecutionRepositoryResult],
+    ) -> Result<Vec<crate::ExecutionRepositoryResult>> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let execution_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM execution WHERE id = ?)")
+                .bind(execution_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if !execution_exists {
+            return Err(DbError::NotFound);
+        }
+
+        let mut repo_ids = HashSet::with_capacity(rows.len());
+        for row in rows {
+            if row.execution_id != execution_id || !repo_ids.insert(row.repo_id.as_str()) {
+                return Err(DbError::Check(
+                    "Execution repository results must use the exact Execution and unique repositories"
+                        .to_owned(),
+                ));
+            }
+        }
+
+        let existing_rows = sqlx::query(
+            "SELECT execution_id, task_id, repo_id, workspace_id, before_sha,
+                    after_sha, snapshot_digest, created_at
+             FROM execution_repository_result WHERE execution_id = ?",
+        )
+        .bind(execution_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(map_execution_repository_result)
+        .collect::<Result<Vec<_>>>()?;
+        if existing_rows.iter().any(|existing| {
+            !rows
+                .iter()
+                .any(|row| same_execution_repository_result(row, existing))
+        }) {
+            return Err(DbError::VersionConflict);
+        }
+
+        for row in rows {
+            if existing_rows
+                .iter()
+                .any(|existing| same_execution_repository_result(row, existing))
+            {
+                continue;
+            }
+            sqlx::query(
+                "INSERT INTO execution_repository_result (
+                    execution_id, task_id, repo_id, workspace_id, before_sha,
+                    after_sha, snapshot_digest, created_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&row.execution_id)
+            .bind(&row.task_id)
+            .bind(&row.repo_id)
+            .bind(&row.workspace_id)
+            .bind(row.before_sha.as_deref())
+            .bind(row.after_sha.as_deref())
+            .bind(row.snapshot_digest.as_deref())
+            .bind(&row.created_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let stored = sqlx::query(
+            "SELECT execution_id, task_id, repo_id, workspace_id, before_sha,
+                    after_sha, snapshot_digest, created_at
+             FROM execution_repository_result WHERE execution_id = ?
+             ORDER BY repo_id",
+        )
+        .bind(execution_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(map_execution_repository_result)
+        .collect::<Result<Vec<_>>>()?;
+        if stored.len() != rows.len()
+            || stored.iter().any(|stored_row| {
+                !rows
+                    .iter()
+                    .any(|row| same_execution_repository_result(row, stored_row))
+            })
+        {
+            return Err(DbError::VersionConflict);
+        }
+        tx.commit().await?;
+        Ok(stored)
+    }
+
+    async fn list_repository_results(
+        &self,
+        execution_id: &str,
+    ) -> Result<Vec<crate::ExecutionRepositoryResult>> {
+        sqlx::query(
+            "SELECT result.execution_id, result.task_id, result.repo_id,
+                    result.workspace_id, result.before_sha, result.after_sha,
+                    result.snapshot_digest, result.created_at
+             FROM execution_repository_result result
+             LEFT JOIN execution execution_row
+               ON execution_row.id = result.execution_id
+              AND execution_row.task_id = result.task_id
+             LEFT JOIN work_unit_repository_set_revision pin
+               ON pin.work_unit_id = execution_row.work_unit_id
+              AND pin.task_id = result.task_id
+             LEFT JOIN task_repository_set_revision_repo repository
+               ON repository.task_id = pin.task_id
+              AND repository.revision = pin.revision
+              AND repository.repo_id = result.repo_id
+             WHERE result.execution_id = ?
+             ORDER BY repository.position, result.repo_id",
+        )
+        .bind(execution_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(map_execution_repository_result)
+        .collect()
     }
 
     async fn create_with_event(
@@ -1552,8 +1703,41 @@ impl ExecutionRepo for SqliteDb {
                                 AND coordination.team_stale = 0
                           )
                       )
-                      AND ((w.requires_integration = 1 AND ? IS NOT NULL)
-                           OR (w.requires_integration = 0 AND ? IS NULL))
+                      AND ? IS (
+                          SELECT primary_scope.workspace_id
+                          FROM task current_task
+                          JOIN workspace_scope primary_scope
+                            ON primary_scope.work_unit_id = w.id
+                           AND primary_scope.task_id = w.task_id
+                           AND primary_scope.scope_kind = 'work_unit'
+                          JOIN workspace primary_workspace
+                            ON primary_workspace.id = primary_scope.workspace_id
+                           AND primary_workspace.task_id = primary_scope.task_id
+                          WHERE current_task.id = w.task_id
+                            AND w.requires_integration = 1
+                            AND primary_workspace.repo_id = current_task.repo_id
+                            AND (NOT EXISTS (
+                                SELECT 1 FROM work_unit_repository selected
+                                WHERE selected.work_unit_id = w.id
+                            ) OR EXISTS (
+                                SELECT 1 FROM work_unit_repository selected
+                                WHERE selected.work_unit_id = w.id
+                                  AND selected.repo_id = current_task.repo_id
+                            ))
+                            AND (
+                                (primary_scope.workspace_group_id IS NULL AND NOT EXISTS (
+                                    SELECT 1 FROM workspace_group group_row
+                                    WHERE group_row.work_unit_id = w.id
+                                ))
+                                OR EXISTS (
+                                    SELECT 1 FROM workspace_group group_row
+                                    WHERE group_row.id = primary_scope.workspace_group_id
+                                      AND group_row.task_id = w.task_id
+                                      AND group_row.work_unit_id = w.id
+                                )
+                            )
+                          LIMIT 1
+                      )
                 )",
             )
             .bind(&execution.id)
@@ -1568,7 +1752,6 @@ impl ExecutionRepo for SqliteDb {
             .bind(&actor_kind)
             .bind(&actor_id)
             .bind(execution.workspace_id.as_deref())
-            .bind(execution.workspace_id.as_deref())
             .fetch_one(&mut *tx)
             .await?;
             if !work_unit_authority_is_current {
@@ -1577,45 +1760,145 @@ impl ExecutionRepo for SqliteDb {
             }
         }
 
-        if let (Some(work_unit_id), Some(workspace_id)) = (
-            execution.work_unit_id.as_deref(),
-            execution.workspace_id.as_deref(),
-        ) {
-            let actor_id = execution
-                .actor_ref()
-                .map(|actor| actor.id().to_owned())
-                .ok_or_else(|| {
-                    DbError::Check("provider start claim has no exact Workspace Actor".to_owned())
-                })?;
-            let lease_is_current: bool = sqlx::query_scalar(
+        if let Some(work_unit_id) = execution.work_unit_id.as_deref() {
+            let repository_lease_required: bool = sqlx::query_scalar(
                 "SELECT EXISTS(
-                    SELECT 1 FROM workspace_lease
-                    WHERE task_id = ? AND work_unit_id = ? AND workspace_id = ?
-                      AND execution_id = ? AND operation_idempotency_key = ?
-                      AND role = CASE WHEN EXISTS (
+                    SELECT 1 FROM work_unit
+                    WHERE id = ? AND task_id = ? AND requires_integration = 1
+                      AND NOT EXISTS (
                           SELECT 1 FROM execution_task_role_authority authority
                           JOIN json_each(authority.capabilities_json) capability
                           WHERE authority.execution_id = ?
                             AND capability.type = 'text'
                             AND capability.value = 'formal_review'
-                      ) THEN 'reviewer' ELSE 'worker' END
-                      AND assigned_principal_type = 'agent' AND assigned_principal_id = ?
-                      AND status = 'active' AND expires_at > ?
+                      )
                 )",
             )
-            .bind(&execution.task_id)
             .bind(work_unit_id)
-            .bind(workspace_id)
+            .bind(&execution.task_id)
             .bind(&execution.id)
-            .bind(&execution.id)
-            .bind(&execution.id)
-            .bind(&actor_id)
-            .bind(crate::now_rfc3339())
             .fetch_one(&mut *tx)
             .await?;
-            if !lease_is_current {
-                tx.commit().await?;
-                return Ok(ProviderStartClaim::AuthorityLost);
+            if repository_lease_required {
+                let actor_id = execution
+                    .actor_ref()
+                    .map(|actor| actor.id().to_owned())
+                    .ok_or_else(|| {
+                        DbError::Check(
+                            "provider start claim has no exact Workspace Actor".to_owned(),
+                        )
+                    })?;
+                let lease_is_current: bool = sqlx::query_scalar(
+                    "WITH expected AS (
+                    SELECT workspace.id AS workspace_id, repository.repo_id,
+                           scope.workspace_group_id, task.project_id,
+                           CASE WHEN workspace.id IS NOT NULL
+                                  AND workspace.status = 'ready'
+                                  AND (
+                                      (scope.workspace_group_id IS NULL AND NOT EXISTS (
+                                          SELECT 1 FROM workspace_group group_row
+                                          WHERE group_row.work_unit_id = unit.id
+                                      ))
+                                      OR EXISTS (
+                                          SELECT 1 FROM workspace_group group_row
+                                          WHERE group_row.id = scope.workspace_group_id
+                                            AND group_row.task_id = task.id
+                                            AND group_row.work_unit_id = unit.id
+                                      )
+                                  )
+                                THEN 1 ELSE 0 END AS scope_is_current,
+                           COALESCE(workspace.before_sha, repo.default_branch) AS base_ref
+                    FROM work_unit unit
+                    JOIN task ON task.id = unit.task_id
+                    JOIN work_unit_repository_set_revision pin
+                      ON pin.work_unit_id = unit.id AND pin.task_id = unit.task_id
+                    JOIN task_repository_set_revision_repo repository
+                      ON repository.task_id = pin.task_id
+                     AND repository.revision = pin.revision
+                     AND repository.role IN ('primary', 'affected')
+                    JOIN repo ON repo.id = repository.repo_id
+                    LEFT JOIN workspace ON workspace.task_id = task.id
+                      AND workspace.repo_id = repository.repo_id
+                      AND EXISTS (
+                          SELECT 1 FROM workspace_scope candidate_scope
+                          WHERE candidate_scope.workspace_id = workspace.id
+                            AND candidate_scope.task_id = task.id
+                            AND candidate_scope.scope_kind = 'work_unit'
+                            AND candidate_scope.work_unit_id = unit.id
+                      )
+                    LEFT JOIN workspace_scope scope
+                      ON scope.workspace_id = workspace.id AND scope.task_id = task.id
+                     AND scope.scope_kind = 'work_unit'
+                     AND scope.work_unit_id = unit.id
+                    WHERE unit.id = ? AND unit.task_id = ?
+                      AND unit.requires_integration = 1
+                      AND (NOT EXISTS (
+                          SELECT 1 FROM work_unit_repository selected
+                          WHERE selected.work_unit_id = unit.id
+                      ) OR EXISTS (
+                          SELECT 1 FROM work_unit_repository selected
+                          WHERE selected.work_unit_id = unit.id
+                            AND selected.repo_id = repository.repo_id
+                      ))
+                ), expected_count AS (
+                    SELECT COUNT(*) AS total FROM expected
+                )
+                SELECT EXISTS(
+                    SELECT 1 FROM expected_count
+                    WHERE total > 0
+                      AND total = (
+                          SELECT COUNT(*) FROM workspace_lease lease
+                          WHERE lease.task_id = ? AND lease.work_unit_id = ?
+                            AND lease.execution_id = ? AND lease.status = 'active'
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM expected
+                          WHERE scope_is_current != 1 OR NOT EXISTS (
+                              SELECT 1 FROM workspace_lease lease
+                              WHERE lease.project_id = expected.project_id
+                                AND lease.task_id = ? AND lease.work_unit_id = ?
+                                AND lease.workspace_id = expected.workspace_id
+                                AND lease.execution_id = ?
+                                AND lease.operation_idempotency_key = CASE
+                                    WHEN expected.workspace_group_id IS NULL THEN ?
+                                    ELSE ? || ':workspace:' || expected.repo_id
+                                END
+                                AND lease.repository_binding_id = expected.repo_id
+                                AND lease.base_ref = expected.base_ref
+                                AND lease.role = CASE WHEN EXISTS (
+                                    SELECT 1 FROM execution_task_role_authority authority
+                                    JOIN json_each(authority.capabilities_json) capability
+                                    WHERE authority.execution_id = ?
+                                      AND capability.type = 'text'
+                                      AND capability.value = 'formal_review'
+                                ) THEN 'reviewer' ELSE 'worker' END
+                                AND lease.assigned_principal_type = 'agent'
+                                AND lease.assigned_principal_id = ?
+                                AND lease.status = 'active'
+                                AND lease.expires_at > ?
+                          )
+                      )
+                )",
+                )
+                .bind(work_unit_id)
+                .bind(&execution.task_id)
+                .bind(&execution.task_id)
+                .bind(work_unit_id)
+                .bind(&execution.id)
+                .bind(&execution.task_id)
+                .bind(work_unit_id)
+                .bind(&execution.id)
+                .bind(&execution.id)
+                .bind(&execution.id)
+                .bind(&execution.id)
+                .bind(&actor_id)
+                .bind(crate::now_rfc3339())
+                .fetch_one(&mut *tx)
+                .await?;
+                if !lease_is_current {
+                    tx.commit().await?;
+                    return Ok(ProviderStartClaim::AuthorityLost);
+                }
             }
         }
 

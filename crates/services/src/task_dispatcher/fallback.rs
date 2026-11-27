@@ -1084,6 +1084,432 @@ fn blocking_metadata_matches(task: &db::Task, execution_id: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn multirepo_workspace_fallback_reuses_same_work_unit_group() {
+        use db::{
+            AgentRepo, CreateAgent, CreateProject, CreateRepo, CreateTask, CreateTaskRole,
+            CreateWorkUnitFallbackReceipt, CreateWorkUnitWorkspace, CreateWorkspace,
+            CreateWorkspaceGroup, ProjectRepo, RepoRepo, RoleMembershipRepo, TaskDispatchOperation,
+            TaskDispatchState, TaskLifecycleRepo, TaskLifecycleState, TaskRepo, TaskRoleRepo,
+            TransitionTaskDispatch, TransitionTaskLifecycle, User, UserRepo,
+            WorkUnitFallbackReceiptRepo, WorkUnitWorkspaceRepo, WorkspaceRepo, WorkspaceStatus,
+        };
+
+        let pool = db::create_sqlite_pool("sqlite::memory:")
+            .await
+            .expect("SQLite pool creates");
+        db::run_migrations(&pool).await.expect("migrations apply");
+        let db = db::SqliteDb::new(pool);
+        let now = db::now_rfc3339();
+        let owner_id = db::new_uuid_v4();
+        UserRepo::create_user(
+            &db,
+            &User {
+                id: owner_id.clone(),
+                email: format!("owner-{owner_id}@example.invalid"),
+                password_hash: "test-hash".to_owned(),
+                display_name: None,
+                is_admin: false,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("Project owner creates");
+        let project_id = db::new_uuid_v4();
+        ProjectRepo::create(
+            &db,
+            CreateProject {
+                id: project_id.clone(),
+                name: "Fallback WorkspaceGroup fixture".to_owned(),
+                settings: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: Some(owner_id.clone()),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("Project creates");
+        let repo_id = db::new_uuid_v4();
+        RepoRepo::create(
+            &db,
+            CreateRepo {
+                id: repo_id.clone(),
+                project_id: project_id.clone(),
+                name: "fallback-repo".to_owned(),
+                remote_url: "https://example.invalid/fallback.git".to_owned(),
+                local_path: None,
+                work_mode: db::WorkMode::DirectMerge,
+                default_branch: "main".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("Task repository creates");
+        let task_id = db::new_uuid_v4();
+        TaskRepo::create(
+            &db,
+            CreateTask {
+                id: task_id.clone(),
+                project_id: project_id.clone(),
+                repo_id: Some(repo_id.clone()),
+                repositories: Vec::new(),
+                parent_task_id: None,
+                title: "Fallback keeps its WorkspaceGroup".to_owned(),
+                description: None,
+                lifecycle_state: TaskLifecycleState::Active,
+                is_automation: false,
+                priority: 0,
+                subtask_order: None,
+                merge_config: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("Task creates");
+
+        let create_agent = |name: &str| CreateAgent {
+            id: db::new_uuid_v4(),
+            name: name.to_owned(),
+            description: None,
+            executor_type: "shell".to_owned(),
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "[]".to_owned(),
+            config_json: "{}".to_owned(),
+            credential_ref: None,
+            daemon_id: None,
+            max_concurrent_tasks: 1,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: db::AgentStatus::Idle,
+            last_heartbeat_at: None,
+            is_default: false,
+            paused: false,
+            owner_id: Some(owner_id.clone()),
+            visibility: "account".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        let origin = create_agent("Fallback origin");
+        let origin_agent_id = origin.id.clone();
+        AgentRepo::create(&db, origin)
+            .await
+            .expect("origin Agent creates");
+        let target = create_agent("Fallback target");
+        let target_agent_id = target.id.clone();
+        AgentRepo::create(&db, target)
+            .await
+            .expect("target Agent creates");
+        let coordinator = create_agent("Fallback coordinator");
+        let coordinator_agent_id = coordinator.id.clone();
+        AgentRepo::create(&db, coordinator)
+            .await
+            .expect("coordinator Agent creates");
+
+        let task_role_id = db::new_uuid_v4();
+        TaskRoleRepo::create_with_configuration(
+            &db,
+            CreateTaskRole {
+                id: task_role_id.clone(),
+                task_id: task_id.clone(),
+                role: "implementer".to_owned(),
+                coordination_mode: Some(db::CoordinationMode::Collaborative),
+                policy_json: "{}".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+            r#"{"schema_version":1,"display_label":null,"capabilities":[],"rework":null}"#,
+        )
+        .await
+        .expect("implementer TaskRole creates");
+        let coordinator_role_id = db::new_uuid_v4();
+        TaskRoleRepo::create(
+            &db,
+            CreateTaskRole {
+                id: coordinator_role_id.clone(),
+                task_id: task_id.clone(),
+                role: "coordinator".to_owned(),
+                coordination_mode: None,
+                policy_json: "{}".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("coordinator TaskRole creates");
+        for (task_role_id, agent_id) in [
+            (&task_role_id, &origin_agent_id),
+            (&task_role_id, &target_agent_id),
+            (&coordinator_role_id, &coordinator_agent_id),
+        ] {
+            RoleMembershipRepo::add(
+                &db,
+                db::CreateRoleMembership {
+                    id: db::new_uuid_v4(),
+                    task_role_id: task_role_id.clone(),
+                    actor_kind: db::ActorKind::Agent,
+                    actor_id: agent_id.clone(),
+                    status: db::RoleMembershipStatus::Active,
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+            )
+            .await
+            .expect("Agent joins its exact TaskRole");
+        }
+
+        let work_unit_id = db::new_uuid_v4();
+        sqlx::query(
+            "INSERT INTO work_unit (
+                id, task_id, title, scope, status, role, assigned_actor_kind,
+                assigned_actor_id, requires_integration, created_by_kind, created_by_id,
+                version, created_at, updated_at
+             ) VALUES (?, ?, 'implement', 'src/**', 'open', 'implementer', 'agent', ?,
+                       1, 'human', ?, 1, ?, ?)",
+        )
+        .bind(&work_unit_id)
+        .bind(&task_id)
+        .bind(&origin_agent_id)
+        .bind(&owner_id)
+        .bind(&now)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .expect("repository WorkUnit creates");
+        let group = WorkspaceRepo::create_group_for_work_unit(
+            &db,
+            CreateWorkspaceGroup {
+                id: db::new_uuid_v4(),
+                task_id: task_id.clone(),
+                work_unit_id: work_unit_id.clone(),
+                root_path: format!("/tmp/work-unit-groups/{task_id}/{work_unit_id}"),
+                created_at: now.clone(),
+            },
+        )
+        .await
+        .expect("exact WorkUnit WorkspaceGroup creates");
+        let workspace_id = db::new_uuid_v4();
+        let branch = workspace::work_unit_branch_name(&task_id, &work_unit_id, &workspace_id)
+            .expect("exact WorkUnit branch derives");
+        let worktree_path = format!("{}/{repo_id}", group.root_path);
+        let workspace = WorkUnitWorkspaceRepo::create_for_work_unit(
+            &db,
+            CreateWorkUnitWorkspace {
+                workspace: CreateWorkspace {
+                    id: workspace_id.clone(),
+                    task_id: task_id.clone(),
+                    repo_id: repo_id.clone(),
+                    worktree_path,
+                    branch,
+                    status: WorkspaceStatus::Ready,
+                    before_sha: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+                work_unit_id: work_unit_id.clone(),
+                workspace_group_id: group.id.clone(),
+            },
+        )
+        .await
+        .expect("exact WorkUnit repository Workspace creates");
+
+        let origin_execution_id = db::new_uuid_v4();
+        sqlx::query("DROP TRIGGER work_unit_execution_admission_guard")
+            .execute(db.pool())
+            .await
+            .expect("fixture skips only live Workspace admission checks");
+        sqlx::query(
+            "INSERT INTO execution (
+                id, task_id, agent_id, actor_kind, actor_id, role, status,
+                work_unit_id, work_unit_version, created_at, updated_at
+             ) VALUES (?, ?, ?, 'agent', ?, 'implementer', 'failed', ?, 1, ?, ?)",
+        )
+        .bind(&origin_execution_id)
+        .bind(&task_id)
+        .bind(&origin_agent_id)
+        .bind(&origin_agent_id)
+        .bind(&work_unit_id)
+        .bind(&now)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .expect("exact failed origin Execution creates");
+        let envelope = json!({
+            "schema_version": 2,
+            "fallback_agents": [{
+                "task_role_id": task_role_id,
+                "agent_id": target_agent_id,
+                "cost_class": "economy",
+                "max_wait_seconds": 30
+            }]
+        });
+        let envelope_json = envelope.to_string();
+        let envelope_digest = sha256_hex(envelope_json.as_bytes());
+        sqlx::query(
+            "UPDATE task_coordination SET mode = 'prepare_and_execute',
+                coordinator_task_role_id = ?, coordinator_actor_kind = 'agent',
+                coordinator_actor_id = ?, authorization_version = 1,
+                envelope_json = ?, envelope_digest = ?, requested_by = ?, team_stale = 0
+             WHERE task_id = ?",
+        )
+        .bind(&coordinator_role_id)
+        .bind(&coordinator_agent_id)
+        .bind(&envelope_json)
+        .bind(&envelope_digest)
+        .bind(&owner_id)
+        .bind(&task_id)
+        .execute(db.pool())
+        .await
+        .expect("current fallback authorization installs");
+
+        let task = TaskRepo::get_by_id(&db, &task_id, false)
+            .await
+            .expect("Task loads")
+            .expect("Task exists");
+        let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&db, &task_id)
+            .await
+            .expect("TaskLifecycle loads")
+            .expect("TaskLifecycle exists");
+        let lifecycle_now = db::now_rfc3339();
+        TaskLifecycleRepo::transition_task_lifecycle(
+            &db,
+            TransitionTaskLifecycle {
+                id: db::new_uuid_v4(),
+                task_id: task_id.clone(),
+                expected_task_version: task.version,
+                expected_lifecycle_version: lifecycle.version,
+                expected_state: TaskLifecycleState::Active,
+                to_state: TaskLifecycleState::Blocked,
+                cause_kind: "execution".to_owned(),
+                cause_ref: Some(origin_execution_id.clone()),
+                reason_kind: Some("executor_unavailable".to_owned()),
+                reason_ref: Some(origin_execution_id.clone()),
+                gate_evaluation_id: None,
+                idempotency_key: "multirepo-fallback-block".to_owned(),
+                updated_at: lifecycle_now.clone(),
+                event: db::CreateDomainEvent {
+                    id: db::new_uuid_v4(),
+                    event_type: "task.lifecycle_changed".to_owned(),
+                    entity_type: "task".to_owned(),
+                    entity_id: task_id.clone(),
+                    actor_type: "system".to_owned(),
+                    actor_id: None,
+                    scope_type: "task".to_owned(),
+                    scope_id: task_id.clone(),
+                    correlation_id: "multirepo-fallback-block".to_owned(),
+                    causation_id: Some(origin_execution_id.clone()),
+                    causation_depth: 1,
+                    dedupe_key: Some(format!("task-lifecycle:{task_id}:multirepo-fallback-block")),
+                    payload_json: json!({"task_id":task_id,"to_state":"blocked"}).to_string(),
+                    created_at: lifecycle_now.clone(),
+                },
+            },
+        )
+        .await
+        .expect("origin Execution owns the exact fallback block");
+        TaskLifecycleRepo::transition_task_dispatch(
+            &db,
+            TransitionTaskDispatch {
+                task_id: task_id.clone(),
+                operation: TaskDispatchOperation::Launch,
+                state: TaskDispatchState::Running,
+                expected_intent_version: 1,
+                requested_by_kind: "system".to_owned(),
+                requested_by_id: None,
+                reason: None,
+                idempotency_key: "multirepo-fallback-launch".to_owned(),
+                request_digest: sha256_hex(b"multirepo-fallback-launch"),
+                receipt_id: db::new_uuid_v4(),
+                created_at: lifecycle_now,
+            },
+        )
+        .await
+        .expect("Task dispatch resumes for the exact Task");
+
+        let receipt = CreateWorkUnitFallbackReceipt {
+            id: db::new_uuid_v4(),
+            task_id: task_id.clone(),
+            work_unit_id: work_unit_id.clone(),
+            work_unit_version_before: 1,
+            work_unit_version_after: 2,
+            origin_execution_id: origin_execution_id.clone(),
+            failure_class: "executor_unavailable".to_owned(),
+            route_attempts_digest: sha256_hex(b"exhausted route"),
+            task_role_id,
+            from_actor_kind: db::ActorKind::Agent,
+            from_actor_id: origin_agent_id,
+            to_actor_kind: db::ActorKind::Agent,
+            to_actor_id: target_agent_id.clone(),
+            chain_index: 0,
+            cost_class: db::CostClass::Economy,
+            authorization_version: 1,
+            envelope_digest,
+            new_execution_id: None,
+            created_at: db::now_rfc3339(),
+        };
+        let (_, _) = WorkUnitFallbackReceiptRepo::allocate_work_unit_with_fallback_receipt(
+            &db,
+            db::AllocateWorkUnit {
+                id: work_unit_id.clone(),
+                expected_version: 1,
+                role: "implementer".to_owned(),
+                assigned_actor: Some(db::ActorRef::Agent(target_agent_id.clone())),
+                updated_at: db::now_rfc3339(),
+            },
+            db::CreateDomainEvent {
+                id: db::new_uuid_v4(),
+                event_type: "work_unit.allocation_changed".to_owned(),
+                entity_type: "work_unit".to_owned(),
+                entity_id: work_unit_id.clone(),
+                actor_type: "system".to_owned(),
+                actor_id: None,
+                scope_type: "task".to_owned(),
+                scope_id: task_id.clone(),
+                correlation_id: "multirepo-fallback-reallocation".to_owned(),
+                causation_id: Some(origin_execution_id),
+                causation_depth: 1,
+                dedupe_key: Some("multirepo-fallback-reallocation".to_owned()),
+                payload_json:
+                    json!({"work_unit_id":work_unit_id,"fallback_agent_id":target_agent_id})
+                        .to_string(),
+                created_at: db::now_rfc3339(),
+            },
+            receipt,
+        )
+        .await
+        .expect("fallback atomically reallocates the existing WorkUnit");
+        let replayed_group = WorkspaceRepo::get_group_by_work_unit_id(&db, &work_unit_id)
+            .await
+            .expect("WorkspaceGroup lookup succeeds")
+            .expect("fallback keeps the existing WorkspaceGroup");
+        assert_eq!(replayed_group.id, group.id);
+        assert_eq!(replayed_group.root_path, group.root_path);
+        let replayed_workspaces = WorkUnitWorkspaceRepo::list_by_work_unit_id(&db, &work_unit_id)
+            .await
+            .expect("reallocated WorkUnit repository workspaces load");
+        assert_eq!(replayed_workspaces.len(), 1);
+        assert_eq!(replayed_workspaces[0].id, workspace.id);
+        assert_eq!(
+            replayed_workspaces[0].worktree_path,
+            workspace.worktree_path
+        );
+        let work_unit = db::WorkUnitRepo::get_by_id(&db, &work_unit_id)
+            .await
+            .expect("WorkUnit lookup succeeds")
+            .expect("reallocated WorkUnit exists");
+        assert_eq!(work_unit.id, group.work_unit_id);
+        assert_eq!(
+            work_unit.assigned_actor,
+            Some(db::ActorRef::Agent(target_agent_id))
+        );
+    }
+
     fn route_attempt(outcome: &str) -> Value {
         json!({"candidate_key": "candidate", "outcome": outcome})
     }

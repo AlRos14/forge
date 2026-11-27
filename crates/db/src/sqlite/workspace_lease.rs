@@ -249,13 +249,32 @@ impl WorkspaceLeaseRepo for SqliteDb {
         .transpose()
     }
 
-    async fn get_active_for_work_unit(&self, work_unit_id: &str) -> Result<Option<WorkspaceLease>> {
+    async fn list_active_for_work_unit(&self, work_unit_id: &str) -> Result<Vec<WorkspaceLease>> {
         sqlx::query(&format!(
             "SELECT {WORKSPACE_LEASE_COLUMNS} FROM workspace_lease
              WHERE work_unit_id = ? AND status = 'active'
-             ORDER BY issued_at DESC, id DESC LIMIT 1"
+             ORDER BY workspace_id, issued_at DESC, id DESC"
         ))
         .bind(work_unit_id)
+        .fetch_all(self.pool())
+        .await?
+        .into_iter()
+        .map(map_workspace_lease)
+        .collect()
+    }
+
+    async fn get_active_for_execution_workspace(
+        &self,
+        execution_id: &str,
+        workspace_id: &str,
+    ) -> Result<Option<WorkspaceLease>> {
+        sqlx::query(&format!(
+            "SELECT {WORKSPACE_LEASE_COLUMNS} FROM workspace_lease
+             WHERE execution_id = ? AND workspace_id = ? AND status = 'active'
+             ORDER BY issued_at DESC, id DESC LIMIT 1"
+        ))
+        .bind(execution_id)
+        .bind(workspace_id)
         .fetch_optional(self.pool())
         .await?
         .map(map_workspace_lease)

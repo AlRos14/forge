@@ -47,15 +47,9 @@ pub async fn create_repo(
             "pr_provider must not be empty",
         ));
     }
-    let project = ProjectRepo::get_by_id(&*state.db, &project_id)
+    ProjectRepo::get_by_id(&*state.db, &project_id)
         .await?
         .ok_or_else(|| ApiError::not_found("project", project_id.clone()))?;
-    if project.primary_repo_id.is_some() {
-        return Err(ApiError::conflict_with_code(
-            "project_already_has_primary_repo",
-            format!("project {project_id} already has a primary repo"),
-        ));
-    }
     let local_path = normalize_optional_local_path(request.local_path)?;
     let name = request
         .name
@@ -107,7 +101,7 @@ pub async fn create_repo(
             updated_at: now.clone(),
         }
     });
-    let repo = RepoRepo::create_primary_with_pr_provider_config(
+    let repo = RepoRepo::create_with_pr_provider_config(
         &*state.db,
         CreateRepo {
             id: repo_id,

@@ -7,7 +7,7 @@ use db::{
     ExecutionRepo, Handoff, HandoffIntent, HandoffStatus, Page, PageRequest, Project,
     ProjectMemberRepo, ProjectRepo, Proposal, ProposalStatus, ProposalTarget, ProposalTargetKind,
     RoleMembershipRepo, RoleMembershipStatus, SqliteDb, Task, TaskRepo, TaskRoleRepo, UserRepo,
-    WorkUnitRepo, WorkspaceRepo,
+    WorkUnitRepo, WorkUnitWorkspaceRepo, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use events::EventBus;
 use sha2::{Digest, Sha256};
@@ -100,6 +100,23 @@ pub struct CollaborationService {
 
 type ReviewReportInputs = (Vec<String>, Vec<String>, Option<String>, Option<i64>);
 
+fn review_subject_repositories_json(
+    repositories: &[db::WorkUnitReviewSubjectRepository],
+) -> serde_json::Value {
+    serde_json::json!(repositories
+        .iter()
+        .map(|repository| serde_json::json!({
+            "repo_id": repository.repo_id,
+            "reviewed_work_unit_version": repository.reviewed_work_unit_version,
+            "result_execution_id": repository.result_execution_id,
+            "result_artifact_id": repository.result_artifact_id,
+            "result_commit_sha": repository.result_commit_sha,
+            "result_workspace_id": repository.result_workspace_id,
+            "workspace_snapshot_digest": repository.workspace_snapshot_digest,
+        }))
+        .collect::<Vec<_>>())
+}
+
 impl CollaborationService {
     pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> Self {
         Self {
@@ -133,6 +150,67 @@ impl CollaborationService {
                 return Err(invalid(
                     "workspace-free Review Execution has a Workspace subject",
                 ));
+            }
+            let Some(review_work_unit_id) = execution.work_unit_id.as_deref() else {
+                return Ok(());
+            };
+            let Some(subject) =
+                crate::task_rework::get_review_subject(&self.db, review_work_unit_id).await?
+            else {
+                return Ok(());
+            };
+            if subject.repositories.is_empty() {
+                let workspaces =
+                    WorkUnitWorkspaceRepo::list_by_work_unit_id(&*self.db, review_work_unit_id)
+                        .await?;
+                if workspaces.is_empty() {
+                    return Ok(());
+                }
+                return Err(invalid(
+                    "workspace-free Review Execution has Workspaces outside its frozen repository subject",
+                ));
+            }
+            if !crate::task_rework::review_subject_ready(&self.db, review_work_unit_id).await? {
+                return Err(invalid(
+                    "workspace-free Review Execution has no exact frozen repository result",
+                ));
+            }
+            let workspaces =
+                WorkUnitWorkspaceRepo::list_by_work_unit_id(&*self.db, review_work_unit_id).await?;
+            let active_leases =
+                WorkspaceLeaseRepo::list_active_for_work_unit(&*self.db, review_work_unit_id)
+                    .await?;
+            if workspaces.len() != subject.repositories.len() || !active_leases.is_empty() {
+                return Err(invalid(
+                    "workspace-free Review group is not exact or has a writable lease",
+                ));
+            }
+            for repository in &subject.repositories {
+                let Some(workspace) = workspaces.iter().find(|workspace| {
+                    workspace.repo_id == repository.repo_id
+                        && workspace.task_id == execution.task_id
+                        && workspace.status == WorkspaceStatus::Ready
+                }) else {
+                    return Err(invalid(
+                        "Review group contains a missing or unexpected repository Workspace",
+                    ));
+                };
+                let expected_commit = repository
+                    .result_commit_sha
+                    .as_deref()
+                    .ok_or_else(|| invalid("Review group repository has no exact result commit"))?;
+                let head = crate::validation_service::read_head(&workspace.worktree_path).await?;
+                let expected_digest = repository
+                    .workspace_snapshot_digest
+                    .as_deref()
+                    .ok_or_else(|| invalid("Review group repository has no exact snapshot"))?;
+                let snapshot =
+                    crate::ValidationService::snapshot_digest(&workspace.worktree_path).await?;
+                if head != expected_commit || snapshot != expected_digest {
+                    return Err(invalid(
+                        "Review group repository no longer matches its frozen result",
+                    ));
+                }
             }
             return Ok(());
         };
@@ -319,6 +397,13 @@ impl CollaborationService {
                 "workspace_id": subject.result_workspace_id,
                 "workspace_snapshot_digest": subject.workspace_snapshot_digest,
             });
+            if value
+                .pointer("/subject/reviewed_result/repository_results")
+                .is_some()
+            {
+                expected_subject["reviewed_result"]["repository_results"] =
+                    review_subject_repositories_json(&subject.repositories);
+            }
         } else if let Some(legacy_result) = value.pointer("/subject/reviewed_result") {
             expected_subject["reviewed_result"] = legacy_result.clone();
         }
@@ -1012,6 +1097,7 @@ impl CollaborationService {
                 "commit_sha": reviewed_result.result_commit_sha,
                 "workspace_id": reviewed_result.result_workspace_id,
                 "workspace_snapshot_digest": reviewed_result.workspace_snapshot_digest,
+                "repository_results": review_subject_repositories_json(&reviewed_result.repositories),
             });
         }
 

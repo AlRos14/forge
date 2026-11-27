@@ -5,9 +5,9 @@ use db::{
     CreateAgent, CreateExecution, CreateProject, CreateProjectMember, CreateRepo,
     CreateRoleMembership, CreateTask, CreateTaskRole, CreateWorkspace, DaemonRepo, DaemonStatus,
     ExecutionRepo, ExecutionStatus, ProjectMemberRepo, ProjectRepo, RepoRepo, RoleMembershipRepo,
-    RoleMembershipStatus, SqliteDb, Task, TaskRepo, TaskRoleRepo, UpdateDaemonReport,
-    UpdateProject, UpdateTask, UpsertDaemon, User, UserRepo, ValidationRunRepo, WorkspaceRepo,
-    WorkspaceStatus,
+    RoleMembershipStatus, SqliteDb, Task, TaskRepo, TaskRepositoryRole, TaskRepositoryWrite,
+    TaskRoleRepo, UpdateDaemonReport, UpdateProject, UpdateTask, UpsertDaemon, User, UserRepo,
+    ValidationRunRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use events::EventBus;
 use serde_json::{json, Value};
@@ -858,6 +858,7 @@ fn tools_list_returns_descriptors() {
             "forge_update_project",
             "forge_update_project_hooks",
             "forge_update_task",
+            "forge_update_task_repositories",
             "forge_update_task_role",
             "forge_update_work_unit",
             "forge_list_validation_checks",
@@ -891,6 +892,74 @@ fn tools_list_returns_descriptors() {
 }
 
 #[test]
+fn multirepo_task_mcp_task_and_work_unit_schemas() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let result = dispatch(&state, "tools/list", json!({}))
+            .await
+            .expect("tools/list succeeds");
+        let tools = result["tools"].as_array().expect("tool list");
+        let schema = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("{name} descriptor exists"))["inputSchema"]
+                .clone()
+        };
+
+        let create_task = schema("forge_create_task");
+        assert_eq!(create_task["additionalProperties"], false);
+        let repositories = &create_task["properties"]["repositories"];
+        assert_eq!(repositories["items"]["additionalProperties"], false);
+        assert_eq!(
+            repositories["items"]["properties"]["role"]["enum"],
+            json!(["primary", "affected", "context"])
+        );
+
+        let create_work_unit = schema("forge_create_work_unit");
+        assert_eq!(create_work_unit["additionalProperties"], false);
+        assert_eq!(
+            create_work_unit["properties"]["repository_ids"]["items"]["type"],
+            "string"
+        );
+
+        let get_coordination = tools
+            .iter()
+            .find(|tool| tool["name"] == "forge_get_task_coordination")
+            .expect("coordination tool descriptor exists");
+        let coordination_description = get_coordination["description"]
+            .as_str()
+            .expect("coordination tool description");
+        assert!(coordination_description.contains("repository_ids"));
+        assert!(coordination_description.contains("context repositories are rejected"));
+        assert!(coordination_description.contains("ids, names, and roles"));
+
+        let update_repositories = schema("forge_update_task_repositories");
+        assert_eq!(update_repositories["additionalProperties"], false);
+        assert_eq!(
+            update_repositories["properties"]["repositories"]["items"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            update_repositories["required"],
+            json!(["task_id", "expected_version", "repositories"])
+        );
+
+        let update_project = schema("forge_update_project");
+        assert_eq!(update_project["properties"]["version"]["type"], "integer");
+        assert_eq!(
+            update_project["properties"]["primary_repo_id"]["oneOf"],
+            json!([{"type":"string"}, {"type":"null"}])
+        );
+        assert!(update_project["required"]
+            .as_array()
+            .expect("required array")
+            .iter()
+            .any(|field| field == "version"));
+    });
+}
+
+#[test]
 fn mcp_pr_feedback_tools_return_empty_task_scoped_pages() {
     run_async(async {
         let state = sqlite_state().await;
@@ -910,6 +979,59 @@ fn mcp_pr_feedback_tools_return_empty_task_scoped_pages() {
             assert_eq!(result["items"].as_array().map(Vec::len), Some(0));
             assert!(result["next_cursor"].is_null());
         }
+    });
+}
+
+#[test]
+fn multirepo_pr_mcp_task_projection_exposes_exact_repository_ids() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let (project_id, primary_repo_id) = seed_project_repo(&state).await;
+        let task = seed_task_in_project(&state, project_id.clone()).await;
+        let now = now_rfc3339();
+        let affected = RepoRepo::create(
+            &*state.db,
+            CreateRepo {
+                id: new_uuid_v4(),
+                project_id,
+                name: "api".to_owned(),
+                local_path: None,
+                remote_url: "https://example.com/api.git".to_owned(),
+                work_mode: db::WorkMode::PullRequest,
+                default_branch: "main".to_owned(),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("affected repository creates");
+        state
+            .task_service
+            .replace_task_repositories(
+                &task.id,
+                task.version,
+                vec![
+                    TaskRepositoryWrite {
+                        repo_id: primary_repo_id.clone(),
+                        role: TaskRepositoryRole::Primary,
+                    },
+                    TaskRepositoryWrite {
+                        repo_id: affected.id.clone(),
+                        role: TaskRepositoryRole::Affected,
+                    },
+                ],
+            )
+            .await
+            .expect("Task repository scope updates");
+
+        let result = call_tool(&state, "forge_get_task", json!({"task_id":task.id})).await;
+        let repositories = result["repositories"]
+            .as_array()
+            .expect("MCP Task projection includes repositories");
+        assert_eq!(repositories.len(), 2);
+        assert_eq!(repositories[0]["repo_id"], primary_repo_id);
+        assert_eq!(repositories[1]["repo_id"], affected.id);
+        assert_eq!(repositories[1]["role"], "affected");
     });
 }
 
@@ -1779,11 +1901,15 @@ fn user_scoped_mcp_isolates_projects_and_derived_resources() {
         );
         assert_eq!(private_agent_b["config_json"]["safe"], "visible");
 
+        let project_a_record = ProjectRepo::get_by_id(&*state.db, &project_a)
+            .await
+            .unwrap()
+            .unwrap();
         let updated_project = call_tool_as(
             &state,
             &user_a,
             "forge_update_project",
-            json!({ "project_id": project_a, "name": "Project A updated" }),
+            json!({ "project_id": project_a, "version": project_a_record.version, "name": "Project A updated" }),
         )
         .await;
         assert_eq!(updated_project["name"], "Project A updated");
@@ -1808,11 +1934,15 @@ fn user_scoped_mcp_isolates_projects_and_derived_resources() {
         )
         .await;
         assert_eq!(error.code, -32001);
+        let project_b_record = ProjectRepo::get_by_id(&*state.db, &project_b)
+            .await
+            .unwrap()
+            .unwrap();
         let error = call_tool_error_as(
             &state,
             &user_a,
             "forge_update_project",
-            json!({ "project_id": project_b, "name": "cross-user write" }),
+            json!({ "project_id": project_b, "version": project_b_record.version, "name": "cross-user write" }),
         )
         .await;
         assert_eq!(error.code, -32001);
@@ -2137,11 +2267,15 @@ fn mcp_project_visibility_does_not_grant_mutation_authority() {
         .await;
         assert_eq!(task_read["id"], owner_task["id"]);
 
+        let project_a_record = ProjectRepo::get_by_id(&*state.db, &project_a)
+            .await
+            .unwrap()
+            .unwrap();
         let updated = call_tool_as(
             &state,
             &admin,
             "forge_update_project",
-            json!({"project_id":project_a,"name":"Admin Project update"}),
+            json!({"project_id":project_a,"version":project_a_record.version,"name":"Admin Project update"}),
         )
         .await;
         assert_eq!(updated["name"], "Admin Project update");
@@ -2159,12 +2293,12 @@ fn mcp_project_visibility_does_not_grant_mutation_authority() {
             (
                 &member,
                 "forge_update_project",
-                json!({"project_id":project_a,"name":"Member Project update"}),
+                json!({"project_id":project_a,"version":updated["version"],"name":"Member Project update"}),
             ),
             (
                 &viewer,
                 "forge_update_project",
-                json!({"project_id":project_a,"name":"Viewer Project update"}),
+                json!({"project_id":project_a,"version":updated["version"],"name":"Viewer Project update"}),
             ),
         ] {
             let error = call_tool_error_as(&state, context, name, arguments).await;
@@ -2268,7 +2402,7 @@ fn mcp_project_visibility_does_not_grant_mutation_authority() {
             &state,
             &outsider,
             "forge_update_project",
-            json!({"project_id":ownerless.id,"name":"World writable"}),
+            json!({"project_id":ownerless.id,"version":ownerless.version,"name":"World writable"}),
         )
         .await;
         assert_eq!(ownerless_update.code, -32003);
@@ -2394,6 +2528,7 @@ fn forge_update_task_rejects_cross_repo_parent_without_partial_write() {
                 lifecycle_state: db::TaskLifecycleState::Ready,
                 is_automation: false,
                 priority: 0,
+                repositories: Vec::new(),
                 merge_config: None,
                 created_at: now.clone(),
                 updated_at: now,
@@ -2625,11 +2760,16 @@ fn forge_update_project_updates_mutable_fields() {
     run_async(async {
         let state = sqlite_state().await;
         let (project_id, _) = seed_project_repo(&state).await;
+        let project = ProjectRepo::get_by_id(&*state.db, &project_id)
+            .await
+            .unwrap()
+            .unwrap();
         let result = call_tool(
             &state,
             "forge_update_project",
             json!({
                 "project_id": project_id,
+                "version": project.version,
                 "name": "Updated Forge",
                 "paused": true
             }),
@@ -2789,6 +2929,7 @@ fn forge_create_sub_tasks_nested_rejected() {
                 lifecycle_state: db::TaskLifecycleState::Ready,
                 is_automation: false,
                 priority: 0,
+                repositories: Vec::new(),
                 subtask_order: Some(0),
                 merge_config: None,
                 created_at: now.clone(),
@@ -3541,5 +3682,263 @@ fn mcp_human_decision_list_rejects_unknown_state_and_has_no_answer_tool() {
         )
         .await;
         assert!(error.code == -32601 || error.code == -32602);
+    });
+}
+
+#[test]
+fn multirepo_result_reader_tools_expose_repo_results() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let task = seed_task(&state).await;
+        let primary_repo_id = task
+            .repo_id
+            .clone()
+            .expect("fixture Task has a primary Repo");
+        let now = now_rfc3339();
+        let affected = RepoRepo::create(
+            &*state.db,
+            CreateRepo {
+                id: new_uuid_v4(),
+                project_id: task.project_id.clone(),
+                name: "affected".to_owned(),
+                local_path: None,
+                remote_url: "https://example.com/affected.git".to_owned(),
+                work_mode: db::WorkMode::DirectMerge,
+                default_branch: "main".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("affected Repo creates");
+        state
+            .task_service
+            .replace_task_repositories(
+                &task.id,
+                task.version,
+                vec![
+                    db::TaskRepositoryWrite {
+                        repo_id: primary_repo_id.clone(),
+                        role: db::TaskRepositoryRole::Primary,
+                    },
+                    db::TaskRepositoryWrite {
+                        repo_id: affected.id.clone(),
+                        role: db::TaskRepositoryRole::Affected,
+                    },
+                ],
+            )
+            .await
+            .expect("Task receives the affected Repo");
+        if TaskRoleRepo::get_by_task_and_role(&*state.db, &task.id, "implementer")
+            .await
+            .expect("implementer TaskRole lookup succeeds")
+            .is_none()
+        {
+            TaskRoleRepo::create_with_configuration(
+                &*state.db,
+                CreateTaskRole {
+                    id: new_uuid_v4(),
+                    task_id: task.id.clone(),
+                    role: "implementer".to_owned(),
+                    coordination_mode: Some(db::CoordinationMode::Collaborative),
+                    policy_json: "{}".to_owned(),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+                r#"{"schema_version":1,"display_label":null,"capabilities":[],"rework":null}"#,
+            )
+            .await
+            .expect("implementer TaskRole creates");
+        }
+        let work_unit_id = new_uuid_v4();
+        db::WorkUnitRepo::create(
+            &*state.db,
+            db::CreateWorkUnit {
+                id: work_unit_id.clone(),
+                task_id: task.id.clone(),
+                parent_work_unit_id: None,
+                title: "Read repository result rows".to_owned(),
+                scope: "Expose exact results for both writable repositories".to_owned(),
+                execution_instructions: None,
+                role: "implementer".to_owned(),
+                assigned_actor: None,
+                requires_integration: true,
+                provenance: None,
+                artifact_input_ids: Vec::new(),
+                repository_ids: Vec::new(),
+                review_approval_gate_id: None,
+                review_approval_line_id: None,
+                created_by: db::ActorRef::Human("test-user".to_owned()),
+                created_at: now.clone(),
+            },
+            db::CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "work_unit.created".to_owned(),
+                entity_type: "work_unit".to_owned(),
+                entity_id: work_unit_id.clone(),
+                actor_type: "human".to_owned(),
+                actor_id: Some("test-user".to_owned()),
+                scope_type: "task".to_owned(),
+                scope_id: task.id.clone(),
+                correlation_id: work_unit_id.clone(),
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: Some(format!("work-unit-created:{work_unit_id}")),
+                payload_json: json!({
+                    "work_unit_id": work_unit_id,
+                    "task_id": task.id,
+                })
+                .to_string(),
+                created_at: now.clone(),
+            },
+        )
+        .await
+        .expect("repository WorkUnit creates");
+        let group_id = new_uuid_v4();
+        WorkspaceRepo::create_group_for_work_unit(
+            &*state.db,
+            db::CreateWorkspaceGroup {
+                id: group_id.clone(),
+                task_id: task.id.clone(),
+                work_unit_id: work_unit_id.clone(),
+                root_path: format!("/tmp/forge-mcp-group-{group_id}"),
+                created_at: now.clone(),
+            },
+        )
+        .await
+        .expect("WorkUnit WorkspaceGroup creates");
+        let mut workspaces = Vec::new();
+        for (repo_id, index) in [(primary_repo_id.clone(), 1), (affected.id.clone(), 2)] {
+            let workspace_id = new_uuid_v4();
+            let workspace = db::WorkUnitWorkspaceRepo::create_for_work_unit(
+                &*state.db,
+                db::CreateWorkUnitWorkspace {
+                    workspace: CreateWorkspace {
+                        id: workspace_id,
+                        task_id: task.id.clone(),
+                        repo_id: repo_id.clone(),
+                        worktree_path: format!("/tmp/forge-mcp-{group_id}-{repo_id}"),
+                        branch: format!("agent/{}-{work_unit_id}", task.id),
+                        status: WorkspaceStatus::Ready,
+                        before_sha: Some(format!("{index:040x}")),
+                        created_at: now.clone(),
+                        updated_at: now.clone(),
+                    },
+                    work_unit_id: work_unit_id.clone(),
+                    workspace_group_id: group_id.clone(),
+                },
+            )
+            .await
+            .expect("WorkUnit Workspace creates");
+            workspaces.push((repo_id, index, workspace.id));
+        }
+        let execution_id = new_uuid_v4();
+        ExecutionRepo::create(
+            &*state.db,
+            CreateExecution {
+                id: execution_id.clone(),
+                task_id: task.id.clone(),
+                agent_id: None,
+                actor_ref: None,
+                harness_session_id: None,
+                role: "implementer".to_owned(),
+                status: ExecutionStatus::Completed,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                parent_execution_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: None,
+                workspace_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("implementer Execution creates");
+        let (primary_index, primary_workspace) = workspaces
+            .iter()
+            .find(|(repo_id, _, _)| repo_id == &primary_repo_id)
+            .map(|(_, index, workspace_id)| (*index, workspace_id.clone()))
+            .expect("primary WorkUnit Workspace exists");
+        sqlx::query(
+            "UPDATE execution
+             SET work_unit_id = ?, work_unit_version = 1, workspace_id = ?,
+                 before_sha = ?, after_sha = ?, updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(&work_unit_id)
+        .bind(&primary_workspace)
+        .bind(format!("{primary_index:040x}"))
+        .bind(format!("{:040x}", primary_index + 10))
+        .bind(&now)
+        .bind(&execution_id)
+        .execute(state.db.pool())
+        .await
+        .expect("Execution binds to its exact WorkUnit workspace group");
+        let results = workspaces
+            .iter()
+            .map(
+                |(repo_id, index, workspace_id)| db::ExecutionRepositoryResult {
+                    execution_id: execution_id.clone(),
+                    task_id: task.id.clone(),
+                    repo_id: repo_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                    before_sha: Some(format!("{index:040x}")),
+                    after_sha: Some(format!("{:040x}", *index + 10)),
+                    snapshot_digest: (repo_id != &primary_repo_id).then(|| "a".repeat(64)),
+                    created_at: now.clone(),
+                },
+            )
+            .collect::<Vec<_>>();
+        ExecutionRepo::record_repository_results(&*state.db, &execution_id, &results)
+            .await
+            .expect("Execution repository results record");
+
+        let page = call_tool(&state, "forge_list_executions", json!({"task_id":task.id})).await;
+        let execution = &page["items"][0];
+        let repository_results = execution["repository_results"]
+            .as_array()
+            .expect("MCP Execution includes repository results");
+        assert_eq!(repository_results.len(), 2);
+        assert!(repository_results
+            .iter()
+            .any(|result| result["repo_id"] == primary_repo_id));
+        assert!(repository_results
+            .iter()
+            .any(|result| result["repo_id"] == affected.id));
+        assert!(repository_results
+            .iter()
+            .all(|result| result.get("worktree_path").is_none()));
+
+        let public_task = call_tool(&state, "forge_get_task", json!({"task_id":task.id})).await;
+        let repositories = public_task["repositories"]
+            .as_array()
+            .expect("MCP Task includes per-repository state");
+        assert!(repositories
+            .iter()
+            .any(|repository| repository["repo_id"] == primary_repo_id));
+        assert!(repositories
+            .iter()
+            .any(|repository| repository["repo_id"] == affected.id));
+        assert_eq!(public_task["repository_set_revision"], 2);
+        assert!(public_task["repository_merge_batches"].as_array().is_some());
+
+        let public_work_unit = call_tool(
+            &state,
+            "forge_get_work_unit",
+            json!({"work_unit_id":work_unit_id}),
+        )
+        .await;
+        assert!(public_work_unit["integrations"]
+            .as_array()
+            .is_some_and(|integrations| integrations.is_empty()));
     });
 }

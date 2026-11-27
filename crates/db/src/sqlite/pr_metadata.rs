@@ -1,27 +1,61 @@
 use super::*;
 
+async fn pr_metadata_has_repo_id(tx: &mut Transaction<'_, Sqlite>) -> Result<bool> {
+    let rows = sqlx::query("PRAGMA table_info(pr_metadata)")
+        .fetch_all(&mut **tx)
+        .await?;
+    for row in rows {
+        if row.try_get::<String, _>("name")? == "repo_id" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(super) async fn insert_pr_metadata_in_tx(
     tx: &mut Transaction<'_, Sqlite>,
     input: &CreatePrMetadata,
 ) -> Result<()> {
-    sqlx::query("INSERT INTO pr_metadata (id, task_id, provider_type, provider_pr_id, pr_url, source_branch, target_branch, pr_state, merge_status, task_merge_operation_id, publish_operation_id, last_synced_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-        .bind(&input.id)
-        .bind(&input.task_id)
-        .bind(&input.provider_type)
-        .bind(&input.provider_pr_id)
-        .bind(&input.pr_url)
-        .bind(&input.source_branch)
-        .bind(&input.target_branch)
-        .bind(&input.pr_state)
-        .bind(&input.merge_status)
-        .bind(&input.task_merge_operation_id)
-        .bind(&input.publish_operation_id)
-        .bind(&input.last_synced_at)
-        .bind(&input.created_at)
-        .bind(&input.updated_at)
-        .execute(&mut **tx)
-        .await
-        .map_err(check_error)?;
+    if pr_metadata_has_repo_id(tx).await? {
+        sqlx::query("INSERT INTO pr_metadata (id, task_id, repo_id, provider_type, provider_pr_id, pr_url, source_branch, target_branch, pr_state, merge_status, task_merge_operation_id, publish_operation_id, last_synced_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(&input.id)
+            .bind(&input.task_id)
+            .bind(&input.repo_id)
+            .bind(&input.provider_type)
+            .bind(&input.provider_pr_id)
+            .bind(&input.pr_url)
+            .bind(&input.source_branch)
+            .bind(&input.target_branch)
+            .bind(&input.pr_state)
+            .bind(&input.merge_status)
+            .bind(&input.task_merge_operation_id)
+            .bind(&input.publish_operation_id)
+            .bind(&input.last_synced_at)
+            .bind(&input.created_at)
+            .bind(&input.updated_at)
+            .execute(&mut **tx)
+            .await
+            .map_err(check_error)?;
+    } else {
+        sqlx::query("INSERT INTO pr_metadata (id, task_id, provider_type, provider_pr_id, pr_url, source_branch, target_branch, pr_state, merge_status, task_merge_operation_id, publish_operation_id, last_synced_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(&input.id)
+            .bind(&input.task_id)
+            .bind(&input.provider_type)
+            .bind(&input.provider_pr_id)
+            .bind(&input.pr_url)
+            .bind(&input.source_branch)
+            .bind(&input.target_branch)
+            .bind(&input.pr_state)
+            .bind(&input.merge_status)
+            .bind(&input.task_merge_operation_id)
+            .bind(&input.publish_operation_id)
+            .bind(&input.last_synced_at)
+            .bind(&input.created_at)
+            .bind(&input.updated_at)
+            .execute(&mut **tx)
+            .await
+            .map_err(check_error)?;
+    }
     Ok(())
 }
 
@@ -31,14 +65,114 @@ impl PrMetadataRepo for SqliteDb {
         let mut tx = self.pool.begin().await?;
         insert_pr_metadata_in_tx(&mut tx, &input).await?;
         tx.commit().await?;
-        PrMetadataRepo::get_by_task_id(self, &input.task_id)
+        PrMetadataRepo::get_by_task_repo(self, &input.task_id, &input.repo_id)
             .await?
             .ok_or(DbError::NotFound)
     }
 
-    async fn get_by_task_id(&self, task_id: &str) -> Result<Option<PrMetadata>> {
-        sqlx::query("SELECT * FROM pr_metadata WHERE task_id = ?")
+    async fn list_by_task(&self, task_id: &str) -> Result<Vec<PrMetadata>> {
+        let columns = sqlx::query("PRAGMA table_info(pr_metadata)")
+            .fetch_all(&self.pool)
+            .await?;
+        let has_repo_id = columns
+            .iter()
+            .any(|row| row.try_get::<String, _>("name").ok().as_deref() == Some("repo_id"));
+        let sql = if has_repo_id {
+            "SELECT pr_metadata.*,
+                    CASE WHEN pr_metadata.repo_id IS NOT NULL THEN pr_metadata.repo_id
+                         WHEN task.repo_id IS NOT NULL
+                          AND NOT EXISTS (
+                              SELECT 1 FROM task_requires_repository_merge_batch required
+                              WHERE required.task_id = task.id
+                          )
+                          AND EXISTS (
+                              SELECT 1 FROM task_repository_set_revision revision
+                              JOIN task_repository_set_revision_repo repository
+                                ON repository.task_id = revision.task_id
+                               AND repository.revision = revision.revision
+                              WHERE revision.task_id = task.id AND revision.state = 'current'
+                                AND repository.repo_id = task.repo_id
+                                AND repository.role = 'primary'
+                                AND (SELECT COUNT(*)
+                                     FROM task_repository_set_revision_repo writable
+                                     WHERE writable.task_id = revision.task_id
+                                       AND writable.revision = revision.revision
+                                       AND writable.role IN ('primary', 'affected')) = 1
+                          ) THEN task.repo_id END AS resolved_repo_id
+             FROM pr_metadata JOIN task ON task.id = pr_metadata.task_id
+             WHERE pr_metadata.task_id = ?
+             ORDER BY COALESCE(pr_metadata.repo_id, resolved_repo_id),
+                      pr_metadata.created_at, pr_metadata.id"
+        } else {
+            "SELECT pr_metadata.*, task.repo_id AS repo_id
+             FROM pr_metadata JOIN task ON task.id = pr_metadata.task_id
+             WHERE pr_metadata.task_id = ? ORDER BY pr_metadata.created_at, pr_metadata.id"
+        };
+        let rows = sqlx::query(sql).bind(task_id).fetch_all(&self.pool).await?;
+        rows.into_iter().map(map_pr_metadata).collect()
+    }
+
+    async fn get_by_task_repo(&self, task_id: &str, repo_id: &str) -> Result<Option<PrMetadata>> {
+        let columns = sqlx::query("PRAGMA table_info(pr_metadata)")
+            .fetch_all(&self.pool)
+            .await?;
+        let has_repo_id = columns
+            .iter()
+            .any(|row| row.try_get::<String, _>("name").ok().as_deref() == Some("repo_id"));
+        let sql = if has_repo_id {
+            "SELECT pr_metadata.*,
+                    CASE WHEN pr_metadata.repo_id IS NOT NULL THEN pr_metadata.repo_id
+                         WHEN task.repo_id IS NOT NULL
+                          AND NOT EXISTS (
+                              SELECT 1 FROM task_requires_repository_merge_batch required
+                              WHERE required.task_id = task.id
+                          )
+                          AND EXISTS (
+                              SELECT 1 FROM task_repository_set_revision revision
+                              JOIN task_repository_set_revision_repo repository
+                                ON repository.task_id = revision.task_id
+                               AND repository.revision = revision.revision
+                              WHERE revision.task_id = task.id AND revision.state = 'current'
+                                AND repository.repo_id = task.repo_id
+                                AND repository.role = 'primary'
+                                AND (SELECT COUNT(*)
+                                     FROM task_repository_set_revision_repo writable
+                                     WHERE writable.task_id = revision.task_id
+                                       AND writable.revision = revision.revision
+                                       AND writable.role IN ('primary', 'affected')) = 1
+                          ) THEN task.repo_id END AS resolved_repo_id
+             FROM pr_metadata JOIN task ON task.id = pr_metadata.task_id
+             WHERE pr_metadata.task_id = ?
+               AND COALESCE(
+                   pr_metadata.repo_id,
+                   CASE WHEN task.repo_id IS NOT NULL
+                          AND NOT EXISTS (
+                              SELECT 1 FROM task_requires_repository_merge_batch required
+                              WHERE required.task_id = task.id
+                          )
+                          AND EXISTS (
+                              SELECT 1 FROM task_repository_set_revision revision
+                              JOIN task_repository_set_revision_repo repository
+                                ON repository.task_id = revision.task_id
+                               AND repository.revision = revision.revision
+                              WHERE revision.task_id = task.id AND revision.state = 'current'
+                                AND repository.repo_id = task.repo_id
+                                AND repository.role = 'primary'
+                                AND (SELECT COUNT(*)
+                                     FROM task_repository_set_revision_repo writable
+                                     WHERE writable.task_id = revision.task_id
+                                       AND writable.revision = revision.revision
+                                       AND writable.role IN ('primary', 'affected')) = 1
+                          ) THEN task.repo_id END
+               ) = ?"
+        } else {
+            "SELECT pr_metadata.*, task.repo_id AS repo_id
+             FROM pr_metadata JOIN task ON task.id = pr_metadata.task_id
+             WHERE pr_metadata.task_id = ? AND task.repo_id = ?"
+        };
+        sqlx::query(sql)
             .bind(task_id)
+            .bind(repo_id)
             .fetch_optional(&self.pool)
             .await?
             .map(map_pr_metadata)

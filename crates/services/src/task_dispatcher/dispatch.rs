@@ -178,12 +178,62 @@ pub(crate) async fn work_unit_consumption_context(
     let mut sections = Vec::new();
     if let Some(subject) = crate::task_rework::get_review_subject(db, &work_unit.id).await? {
         sections.push("You are performing formal independent review. Inspect the exact result against its scope and acceptance criteria. Do not edit files, implement fixes, approve your own reasoning as evidence, or contact external providers. Report only concrete findings with reproduction/evidence; distinguish unavailable checks from passes. End your assistant output with exactly one final line in this contract: FORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass|fail|needs_human\",\"summary\":\"nonempty factual summary\",\"criteria\":[\"criterion checked\"],\"findings\":[\"concrete defect with location and evidence\"],\"questions\":[],\"evidence_considered\":[]}. Choose one verdict. Use fail for confirmed defects, pass only when the required criteria are met, and needs_human for an unresolved decision or missing essential evidence. findings and questions must be JSON arrays; findings must be concrete strings, not instructions to silently change scope.".to_owned());
-        sections.push(format!(
-            "Exact review subject: WorkUnit {} v{}, result Execution {}, commit {}, Workspace {}, snapshot digest {}. Review this immutable result independently. Your current directory is an isolated review context; the implementation has not been copied into it. Do not edit the result or reuse its native session.",
-            subject.reviewed_work_unit_id,
-            subject.reviewed_work_unit_version.map(|v|v.to_string()).unwrap_or_else(||"pending".to_owned()),
-            subject.result_execution_id.as_deref().unwrap_or("none"),subject.result_commit_sha.as_deref().unwrap_or("none"),
-            subject.result_workspace_id.as_deref().unwrap_or("none"),subject.workspace_snapshot_digest.as_deref().unwrap_or("none")));
+        let repository_subjects =
+            db::WorkUnitRepo::list_review_subject_repositories(db, &work_unit.id).await?;
+        if repository_subjects.is_empty() {
+            sections.push(format!(
+                "Exact review subject: WorkUnit {} v{}, result Execution {}, commit {}, Workspace {}, snapshot digest {}. Review this immutable result independently. Your current directory is an isolated review context. Do not edit the result or reuse its native session.",
+                subject.reviewed_work_unit_id,
+                subject.reviewed_work_unit_version.map(|v|v.to_string()).unwrap_or_else(||"pending".to_owned()),
+                subject.result_execution_id.as_deref().unwrap_or("none"),subject.result_commit_sha.as_deref().unwrap_or("none"),
+                subject.result_workspace_id.as_deref().unwrap_or("none"),subject.workspace_snapshot_digest.as_deref().unwrap_or("none")));
+        } else {
+            let mut repository_inputs = Vec::with_capacity(repository_subjects.len());
+            for repository in &repository_subjects {
+                let workspace_id = repository.result_workspace_id.as_deref().ok_or_else(|| {
+                    crate::ServiceError::invalid_operation(format!(
+                        "Review repository {} has no exact result Workspace",
+                        repository.repo_id
+                    ))
+                })?;
+                let commit_sha = repository.result_commit_sha.as_deref().ok_or_else(|| {
+                    crate::ServiceError::invalid_operation(format!(
+                        "Review repository {} has no exact result commit",
+                        repository.repo_id
+                    ))
+                })?;
+                let workspace = WorkspaceRepo::get_by_id(db, workspace_id)
+                    .await?
+                    .filter(|workspace| {
+                        workspace.task_id == work_unit.task_id
+                            && workspace.repo_id == repository.repo_id
+                    })
+                    .ok_or_else(|| {
+                        crate::ServiceError::invalid_operation(format!(
+                            "Review repository {} result Workspace is outside the exact Task",
+                            repository.repo_id
+                        ))
+                    })?;
+                repository_inputs.push(format!(
+                    "- Repo `{}`: commit `{}`, Workspace `{}`, path `{}`, snapshot digest `{}`",
+                    repository.repo_id,
+                    commit_sha,
+                    workspace.id,
+                    workspace.worktree_path,
+                    repository
+                        .workspace_snapshot_digest
+                        .as_deref()
+                        .unwrap_or("none")
+                ));
+            }
+            sections.push(format!(
+                "Exact review subject: WorkUnit {} v{}, result Execution {}. Review every repository below at its frozen commit and snapshot. Your current directory is the WorkspaceGroup root; repository worktrees are sibling directories listed in `FORGE_WORKSPACE.md`. All subject repositories are read-only. Do not edit them or reuse the result's native session.\n{}",
+                subject.reviewed_work_unit_id,
+                subject.reviewed_work_unit_version.map(|v|v.to_string()).unwrap_or_else(||"pending".to_owned()),
+                subject.result_execution_id.as_deref().unwrap_or("none"),
+                repository_inputs.join("\n")
+            ));
+        }
         if let Some(unit) = WorkUnitRepo::get_by_id(db, &subject.reviewed_work_unit_id).await? {
             sections.push(format!("Reviewed scope and acceptance:\n{}", unit.scope));
         }
@@ -195,14 +245,16 @@ pub(crate) async fn work_unit_consumption_context(
                 ));
             }
         }
-        if let Some(id) = subject.result_workspace_id.as_deref() {
-            if let Some(workspace) = WorkspaceRepo::get_by_id(db, id).await? {
-                if workspace.task_id != work_unit.task_id {
-                    return Err(crate::ServiceError::invalid_operation(
-                        "Review workspace belongs to another Task",
-                    ));
+        if repository_subjects.is_empty() {
+            if let Some(id) = subject.result_workspace_id.as_deref() {
+                if let Some(workspace) = WorkspaceRepo::get_by_id(db, id).await? {
+                    if workspace.task_id != work_unit.task_id {
+                        return Err(crate::ServiceError::invalid_operation(
+                            "Review workspace belongs to another Task",
+                        ));
+                    }
+                    sections.push(format!("Read the exact implementation at {} (commit {}). Read access does not grant a WorkspaceLease or write permission.",workspace.worktree_path,subject.result_commit_sha.as_deref().unwrap_or("none")));
                 }
-                sections.push(format!("Read the exact implementation at {} (commit {}). Read access does not grant a WorkspaceLease or write permission.",workspace.worktree_path,subject.result_commit_sha.as_deref().unwrap_or("none")));
             }
         }
         if let Some(id) = subject.result_artifact_id.as_deref() {

@@ -117,6 +117,65 @@ fn project_domain_event(event: &DomainEvent) -> Option<PublicEventEnvelope> {
                 "reason_ref",
             ],
         ),
+        "task.repositories_changed" => {
+            let projected = project_fields(&source, &["task_id", "task_version", "repositories"]);
+            let payload: api_types::TaskRepositoriesChangedPayload =
+                serde_json::from_value(projected).ok()?;
+            serde_json::to_value(payload).ok()?
+        }
+        "task.repository_set_replanned" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "previous_revision",
+                "repository_set_revision",
+                "repository_set_digest",
+                "plan_artifact_id",
+                "human_decision_request_id",
+            ],
+        ),
+        "work_unit.repository_integration_changed" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "work_unit_id",
+                "repo_id",
+                "repository_revision",
+                "parent_integration_id",
+                "integration_id",
+                "outcome",
+                "version",
+            ],
+        ),
+        "task.repository_merge_batch_changed" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "repo_id",
+                "repository_revision",
+                "repository_merge_batch_id",
+                "integration_id",
+                "admission_id",
+                "state",
+                "batch_state",
+                "version",
+            ],
+        ),
+        "task.repository_pr_status_changed" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "repo_id",
+                "repository_revision",
+                "repository_merge_batch_id",
+                "admission_id",
+                "pr_metadata_id",
+                "state",
+                "admission_status",
+                "pr_state",
+                "version",
+            ],
+        ),
         "project.plan_proposed"
         | "project.plan_applied"
         | "project.plan_dependencies_changed"
@@ -152,6 +211,7 @@ fn project_domain_event(event: &DomainEvent) -> Option<PublicEventEnvelope> {
         | "proposal.created"
         | "proposal.withdrawn"
         | "decision.recorded" => json!({}),
+        "execution.repository_results_recorded" => project_execution_repository_results(&source),
         "task.coordination_authorized" => project_fields(
             &source,
             &[
@@ -294,6 +354,7 @@ fn project_domain_event(event: &DomainEvent) -> Option<PublicEventEnvelope> {
                 "task_id",
                 "feedback_item_id",
                 "admission_id",
+                "repo_id",
                 "body_digest",
                 "trust_class",
                 "head_state",
@@ -301,7 +362,14 @@ fn project_domain_event(event: &DomainEvent) -> Option<PublicEventEnvelope> {
         ),
         "task.pr_feedback_triaged" => project_fields(
             &source,
-            &["task_id", "request_id", "admission_id", "set_digest"],
+            &[
+                "task_id",
+                "request_id",
+                "admission_id",
+                "repo_id",
+                "repository_merge_batch_id",
+                "set_digest",
+            ],
         ),
         "task.work_unit_fallback" => project_fields(
             &source,
@@ -353,6 +421,9 @@ fn project_domain_event(event: &DomainEvent) -> Option<PublicEventEnvelope> {
                 "supersession_id",
                 "request_id",
                 "task_merge_operation_id",
+                "admission_id",
+                "repo_id",
+                "repository_merge_batch_id",
                 "provider_pr_id",
                 "superseded_head_sha",
                 "triage_set_digest",
@@ -364,13 +435,24 @@ fn project_domain_event(event: &DomainEvent) -> Option<PublicEventEnvelope> {
                 "task_id",
                 "supersession_id",
                 "request_id",
+                "admission_id",
+                "repo_id",
+                "repository_merge_batch_id",
                 "state",
                 "readmission_merge_operation_id",
             ],
         ),
         "task.pr_rework_converged" => project_fields(
             &source,
-            &["task_id", "supersession_id", "outcome", "decision_id"],
+            &[
+                "task_id",
+                "supersession_id",
+                "admission_id",
+                "repo_id",
+                "repository_merge_batch_id",
+                "outcome",
+                "decision_id",
+            ],
         ),
         "task.pr_followup_proposed" => project_fields(
             &source,
@@ -379,22 +461,40 @@ fn project_domain_event(event: &DomainEvent) -> Option<PublicEventEnvelope> {
                 "disposition_id",
                 "human_decision_id",
                 "followup_task_id",
+                "admission_id",
+                "repo_id",
                 "state",
             ],
         ),
         "pr.external_action_created"
         | "pr.external_action_approved"
         | "pr.external_action_running"
-        | "pr.external_action_outcome_unknown" => {
-            project_fields(&source, &["task_id", "action_id", "admission_id", "state"])
-        }
+        | "pr.external_action_outcome_unknown" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "action_id",
+                "admission_id",
+                "repo_id",
+                "repository_merge_batch_id",
+                "state",
+            ],
+        ),
         "pr.external_action_rejected"
         | "pr.external_action_succeeded"
         | "pr.external_action_failed"
         | "pr.external_action_reconciliation_required"
-        | "pr.external_action_abandoned" => {
-            project_fields(&source, &["task_id", "action_id", "admission_id", "state"])
-        }
+        | "pr.external_action_abandoned" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "action_id",
+                "admission_id",
+                "repo_id",
+                "repository_merge_batch_id",
+                "state",
+            ],
+        ),
         // In particular, legacy Review-row events are not current Review
         // authority and never enter the public stream.
         _ => return None,
@@ -454,6 +554,13 @@ async fn project_is_visible(db: &SqliteDb, project_id: &str, user_id: &str) -> b
 fn public_domain_event_type(event_type: &str) -> Option<PublicEventType> {
     Some(match event_type {
         "task.lifecycle_changed" => PublicEventType::TaskLifecycleChanged,
+        "task.repositories_changed" => PublicEventType::TaskRepositoriesChanged,
+        "task.repository_set_replanned" => PublicEventType::TaskRepositorySetReplanned,
+        "work_unit.repository_integration_changed" => {
+            PublicEventType::WorkUnitRepositoryIntegrationChanged
+        }
+        "task.repository_merge_batch_changed" => PublicEventType::TaskRepositoryMergeBatchChanged,
+        "task.repository_pr_status_changed" => PublicEventType::TaskRepositoryPrStatusChanged,
         "gate.created" => PublicEventType::GateCreated,
         "gate.policy_revised" => PublicEventType::GatePolicyRevised,
         "gate.evaluated" => PublicEventType::GateEvaluated,
@@ -461,6 +568,9 @@ fn public_domain_event_type(event_type: &str) -> Option<PublicEventType> {
         "execution.completed" => PublicEventType::ExecutionCompleted,
         "execution.failed" => PublicEventType::ExecutionFailed,
         "execution.cancelled" => PublicEventType::ExecutionCancelled,
+        "execution.repository_results_recorded" => {
+            PublicEventType::ExecutionRepositoryResultsRecorded
+        }
         "execution.stalled" => PublicEventType::ExecutionStalled,
         "validation_run.started" => PublicEventType::ValidationRunStarted,
         "validation_run.completed" => PublicEventType::ValidationRunCompleted,
@@ -553,6 +663,7 @@ fn project_validation_check(source: &Value, event_type: &str) -> Value {
             "subject_kind",
             "subject_id",
             "subject_version",
+            "repo_id",
             "workspace_id",
             "baseline",
             "state",
@@ -578,11 +689,56 @@ fn project_fields(source: &Value, fields: &[&str]) -> Value {
     Value::Object(projected)
 }
 
+fn project_execution_repository_results(source: &Value) -> Value {
+    let repository_results = source
+        .get("repository_results")
+        .and_then(Value::as_array)
+        .map(|results| {
+            results
+                .iter()
+                .map(|result| {
+                    project_fields(
+                        result,
+                        &[
+                            "repo_id",
+                            "workspace_id",
+                            "before_sha",
+                            "after_sha",
+                            "snapshot_digest",
+                        ],
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    json!({
+        "task_id": source.get("task_id"),
+        "execution_id": source.get("execution_id"),
+        "repository_results": repository_results,
+    })
+}
+
 fn project_runtime_hint(event: &events::ForgeEvent) -> Option<PublicEventEnvelope> {
     // These in-process events have no durable DomainEvent receipt. Keep their
     // public payload to identifiers and status fields; never serialize the
     // internal EventContext wholesale.
     let (event_type, payload) = match (event.event_type.as_str(), &event.context) {
+        (
+            events::TASK_REPOSITORIES_CHANGED_EVENT,
+            events::EventContext::TaskRepositoriesChanged {
+                task_id,
+                task_version,
+                repositories,
+            },
+        ) => (
+            PublicEventType::TaskRepositoriesChanged,
+            serde_json::to_value(api_types::TaskRepositoriesChangedPayload {
+                task_id: task_id.clone(),
+                task_version: *task_version,
+                repositories: repositories.clone(),
+            })
+            .ok()?,
+        ),
         ("project.created", events::EventContext::ProjectCreated { .. }) => {
             (PublicEventType::ProjectCreated, json!({}))
         }
@@ -653,6 +809,9 @@ fn project_runtime_hint(event: &events::ForgeEvent) -> Option<PublicEventEnvelop
         events::EventContext::ProjectHookRunChanged { project_id, .. } => {
             (Some("project".to_owned()), Some(project_id.clone()))
         }
+        events::EventContext::TaskRepositoriesChanged { task_id, .. } => {
+            (Some("task".to_owned()), Some(task_id.clone()))
+        }
         events::EventContext::NotificationCreated { project_id, .. } => {
             (Some("project".to_owned()), Some(project_id.clone()))
         }
@@ -709,6 +868,117 @@ mod tests {
     }
 
     #[test]
+    fn multirepo_execution_results_event_exposes_repo_results_without_paths() {
+        let event = domain_event(
+            "execution.repository_results_recorded",
+            r#"{"task_id":"task-1","execution_id":"execution-1","repository_results":[{"repo_id":"repo-a","workspace_id":"workspace-a","before_sha":"base-a","after_sha":"head-a","snapshot_digest":"digest-a","worktree_path":"/private/a","token":"secret"}],"worktree_path":"/private"}"#,
+        );
+        let projected = project_domain_event(&event).expect("repository result event");
+        assert_eq!(
+            projected.event_type,
+            PublicEventType::ExecutionRepositoryResultsRecorded
+        );
+        let payload = projected.payload.expect("payload");
+        assert_eq!(payload["task_id"], "task-1");
+        assert_eq!(payload["execution_id"], "execution-1");
+        assert_eq!(payload["repository_results"][0]["repo_id"], "repo-a");
+        assert_eq!(payload["repository_results"][0]["after_sha"], "head-a");
+        assert!(payload["repository_results"][0]
+            .get("worktree_path")
+            .is_none());
+        assert!(payload.get("worktree_path").is_none());
+        assert!(payload["repository_results"][0].get("token").is_none());
+    }
+
+    #[test]
+    fn multirepo_lifecycle_single_repo_task_response_and_sse_regression() {
+        let legacy_repository: api_types::TaskRepositoryResponse = serde_json::from_value(json!({
+            "repo_id": "repo-legacy",
+            "role": "primary",
+            "position": 0,
+            "merge": null,
+            "pull_request": null
+        }))
+        .expect("legacy single-repo payload remains readable");
+        assert_eq!(
+            legacy_repository.change_state,
+            api_types::TaskRepositoryChangeState::Pending
+        );
+        assert!(legacy_repository.integration.is_none());
+
+        let repositories_changed = domain_event(
+            "task.repositories_changed",
+            r#"{"task_id":"task-legacy","task_version":2,"repositories":[{"repo_id":"repo-legacy","role":"primary"}],"token":"secret"}"#,
+        );
+        let projected = project_domain_event(&repositories_changed)
+            .expect("legacy repository-scope event remains public");
+        assert_eq!(
+            projected.event_type,
+            PublicEventType::TaskRepositoriesChanged
+        );
+        let payload = projected.payload.expect("repository-scope payload");
+        assert_eq!(payload["repositories"][0]["repo_id"], "repo-legacy");
+        assert!(payload.get("token").is_none());
+
+        let replanned = domain_event(
+            "task.repository_set_replanned",
+            r#"{"task_id":"task-1","previous_revision":1,"repository_set_revision":2,"repository_set_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","plan_artifact_id":"artifact-1","human_decision_request_id":"decision-1","provider_body":"private"}"#,
+        );
+        let projected =
+            project_domain_event(&replanned).expect("repository replan event is public");
+        assert_eq!(
+            projected.event_type,
+            PublicEventType::TaskRepositorySetReplanned
+        );
+        let payload = projected.payload.expect("repository replan payload");
+        assert_eq!(payload["repository_set_revision"], 2);
+        assert_eq!(payload["human_decision_request_id"], "decision-1");
+        assert!(payload.get("provider_body").is_none());
+
+        let event = domain_event(
+            "work_unit.repository_integration_changed",
+            r#"{"task_id":"task-1","work_unit_id":"wu-1","repo_id":"repo-1","repository_revision":2,"parent_integration_id":"parent-1","integration_id":"child-1","outcome":"success","version":2,"token":"secret","worktree_path":"private"}"#,
+        );
+        let projected = project_domain_event(&event).expect("repo integration event is public");
+        assert_eq!(
+            projected.event_type,
+            PublicEventType::WorkUnitRepositoryIntegrationChanged
+        );
+        let payload = projected.payload.expect("payload");
+        assert_eq!(payload["repo_id"], "repo-1");
+        assert_eq!(payload["integration_id"], "child-1");
+        assert!(payload.get("token").is_none());
+        assert!(payload.get("worktree_path").is_none());
+
+        let batch = domain_event(
+            "task.repository_merge_batch_changed",
+            r#"{"task_id":"task-1","repo_id":"repo-2","repository_revision":3,"repository_merge_batch_id":"batch-1","state":"open","version":2,"token":"secret"}"#,
+        );
+        let projected = project_domain_event(&batch).expect("repository batch event is public");
+        assert_eq!(
+            projected.event_type,
+            PublicEventType::TaskRepositoryMergeBatchChanged
+        );
+        let payload = projected.payload.expect("batch payload");
+        assert_eq!(payload["repo_id"], "repo-2");
+        assert_eq!(payload["repository_merge_batch_id"], "batch-1");
+        assert!(payload.get("token").is_none());
+
+        let pr = domain_event(
+            "task.repository_pr_status_changed",
+            r#"{"task_id":"task-1","repo_id":"repo-2","repository_revision":3,"repository_merge_batch_id":"batch-1","admission_id":"admission-2","pr_metadata_id":"metadata-2","state":"open","version":1}"#,
+        );
+        let projected = project_domain_event(&pr).expect("repository PR status event is public");
+        assert_eq!(
+            projected.event_type,
+            PublicEventType::TaskRepositoryPrStatusChanged
+        );
+        let payload = projected.payload.expect("PR status payload");
+        assert_eq!(payload["repo_id"], "repo-2");
+        assert_eq!(payload["admission_id"], "admission-2");
+    }
+
+    #[test]
     fn coordination_plan_event_projection_excludes_content_and_prompts() {
         let event = domain_event(
             "task.coordination_plan_proposed",
@@ -729,24 +999,28 @@ mod tests {
     fn pr_feedback_and_action_events_project_only_safe_facts() {
         let action = domain_event(
             "pr.external_action_created",
-            r#"{"task_id":"task-1","action_id":"action-1","admission_id":"admission-1","state":"proposed","body":"provider text","token":"secret"}"#,
+            r#"{"task_id":"task-1","action_id":"action-1","admission_id":"admission-1","repo_id":"repo-1","repository_merge_batch_id":"batch-1","state":"proposed","body":"provider text","token":"secret"}"#,
         );
         let projected = project_domain_event(&action).expect("PR action event is public");
         assert_eq!(projected.event_type, PublicEventType::TaskPrActionRequested);
         let payload = projected.payload.expect("action payload");
         assert_eq!(payload["action_id"], "action-1");
+        assert_eq!(payload["repo_id"], "repo-1");
+        assert_eq!(payload["repository_merge_batch_id"], "batch-1");
         assert_eq!(payload["state"], "proposed");
         assert!(payload.get("body").is_none());
         assert!(payload.get("token").is_none());
 
         let triage = domain_event(
             "task.pr_feedback_triaged",
-            r#"{"task_id":"task-1","request_id":"request-1","admission_id":"admission-1","set_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","rationale":"private rationale","body":"provider text"}"#,
+            r#"{"task_id":"task-1","request_id":"request-1","admission_id":"admission-1","repo_id":"repo-1","repository_merge_batch_id":"batch-1","set_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","rationale":"private rationale","body":"provider text"}"#,
         );
         let projected = project_domain_event(&triage).expect("PR triage event is public");
         assert_eq!(projected.event_type, PublicEventType::TaskPrFeedbackTriaged);
         let payload = projected.payload.expect("triage payload");
         assert_eq!(payload["set_digest"], json!("a".repeat(64)));
+        assert_eq!(payload["repo_id"], "repo-1");
+        assert_eq!(payload["repository_merge_batch_id"], "batch-1");
         assert!(payload.get("rationale").is_none());
         assert!(payload.get("body").is_none());
     }
@@ -938,6 +1212,7 @@ mod tests {
         db::TaskRepo::create(
             &db,
             db::CreateTask {
+                repositories: Vec::new(),
                 id: "private-task".to_owned(),
                 project_id: "private-project".to_owned(),
                 repo_id: None,

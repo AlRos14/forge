@@ -8,7 +8,8 @@ use api_types::{
 };
 use db::{
     Gate, GateEvaluation, GateEvaluationInput, GatePolicyRevision, GateRepo, GateScopeKind,
-    TaskLifecycleRepo, TaskLifecycleState as DbTaskLifecycleState, TaskRepo,
+    PrMetadataRepo, RepoRepo, TaskLifecycleRepo, TaskLifecycleState as DbTaskLifecycleState,
+    TaskRepo, TaskRepositoryMergeBatchRepo, WorkspaceRepo,
 };
 use services::gate_engine::{GateEngine, GatePolicyDocumentV2};
 use std::sync::Arc;
@@ -381,76 +382,207 @@ pub async fn merge_after_gate(
     Json(request): Json<MergeAfterGateRequest>,
 ) -> ApiResult<Json<MergeAfterGateResponse>> {
     require_task_mutable(&state, &task_id, &user).await?;
-    let outcome = state
+    let merge_result = state
         .merge_service
-        .merge_after_gate(task_id, &request.gate_evaluation_id)
+        .merge_after_gate(&task_id, &request.gate_evaluation_id)
         .await
         .map_err(ApiError::from)?;
-    let response = match outcome {
-        services::MergeOutcome::Done {
-            before_sha,
-            after_sha,
-            branch,
-        } => MergeAfterGateResponse {
-            outcome: "done".to_owned(),
-            before_sha: Some(before_sha),
-            after_sha: Some(after_sha),
-            branch: Some(branch),
-            pr_url: None,
-            target_branch: None,
-            details: None,
-            files: Vec::new(),
-        },
-        services::MergeOutcome::PullRequest {
-            pr_url,
-            branch,
-            target_branch,
-        } => MergeAfterGateResponse {
-            outcome: "pull_request".to_owned(),
-            before_sha: None,
-            after_sha: None,
-            branch: Some(branch),
-            pr_url,
-            target_branch: Some(target_branch),
-            details: None,
-            files: Vec::new(),
-        },
-        services::MergeOutcome::Conflict {
+    let Some(batch) = merge_result.batch else {
+        let response = match merge_result.primary_outcome.ok_or_else(|| {
+            ApiError::internal("single-repository merge did not return its scalar outcome")
+        })? {
+            services::MergeOutcome::Done {
+                before_sha,
+                after_sha,
+                branch,
+            } => MergeAfterGateResponse {
+                outcome: "done".to_owned(),
+                before_sha: Some(before_sha),
+                after_sha: Some(after_sha),
+                branch: Some(branch),
+                pr_url: None,
+                target_branch: None,
+                details: None,
+                files: Vec::new(),
+                repository_merge_batch_id: None,
+                repositories: Vec::new(),
+            },
+            services::MergeOutcome::PullRequest {
+                pr_url,
+                branch,
+                target_branch,
+            } => MergeAfterGateResponse {
+                outcome: "pull_request".to_owned(),
+                before_sha: None,
+                after_sha: None,
+                branch: Some(branch),
+                pr_url,
+                target_branch: Some(target_branch),
+                details: None,
+                files: Vec::new(),
+                repository_merge_batch_id: None,
+                repositories: Vec::new(),
+            },
+            services::MergeOutcome::Conflict {
+                details,
+                conflict_paths,
+            } => MergeAfterGateResponse {
+                outcome: "conflict".to_owned(),
+                before_sha: None,
+                after_sha: None,
+                branch: None,
+                pr_url: None,
+                target_branch: None,
+                details: Some(details),
+                files: conflict_paths
+                    .into_iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect(),
+                repository_merge_batch_id: None,
+                repositories: Vec::new(),
+            },
+            services::MergeOutcome::Dirty { files } => MergeAfterGateResponse {
+                outcome: "dirty".to_owned(),
+                before_sha: None,
+                after_sha: None,
+                branch: None,
+                pr_url: None,
+                target_branch: None,
+                details: None,
+                files,
+                repository_merge_batch_id: None,
+                repositories: Vec::new(),
+            },
+            services::MergeOutcome::TargetDirty { files } => MergeAfterGateResponse {
+                outcome: "target_dirty".to_owned(),
+                before_sha: None,
+                after_sha: None,
+                branch: None,
+                pr_url: None,
+                target_branch: None,
+                details: None,
+                files,
+                repository_merge_batch_id: None,
+                repositories: Vec::new(),
+            },
+        };
+        return Ok(Json(response));
+    };
+    let rows = TaskRepositoryMergeBatchRepo::list_repositories(&*state.db, &batch.id).await?;
+    let repositories = rows
+        .iter()
+        .map(|row| api_types::TaskRepositoryMergeResponse {
+            batch_id: row.batch_id.clone(),
+            repo_id: row.repo_id.clone(),
+            state: super::super::merge_state_response(row.state),
+            integration_id: row.work_unit_repository_integration_id.clone(),
+            task_merge_operation_id: row.task_merge_operation_id.clone(),
+            pr_metadata_id: row.pr_metadata_id.clone(),
+            before_sha: row.before_sha.clone(),
+            after_sha: row.after_sha.clone(),
+        })
+        .collect::<Vec<_>>();
+    let task = TaskRepo::get_by_id(&*state.db, &task_id, false)
+        .await?
+        .ok_or_else(|| ApiError::not_found("task", task_id.clone()))?;
+    let primary_row = rows
+        .iter()
+        .find(|row| task.repo_id.as_deref() == Some(row.repo_id.as_str()));
+    let primary_pr =
+        if let Some(metadata_id) = primary_row.and_then(|row| row.pr_metadata_id.as_ref()) {
+            PrMetadataRepo::list_by_task(&*state.db, &task_id)
+                .await?
+                .into_iter()
+                .find(|metadata| metadata.id == *metadata_id)
+        } else {
+            None
+        };
+    let is_pr_batch = rows.iter().any(|row| row.pr_metadata_id.is_some());
+    let outcome = if is_pr_batch {
+        "pull_request"
+    } else if batch.state == db::TaskRepositoryMergeBatchState::Completed {
+        "done"
+    } else if rows
+        .iter()
+        .any(|row| row.state == db::TaskRepositoryMergeBatchRepoState::Conflict)
+    {
+        "conflict"
+    } else if matches!(
+        batch.state,
+        db::TaskRepositoryMergeBatchState::Failed | db::TaskRepositoryMergeBatchState::Blocked
+    ) {
+        "failed"
+    } else {
+        "in_progress"
+    };
+    let repository = if let Some(primary) = primary_row {
+        RepoRepo::get_by_id(&*state.db, &primary.repo_id).await?
+    } else {
+        None
+    };
+    let configured_target_branch = task
+        .merge_config
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+        .and_then(|value| {
+            value
+                .get("target_branch")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .map(str::to_owned)
+        })
+        .filter(|value| !value.is_empty());
+    let target_branch = primary_pr
+        .as_ref()
+        .map(|metadata| metadata.target_branch.clone())
+        .or(configured_target_branch)
+        .or_else(|| repository.as_ref().map(|repo| repo.default_branch.clone()));
+    let branch = if is_pr_batch {
+        if let Some(primary_pr) = &primary_pr {
+            Some(primary_pr.source_branch.clone())
+        } else if let Some(primary) = primary_row {
+            WorkspaceRepo::get_integration_by_task_repo(&*state.db, &task_id, &primary.repo_id)
+                .await?
+                .map(|workspace| workspace.branch)
+        } else {
+            None
+        }
+    } else {
+        target_branch.clone()
+    };
+    let (details, files) = match merge_result.primary_outcome {
+        Some(services::MergeOutcome::Conflict {
             details,
             conflict_paths,
-        } => MergeAfterGateResponse {
-            outcome: "conflict".to_owned(),
-            before_sha: None,
-            after_sha: None,
-            branch: None,
-            pr_url: None,
-            target_branch: None,
-            details: Some(details),
-            files: conflict_paths
+        }) => (
+            Some(details),
+            conflict_paths
                 .into_iter()
                 .map(|path| path.to_string_lossy().into_owned())
                 .collect(),
-        },
-        services::MergeOutcome::Dirty { files } => MergeAfterGateResponse {
-            outcome: "dirty".to_owned(),
-            before_sha: None,
-            after_sha: None,
-            branch: None,
-            pr_url: None,
-            target_branch: None,
-            details: None,
-            files,
-        },
-        services::MergeOutcome::TargetDirty { files } => MergeAfterGateResponse {
-            outcome: "target_dirty".to_owned(),
-            before_sha: None,
-            after_sha: None,
-            branch: None,
-            pr_url: None,
-            target_branch: None,
-            details: None,
-            files,
-        },
+        ),
+        Some(services::MergeOutcome::Dirty { files }) => (None, files),
+        Some(services::MergeOutcome::TargetDirty { files }) => (None, files),
+        _ => (None, Vec::new()),
     };
-    Ok(Json(response))
+    Ok(Json(MergeAfterGateResponse {
+        outcome: outcome.to_owned(),
+        before_sha: if is_pr_batch {
+            None
+        } else {
+            primary_row.and_then(|row| row.before_sha.clone())
+        },
+        after_sha: if is_pr_batch {
+            None
+        } else {
+            primary_row.and_then(|row| row.after_sha.clone())
+        },
+        branch,
+        pr_url: primary_pr.and_then(|metadata| metadata.pr_url),
+        target_branch: if is_pr_batch { target_branch } else { None },
+        details,
+        files,
+        repository_merge_batch_id: Some(batch.id),
+        repositories,
+    }))
 }

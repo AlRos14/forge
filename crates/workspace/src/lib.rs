@@ -53,6 +53,15 @@ pub struct WorkspaceManager {
     repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct GroupWorktreeIdentity<'a> {
+    pub task_id: &'a str,
+    pub work_unit_id: &'a str,
+    pub group_id: &'a str,
+    pub workspace_id: &'a str,
+    pub repo_id: &'a str,
+}
+
 impl WorkspaceManager {
     pub fn new(root: PathBuf) -> Self {
         Self {
@@ -176,6 +185,238 @@ impl WorkspaceManager {
             .into());
         }
         Ok(path)
+    }
+
+    /// Return the persisted common root for one exact WorkUnit group.
+    pub fn work_unit_group_path(
+        &self,
+        task_id: &str,
+        work_unit_id: &str,
+        group_id: &str,
+    ) -> Result<PathBuf> {
+        for value in [task_id, work_unit_id, group_id] {
+            validate_identity_segment(value)?;
+        }
+        Ok(self
+            .root
+            .join("work_units")
+            .join(task_id)
+            .join(work_unit_id)
+            .join("groups")
+            .join(group_id))
+    }
+
+    /// Return the exact sibling directory for one repository in a group.
+    pub fn work_unit_group_worktree_path(
+        &self,
+        task_id: &str,
+        work_unit_id: &str,
+        group_id: &str,
+        repo_id: &str,
+    ) -> Result<PathBuf> {
+        validate_identity_segment(repo_id)?;
+        Ok(self
+            .work_unit_group_path(task_id, work_unit_id, group_id)?
+            .join(repo_id))
+    }
+
+    /// Create one repository worktree as a sibling inside a persisted group.
+    /// Writable members receive their unique WorkUnit branch. Read-only members
+    /// are detached at an exact SHA and have write bits removed after creation.
+    pub async fn create_group_worktree(
+        &self,
+        repo_path: &str,
+        identity: GroupWorktreeIdentity<'_>,
+        base_sha: &str,
+        read_only: bool,
+    ) -> Result<(PathBuf, String)> {
+        let path = self.work_unit_group_worktree_path(
+            identity.task_id,
+            identity.work_unit_id,
+            identity.group_id,
+            identity.repo_id,
+        )?;
+        validate_identity_segment(identity.workspace_id)?;
+        validate_commit_id(base_sha)?;
+        if fs::try_exists(&path).await? {
+            return Err(WorkspaceError::AlreadyExists);
+        }
+        let parent = path.parent().ok_or(WorkspaceError::InvalidIdentity)?;
+        fs::create_dir_all(parent).await?;
+        let _repo_cache_guard = if let Some(locks) = &self.repo_cache_locks {
+            Some(locks.acquire(repo_path).await)
+        } else {
+            None
+        };
+        let branch = if read_only {
+            format!("detached:{base_sha}")
+        } else {
+            work_unit_branch_name(
+                identity.task_id,
+                identity.work_unit_id,
+                identity.workspace_id,
+            )?
+        };
+        let args = if read_only {
+            vec![
+                "worktree".to_owned(),
+                "add".to_owned(),
+                "--detach".to_owned(),
+                path.to_string_lossy().into_owned(),
+                base_sha.to_owned(),
+            ]
+        } else {
+            vec![
+                "worktree".to_owned(),
+                "add".to_owned(),
+                "-b".to_owned(),
+                branch.clone(),
+                path.to_string_lossy().into_owned(),
+                base_sha.to_owned(),
+            ]
+        };
+        let output = git_command()
+            .args(&args)
+            .current_dir(repo_path)
+            .output()
+            .await?;
+        if !output.status.success() {
+            return Err(git::GitError::CommandFailed {
+                command: format!("git {}", args.join(" ")),
+                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            }
+            .into());
+        }
+        if read_only {
+            set_tree_read_only(&path).await?;
+        }
+        Ok((path, branch))
+    }
+
+    /// Recover one missing group member from its immutable branch or detached
+    /// SHA identity. The caller supplies the exact persisted group and repo.
+    pub async fn recover_group_worktree(
+        &self,
+        repo_path: &str,
+        identity: GroupWorktreeIdentity<'_>,
+        branch: &str,
+    ) -> Result<PathBuf> {
+        let path = self.work_unit_group_worktree_path(
+            identity.task_id,
+            identity.work_unit_id,
+            identity.group_id,
+            identity.repo_id,
+        )?;
+        let args = if let Some(commit_sha) = branch.strip_prefix("detached:") {
+            validate_commit_id(commit_sha)?;
+            vec![
+                "worktree".to_owned(),
+                "add".to_owned(),
+                "--detach".to_owned(),
+                path.to_string_lossy().into_owned(),
+                commit_sha.to_owned(),
+            ]
+        } else {
+            let expected_branch = work_unit_branch_name(
+                identity.task_id,
+                identity.work_unit_id,
+                identity.workspace_id,
+            )?;
+            if branch != expected_branch {
+                return Err(WorkspaceError::InvalidIdentity);
+            }
+            vec![
+                "worktree".to_owned(),
+                "add".to_owned(),
+                path.to_string_lossy().into_owned(),
+                branch.to_owned(),
+            ]
+        };
+        if fs::try_exists(&path).await? {
+            return Err(WorkspaceError::AlreadyExists);
+        }
+        let parent = path.parent().ok_or(WorkspaceError::InvalidIdentity)?;
+        fs::create_dir_all(parent).await?;
+        let _repo_cache_guard = if let Some(locks) = &self.repo_cache_locks {
+            Some(locks.acquire(repo_path).await)
+        } else {
+            None
+        };
+        let _ = git_command()
+            .args(["worktree", "prune"])
+            .current_dir(repo_path)
+            .output()
+            .await;
+        let output = git_command()
+            .args(&args)
+            .current_dir(repo_path)
+            .output()
+            .await?;
+        if !output.status.success() {
+            return Err(git::GitError::CommandFailed {
+                command: format!("git {}", args.join(" ")),
+                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            }
+            .into());
+        }
+        if branch.starts_with("detached:") {
+            set_tree_read_only(&path).await?;
+        }
+        Ok(path)
+    }
+
+    /// Remove only one child worktree from its group; never remove the shared
+    /// root or any sibling repository.
+    pub async fn cleanup_group_worktree(
+        &self,
+        repo_path: &str,
+        task_id: &str,
+        work_unit_id: &str,
+        group_id: &str,
+        repo_id: &str,
+    ) -> Result<()> {
+        let path = self.work_unit_group_worktree_path(task_id, work_unit_id, group_id, repo_id)?;
+        let _repo_cache_guard = if let Some(locks) = &self.repo_cache_locks {
+            Some(locks.acquire(repo_path).await)
+        } else {
+            None
+        };
+        if fs::try_exists(&path).await? {
+            set_tree_writable(&path).await?;
+            let args = ["worktree", "remove", "--force", &path.to_string_lossy()];
+            let output = git_command()
+                .args(args)
+                .current_dir(repo_path)
+                .output()
+                .await?;
+            if !output.status.success() {
+                return Err(git::GitError::CommandFailed {
+                    command: format!("git {}", args.join(" ")),
+                    stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                    stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                }
+                .into());
+            }
+        }
+        let _ = git_command()
+            .args(["worktree", "prune"])
+            .current_dir(repo_path)
+            .output()
+            .await;
+        Ok(())
+    }
+
+    pub async fn set_group_worktree_read_only(
+        &self,
+        task_id: &str,
+        work_unit_id: &str,
+        group_id: &str,
+        repo_id: &str,
+    ) -> Result<()> {
+        let path = self.work_unit_group_worktree_path(task_id, work_unit_id, group_id, repo_id)?;
+        set_tree_read_only(&path).await
     }
 
     /// Recover a missing WorkUnit worktree from its exact persisted branch.
@@ -517,6 +758,82 @@ fn validate_identity_segment(value: &str) -> Result<()> {
         return Err(WorkspaceError::InvalidIdentity);
     }
     Ok(())
+}
+
+fn validate_commit_id(value: &str) -> Result<()> {
+    if !matches!(value.len(), 40 | 64) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(WorkspaceError::InvalidIdentity);
+    }
+    Ok(())
+}
+
+async fn set_tree_read_only(root: &Path) -> Result<()> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut paths = Vec::new();
+    while let Some(path) = pending.pop() {
+        let metadata = fs::symlink_metadata(&path).await?;
+        let file_type = metadata.file_type();
+        if file_type.is_dir() {
+            let mut entries = fs::read_dir(&path).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                pending.push(entry.path());
+            }
+        }
+        if !file_type.is_symlink() {
+            paths.push(path);
+        }
+    }
+    for path in paths.into_iter().rev() {
+        let metadata = fs::symlink_metadata(&path).await?;
+        let mut permissions = metadata.permissions();
+        set_readonly_permissions(&mut permissions);
+        fs::set_permissions(path, permissions).await?;
+    }
+    Ok(())
+}
+
+async fn set_tree_writable(root: &Path) -> Result<()> {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let metadata = fs::symlink_metadata(&path).await?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            continue;
+        }
+        let mut permissions = metadata.permissions();
+        set_writable_permissions(&mut permissions, file_type.is_dir());
+        fs::set_permissions(&path, permissions).await?;
+        if file_type.is_dir() {
+            let mut entries = fs::read_dir(&path).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                pending.push(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_readonly_permissions(permissions: &mut std::fs::Permissions) {
+    use std::os::unix::fs::PermissionsExt;
+    permissions.set_mode(permissions.mode() & !0o222);
+}
+
+#[cfg(not(unix))]
+fn set_readonly_permissions(permissions: &mut std::fs::Permissions) {
+    permissions.set_readonly(true);
+}
+
+#[cfg(unix)]
+fn set_writable_permissions(permissions: &mut std::fs::Permissions, is_dir: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let execute = if is_dir { 0o100 } else { 0 };
+    permissions.set_mode(permissions.mode() | 0o200 | execute);
+}
+
+#[cfg(not(unix))]
+fn set_writable_permissions(permissions: &mut std::fs::Permissions, _is_dir: bool) {
+    permissions.set_readonly(false);
 }
 
 fn repo_name(repo_url: &str) -> String {

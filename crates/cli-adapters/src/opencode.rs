@@ -641,7 +641,33 @@ impl HarnessAdapter for OpencodeAdapter {
             stream.agent_session_id.as_deref(),
         )?;
 
+        let group_worktrees =
+            executors::workspace_group_writable_paths(Path::new(&ctx.worktree_path));
         let after_sha = if !ctx.has_repository_workspace || ctx.role == "project_copilot" {
+            None
+        } else if let Some(worktrees) = group_worktrees.as_ref() {
+            let subject = crate::commit::build_commit_subject(Some(&ctx.description), &ctx.task_id);
+            for worktree in worktrees {
+                if let Err(error) = crate::commit::commit_worktree_changes_for_role(
+                    &ctx.role,
+                    worktree,
+                    &subject,
+                    &ctx.agent_config,
+                )
+                .await
+                {
+                    return Ok(ExecutionResult {
+                        status: ExecutionOutcome::Failed,
+                        after_sha: None,
+                        agent_session_id: stream.agent_session_id,
+                        assistant_output: stream.assistant_output,
+                        summary: stream.summary,
+                        error: Some(error.to_string()),
+                        usage: None,
+                        ..Default::default()
+                    });
+                }
+            }
             None
         } else if let Ok(false) = git::is_worktree_clean(Path::new(&ctx.worktree_path)).await {
             let subject = crate::commit::build_commit_subject(Some(&ctx.description), &ctx.task_id);
@@ -649,13 +675,17 @@ impl HarnessAdapter for OpencodeAdapter {
                 &ctx.role,
                 Path::new(&ctx.worktree_path),
                 &subject,
+                &ctx.agent_config,
             )
             .await
             .unwrap_or(None)
         } else {
             None
         };
-        let after_sha = if !ctx.has_repository_workspace || ctx.role == "project_copilot" {
+        let after_sha = if group_worktrees.is_some()
+            || !ctx.has_repository_workspace
+            || ctx.role == "project_copilot"
+        {
             None
         } else {
             match after_sha {

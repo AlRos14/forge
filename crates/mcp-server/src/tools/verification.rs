@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use db::{
     MicroFixReceiptRepo, PageRequest, PrExternalActionRepo, PrExternalActionState, PrReworkRepo,
-    SortBy, SortOrder, TaskCoordinatorReplanRepo, ValidationCheckRequestRepo,
-    ValidationComparisonRepo, WorkUnitFallbackReceiptRepo,
+    SortBy, SortOrder, TaskCoordinatorReplanRepo, TaskIntegrationOperationRepo,
+    ValidationCheckRequestRepo, ValidationComparisonRepo, WorkUnitFallbackReceiptRepo,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -457,37 +457,35 @@ pub(super) async fn forge_list_task_pr_feedback(
     let page = PrService::new(Arc::clone(&state.db), Arc::clone(&state.event_bus))
         .list_task_external_feedback(&params.task_id, params.cursor, params.limit.unwrap_or(20))
         .await?;
-    let items = page
-        .items
-        .into_iter()
-        .map(|item| {
-            json!({
-                "id": item.id,
-                "task_id": item.task_id,
-                "admission_id": item.admission_id,
-                "provider_item_id": item.provider_item_id,
-                "kind": item.kind,
-                "author_login": item.author_login,
-                "author_association": item.author_association,
-                "review_state": item.review_state,
-                "path": item.path,
-                "line": item.line,
-                "commit_sha": item.commit_sha,
-                "body": item.body,
-                "body_truncated": item.body_truncated,
-                "body_digest": item.body_digest,
-                "provider_url": item.provider_url,
-                "trust_class": item.trust_class,
-                "head_state": item.head_state,
-                "disposition": item.disposition,
-                "dismiss_reason": item.dismiss_reason,
-                "scope_classification": item.scope_classification,
-                "human_decision_id": item.human_decision_id,
-                "followup_task_id": item.followup_task_id,
-                "ingested_at": item.ingested_at,
-            })
-        })
-        .collect::<Vec<_>>();
+    let mut items = Vec::with_capacity(page.items.len());
+    for item in page.items {
+        items.push(json!({
+            "id": item.id,
+            "task_id": item.task_id,
+            "admission_id": item.admission_id,
+            "repo_id": item.repo_id,
+            "provider_item_id": item.provider_item_id,
+            "kind": item.kind,
+            "author_login": item.author_login,
+            "author_association": item.author_association,
+            "review_state": item.review_state,
+            "path": item.path,
+            "line": item.line,
+            "commit_sha": item.commit_sha,
+            "body": item.body,
+            "body_truncated": item.body_truncated,
+            "body_digest": item.body_digest,
+            "provider_url": item.provider_url,
+            "trust_class": item.trust_class,
+            "head_state": item.head_state,
+            "disposition": item.disposition,
+            "dismiss_reason": item.dismiss_reason,
+            "scope_classification": item.scope_classification,
+            "human_decision_id": item.human_decision_id,
+            "followup_task_id": item.followup_task_id,
+            "ingested_at": item.ingested_at,
+        }));
+    }
     Ok(json!({"items": items, "next_cursor": page.next_cursor}))
 }
 
@@ -502,29 +500,37 @@ pub(super) async fn forge_list_task_pr_rework(
         &page(params.cursor, params.limit),
     )
     .await?;
-    let items = page
-        .items
-        .into_iter()
-        .map(|item| {
-            json!({
-                "id": item.id,
-                "task_id": item.task_id,
-                "task_merge_operation_id": item.task_merge_operation_id,
-                "publish_operation_id": item.publish_operation_id,
-                "metadata_id": item.metadata_id,
-                "request_id": item.request_id,
-                "triage_set_digest": item.triage_set_digest,
-                "provider_pr_id": item.provider_pr_id,
-                "superseded_head_sha": item.superseded_head_sha,
-                "state": item.state.to_string(),
-                "readmission_merge_operation_id": item.readmission_merge_operation_id,
-                "convergence_decision_id": item.convergence_decision_id,
-                "version": item.version,
-                "created_at": item.created_at,
-                "updated_at": item.updated_at,
-            })
-        })
-        .collect::<Vec<_>>();
+    let mut items = Vec::with_capacity(page.items.len());
+    for item in page.items {
+        let admission = TaskIntegrationOperationRepo::get_remote_pr_admission(
+            &*state.db,
+            &item.task_merge_operation_id,
+        )
+        .await?
+        .filter(|admission| admission.task_id == item.task_id)
+        .ok_or_else(|| {
+            McpToolError::not_found("remote_pr_admission", item.task_merge_operation_id.clone())
+        })?;
+        items.push(json!({
+            "id": item.id,
+            "task_id": item.task_id,
+            "repo_id": admission.repo_id,
+            "admission_id": item.task_merge_operation_id,
+            "task_merge_operation_id": item.task_merge_operation_id,
+            "publish_operation_id": item.publish_operation_id,
+            "metadata_id": item.metadata_id,
+            "request_id": item.request_id,
+            "triage_set_digest": item.triage_set_digest,
+            "provider_pr_id": item.provider_pr_id,
+            "superseded_head_sha": item.superseded_head_sha,
+            "state": item.state.to_string(),
+            "readmission_merge_operation_id": item.readmission_merge_operation_id,
+            "convergence_decision_id": item.convergence_decision_id,
+            "version": item.version,
+            "created_at": item.created_at,
+            "updated_at": item.updated_at,
+        }));
+    }
     Ok(json!({"items": items, "next_cursor": page.next_cursor}))
 }
 
@@ -553,30 +559,35 @@ pub(super) async fn forge_list_task_pr_actions(
         &page(params.cursor, params.limit),
     )
     .await?;
-    let items = page
-        .items
-        .into_iter()
-        .map(|item| {
-            json!({
-                "id": item.id,
-                "task_id": item.task_id,
-                "admission_id": item.admission_id,
-                "kind": item.kind.to_string(),
-                "state": item.state.to_string(),
-                "authorization_mode": item.authorization_mode.to_string(),
-                "gate_evaluation_id": item.gate_evaluation_id,
-                "subject_commit_sha": item.subject_commit_sha,
-                "expected_remote_head_sha": item.expected_remote_head_sha,
-                "summary_artifact_id": item.summary_artifact_id,
-                "body_digest": item.body_digest,
-                "proposal_id": item.proposal_id,
-                "decision_id": item.decision_id,
-                "version": item.version,
-                "created_at": item.created_at,
-                "updated_at": item.updated_at,
-                "finished_at": item.finished_at,
-            })
-        })
-        .collect::<Vec<_>>();
+    let mut items = Vec::with_capacity(page.items.len());
+    for item in page.items {
+        let admission =
+            TaskIntegrationOperationRepo::get_remote_pr_admission(&*state.db, &item.admission_id)
+                .await?
+                .filter(|admission| admission.task_id == item.task_id)
+                .ok_or_else(|| {
+                    McpToolError::not_found("remote_pr_admission", item.admission_id.clone())
+                })?;
+        items.push(json!({
+            "id": item.id,
+            "task_id": item.task_id,
+            "admission_id": item.admission_id,
+            "repo_id": admission.repo_id,
+            "kind": item.kind.to_string(),
+            "state": item.state.to_string(),
+            "authorization_mode": item.authorization_mode.to_string(),
+            "gate_evaluation_id": item.gate_evaluation_id,
+            "subject_commit_sha": item.subject_commit_sha,
+            "expected_remote_head_sha": item.expected_remote_head_sha,
+            "summary_artifact_id": item.summary_artifact_id,
+            "body_digest": item.body_digest,
+            "proposal_id": item.proposal_id,
+            "decision_id": item.decision_id,
+            "version": item.version,
+            "created_at": item.created_at,
+            "updated_at": item.updated_at,
+            "finished_at": item.finished_at,
+        }));
+    }
     Ok(json!({"items": items, "next_cursor": page.next_cursor}))
 }

@@ -133,9 +133,10 @@ impl TaskReworkService {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         run_id: &str,
-    ) -> Result<Option<(String, String)>> {
-        Ok(sqlx::query_as::<_, (String, String)>(
-            "SELECT req.subject_kind, req.subject_id FROM validation_check_request req
+    ) -> Result<Option<(String, String, i64, String)>> {
+        Ok(sqlx::query_as::<_, (String, String, i64, String)>(
+            "SELECT req.subject_kind, req.subject_id, req.subject_version, req.workspace_id
+             FROM validation_check_request req
              WHERE req.candidate_run_id=?",
         )
         .bind(run_id)
@@ -189,7 +190,9 @@ impl TaskReworkService {
         created_by: &db::ActorRef,
         now: &str,
     ) -> Result<String> {
-        let Some((subject_kind, subject_id)) = self.validation_subject(tx, run_id).await? else {
+        let Some((subject_kind, subject_id, subject_version, checked_workspace_id)) =
+            self.validation_subject(tx, run_id).await?
+        else {
             return Err(crate::task_coordination::output_not_permitted(
                 "correct requires a catalog check request subject",
             ));
@@ -199,14 +202,82 @@ impl TaskReworkService {
                 "correct is available only for a WorkUnit result; use recheck or human",
             ));
         }
-        let unit: (String, i64) = sqlx::query_as(
-            "SELECT role, requires_integration FROM work_unit WHERE id=? AND task_id=?",
+        let unit: (String, i64, Option<String>) = sqlx::query_as(
+            "SELECT work_unit.role, work_unit.requires_integration, primary_repository.repo_id
+             FROM work_unit
+             LEFT JOIN work_unit_repository_set_revision repository_pin
+               ON repository_pin.work_unit_id = work_unit.id
+              AND repository_pin.task_id = work_unit.task_id
+             LEFT JOIN task_repository_set_revision_repo primary_repository
+               ON primary_repository.task_id = repository_pin.task_id
+              AND primary_repository.revision = repository_pin.revision
+              AND primary_repository.role = 'primary'
+             WHERE work_unit.id=? AND work_unit.task_id=?",
         )
         .bind(&subject_id)
         .bind(task_id)
         .fetch_optional(&mut **tx)
         .await?
         .ok_or_else(|| ServiceError::not_found("work_unit", subject_id.clone()))?;
+        let execution_id: String = sqlx::query_scalar(
+            "SELECT execution.id FROM execution
+             JOIN execution_repository_result result
+               ON result.execution_id=execution.id
+             WHERE execution.task_id=? AND execution.work_unit_id=?
+               AND execution.work_unit_version=? AND execution.status='completed'
+               AND result.workspace_id=?
+             ORDER BY execution.created_at DESC, execution.id DESC LIMIT 1",
+        )
+        .bind(task_id)
+        .bind(&subject_id)
+        .bind(subject_version)
+        .bind(&checked_workspace_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| {
+            crate::task_coordination::output_not_permitted(
+                "correct requires a check pinned to an exact completed repository result",
+            )
+        })?;
+        let result_rows = sqlx::query(
+            "SELECT result.execution_id, result.task_id, result.repo_id, result.workspace_id,
+                    result.before_sha, result.after_sha, result.snapshot_digest, result.created_at
+             FROM execution_repository_result result
+             JOIN execution ON execution.id=result.execution_id
+             WHERE execution.id=? AND execution.task_id=? AND execution.work_unit_id=?
+               AND execution.work_unit_version=? AND execution.status='completed'
+             ORDER BY result.repo_id",
+        )
+        .bind(&execution_id)
+        .bind(task_id)
+        .bind(&subject_id)
+        .bind(subject_version)
+        .fetch_all(&mut **tx)
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(db::ExecutionRepositoryResult {
+                execution_id: row.try_get("execution_id")?,
+                task_id: row.try_get("task_id")?,
+                repo_id: row.try_get("repo_id")?,
+                workspace_id: row.try_get("workspace_id")?,
+                before_sha: row.try_get("before_sha")?,
+                after_sha: row.try_get("after_sha")?,
+                snapshot_digest: row.try_get("snapshot_digest")?,
+                created_at: row.try_get("created_at")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+        if result_rows.is_empty() {
+            return Err(crate::task_coordination::output_not_permitted(
+                "correct requires repository results for the exact checked WorkUnit",
+            ));
+        }
+        if unit.2.is_none() {
+            return Err(ServiceError::invalid_operation(
+                "checked repository results have no pinned primary repository",
+            ));
+        }
         self.consume_validation_round(tx, task_id).await?;
         let contributor = sole_work_unit_contributor(&self.db, task_id, &subject_id).await?;
         let role_id: Option<String> =
@@ -240,6 +311,62 @@ impl TaskReworkService {
             Some(("work_unit", &subject_id, None)),
             created_by,
             now,
+        )
+        .await?;
+        for result in &result_rows {
+            sqlx::query(
+                "INSERT INTO work_unit_repository(work_unit_id, task_id, repo_id, created_at)
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(&id)
+            .bind(task_id)
+            .bind(&result.repo_id)
+            .bind(now)
+            .execute(&mut **tx)
+            .await?;
+        }
+        let primary_result = unit
+            .2
+            .as_deref()
+            .and_then(|repo_id| result_rows.iter().find(|result| result.repo_id == repo_id));
+        sqlx::query(
+            "INSERT INTO work_unit_result_requirement (
+                work_unit_id, task_id, source_work_unit_id, source_work_unit_version,
+                result_execution_id, result_artifact_id, result_commit_sha,
+                result_workspace_id, workspace_snapshot_digest, created_at
+             ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(task_id)
+        .bind(&subject_id)
+        .bind(subject_version)
+        .bind(&execution_id)
+        .bind(primary_result.and_then(|result| result.after_sha.as_deref()))
+        .bind(primary_result.map(|result| result.workspace_id.as_str()))
+        .bind(primary_result.and_then(|result| result.snapshot_digest.as_deref()))
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
+        let requirement_repositories = result_rows
+            .iter()
+            .map(|result| db::WorkUnitResultRequirementRepository {
+                work_unit_id: id.clone(),
+                task_id: task_id.to_owned(),
+                repo_id: result.repo_id.clone(),
+                source_work_unit_id: subject_id.clone(),
+                source_work_unit_version: subject_version,
+                result_execution_id: execution_id.clone(),
+                result_artifact_id: None,
+                result_commit_sha: result.after_sha.clone(),
+                result_workspace_id: Some(result.workspace_id.clone()),
+                workspace_snapshot_digest: result.snapshot_digest.clone(),
+                created_at: now.to_owned(),
+            })
+            .collect::<Vec<_>>();
+        WorkUnitRepo::insert_result_requirement_repositories_in_tx(
+            &*self.db,
+            tx,
+            &requirement_repositories,
         )
         .await?;
         Ok(id)

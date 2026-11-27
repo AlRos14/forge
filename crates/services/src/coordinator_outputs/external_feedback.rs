@@ -333,6 +333,7 @@ impl ExternalFeedbackPlanItem {
             review_subject_key: self.review_subject_key.clone(),
             acceptance: self.acceptance.clone(),
             artifact_inputs: self.artifact_inputs.clone(),
+            repository_ids: Vec::new(),
         }
     }
 

@@ -23,7 +23,7 @@ use events::EventBus;
 use crate::credential_service::CredentialService;
 use crate::pr_github_client::{DefaultPrProviderFactory, PrProviderFactory};
 use crate::pr_rework::{ObserveOutcome, PrReworkService};
-use crate::pr_service::{provider_for_admission, PrProvider};
+use crate::pr_service::{provider_for_admission, PrProvider, RemotePrAdmissionKey};
 use crate::Result;
 
 const WATCH_BATCH: i64 = 200;
@@ -117,10 +117,17 @@ impl PrReworkWatcher {
         else {
             return Ok(None);
         };
-        let Some(metadata) = PrMetadataRepo::get_by_task_id(&*self.db, &admission.task_id).await?
+        let key = RemotePrAdmissionKey::from_admission(&admission)?;
+        let Some(metadata) =
+            PrMetadataRepo::get_by_task_repo(&*self.db, &key.task_id, &key.repo_id).await?
         else {
             return Ok(None);
         };
+        if metadata.id != admission.metadata_id
+            || metadata.task_merge_operation_id.as_deref() != Some(key.admission_id.as_str())
+        {
+            return Ok(None);
+        }
         let provider = match self.provider(&admission).await {
             Ok(provider) => provider,
             Err(error) => {

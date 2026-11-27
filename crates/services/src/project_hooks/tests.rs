@@ -690,6 +690,7 @@ async fn seed_task(
     TaskRepo::create(
         db,
         CreateTask {
+            repositories: Vec::new(),
             id: new_uuid_v4(),
             project_id: project_id.to_owned(),
             repo_id: None,

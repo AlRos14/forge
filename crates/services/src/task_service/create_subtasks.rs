@@ -47,6 +47,7 @@ impl TaskService {
                 &*self.db,
                 &mut transaction,
                 CreateTask {
+                    repositories: Vec::new(),
                     id: task_id.clone(),
                     project_id: parent.project_id.clone(),
                     repo_id: parent.repo_id.clone(),

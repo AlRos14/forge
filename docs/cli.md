@@ -58,6 +58,12 @@ select an implicit Task Agent or Workspace.
 If a provider Start is uncertain, inspect the exact admitted Execution and
 follow the recovery contract. Do not automatically submit another Start.
 
+`task get` and `task list --output json` expose the Task repository revision,
+per-repository integration and PR state, and repository merge-batch history.
+Forge keeps the existing CLI command set: repository integration, merge, PR
+actions, and repository-set replan decisions use the REST/MCP flows. A PR merge
+is always a Human decision.
+
 Task coordination is available without creating WorkUnits by hand:
 
 ```text

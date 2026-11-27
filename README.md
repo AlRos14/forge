@@ -78,9 +78,9 @@ exposure.
 ## Project identity and history
 
 The workspace source version is 0.9.1.
-The current schema contains migrations through V180. Migration records,
-historical specifications, earlier design documents, and ProjectRelease
-snapshots remain historical evidence.
+The current schema contains migrations through V181; M1 adds Task and WorkUnit
+repository scopes. Migration records, historical specifications, earlier
+design documents, and ProjectRelease snapshots remain historical evidence.
 
 The product name remains Forge until its owner provides a replacement name.
 This repository preserves its MIT license and upstream attribution.

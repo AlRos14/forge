@@ -3,14 +3,14 @@ use axum::{
     extract::{Path, State},
     Json,
 };
-use db::{CollaborationRepo, ExecutionRepo, ValidationRunRepo};
+use db::{CollaborationRepo, ExecutionRepo, ValidationRunRepo, WorkspaceRepo};
 
 use crate::{
     errors::{ApiError, ApiResult},
     routes::{
         auth::AuthenticatedUser,
         collaboration::artifact_response,
-        execution_response,
+        execution_response_with_repository_results,
         tasks::{require_task_mutable, require_task_visible},
     },
     state::AppState,
@@ -51,7 +51,7 @@ pub async fn get_review(
     .map(|artifact| artifact_response(artifact, true))
     .transpose()?;
     Ok(Json(ReviewExecutionResponse {
-        execution: execution_response(execution),
+        execution: execution_response_with_repository_results(&state.db, execution).await?,
         report,
     }))
 }
@@ -71,7 +71,7 @@ pub async fn submit_review_report(
     let report = artifact_response(report, true)?;
     Ok(Json(SubmitReviewReportResponse {
         review_execution: ReviewExecutionResponse {
-            execution: execution_response(execution),
+            execution: execution_response_with_repository_results(&state.db, execution).await?,
             report: Some(report.clone()),
         },
         report,
@@ -131,6 +131,9 @@ async fn validation_run_response(
     state: &AppState,
     run: db::ValidationRun,
 ) -> ApiResult<api_types::ValidationRunResponse> {
+    let workspace = WorkspaceRepo::get_by_id(&*state.db, &run.workspace_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("workspace", run.workspace_id.clone()))?;
     let evidence = ValidationRunRepo::list_evidence_for_validation_run(&*state.db, &run.id).await?;
     let artifact =
         ValidationRunRepo::get_validation_run_artifact_output(&*state.db, &run.id).await?;
@@ -140,6 +143,7 @@ async fn validation_run_response(
     Ok(api_types::ValidationRunResponse {
         id: run.id,
         task_id: run.task_id,
+        repo_id: workspace.repo_id,
         work_unit_id: run.work_unit_id,
         caused_by_execution_id: run.caused_by_execution_id,
         check_identity: run.check_identity,

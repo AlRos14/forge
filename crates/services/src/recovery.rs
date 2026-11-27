@@ -813,28 +813,36 @@ async fn revoke_active_workspace_lease(db: &SqliteDb, execution_id: &str) {
             return;
         }
     };
-    let lease_result = match execution.work_unit_id.as_deref() {
-        Some(work_unit_id) => WorkspaceLeaseRepo::get_active_for_work_unit(db, work_unit_id).await,
-        None => WorkspaceLeaseRepo::get_active_for_task(db, &execution.task_id).await,
+    let leases = match execution.work_unit_id.as_deref() {
+        Some(work_unit_id) => WorkspaceLeaseRepo::list_active_for_work_unit(db, work_unit_id)
+            .await
+            .map(Some),
+        None => WorkspaceLeaseRepo::get_active_for_task(db, &execution.task_id)
+            .await
+            .map(|lease| lease.map(|lease| vec![lease])),
     };
-    match lease_result {
-        Ok(Some(lease)) if lease.execution_id == execution_id => {
-            if let Err(error) =
-                WorkspaceLeaseRepo::revoke(db, &lease.id, lease.version, &now_rfc3339()).await
-            {
-                tracing::warn!(
-                    execution_id,
-                    lease_id = %lease.id,
-                    %error,
-                    "failed to revoke WorkspaceLease at recovery terminal boundary"
-                );
+    match leases {
+        Ok(Some(leases)) => {
+            for lease in leases {
+                if lease.execution_id != execution_id {
+                    tracing::debug!(
+                        execution_id,
+                        lease_id = %lease.id,
+                        "leaving another Execution's WorkspaceLease active"
+                    );
+                    continue;
+                }
+                if let Err(error) =
+                    WorkspaceLeaseRepo::revoke(db, &lease.id, lease.version, &now_rfc3339()).await
+                {
+                    tracing::warn!(
+                        execution_id,
+                        lease_id = %lease.id,
+                        %error,
+                        "failed to revoke WorkspaceLease at recovery terminal boundary"
+                    );
+                }
             }
-        }
-        Ok(Some(_)) => {
-            tracing::debug!(
-                execution_id,
-                "leaving another Execution's WorkspaceLease active"
-            );
         }
         Ok(None) => {}
         Err(error) => {
@@ -1890,6 +1898,7 @@ mod tests {
         let task = TaskRepo::create(
             db,
             CreateTask {
+                repositories: Vec::new(),
                 id: new_uuid_v4(),
                 project_id,
                 repo_id: Some(repo_id),
@@ -2042,6 +2051,7 @@ mod tests {
         let work_unit = db::WorkUnitRepo::create(
             db,
             db::CreateWorkUnit {
+                repository_ids: Vec::new(),
                 id: work_unit_id.clone(),
                 task_id: task_id.clone(),
                 parent_work_unit_id: None,
@@ -2122,7 +2132,7 @@ mod tests {
                 },
                 work_unit_id,
                 work_unit_version: work_unit.version,
-                workspace_lease: None,
+                workspace_leases: Vec::new(),
             },
             db::CreateDomainEvent {
                 id: new_uuid_v4(),

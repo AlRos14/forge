@@ -27,10 +27,16 @@ vi.mock('@/stores/auth', () => ({
     selector({ user: { id: 'user-1', is_admin: false } }),
 }))
 
-const task = { id: 'task-1', project_id: 'project-1' } as unknown as Task
-const members = [
-  { user_id: 'user-1', role: 'owner' },
-] as ProjectMemberResponse[]
+const task = {
+  id: 'task-1',
+  project_id: 'project-1',
+  repo_id: null,
+  repositories: [],
+  repository_set_revision: 0,
+  repository_set_digest: null,
+  repository_merge_batches: [],
+} as unknown as Task
+const members = [{ user_id: 'user-1', role: 'owner' }] as ProjectMemberResponse[]
 
 function actionResponse(): PrExternalActionListResponse {
   return {
@@ -38,6 +44,7 @@ function actionResponse(): PrExternalActionListResponse {
       {
         id: 'action-1',
         task_id: 'task-1',
+        repo_id: 'repo-1',
         admission_id: 'admission-1',
         kind: 'push_update',
         state: 'proposed',
@@ -104,7 +111,9 @@ describe('TaskPrActionsPanel', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Reject action' }))
 
-    expect((await screen.findByRole('status')).textContent).toMatch(/changed while you were reading/)
+    expect((await screen.findByRole('status')).textContent).toMatch(
+      /changed while you were reading/,
+    )
     expect(actions.query.refetch).toHaveBeenCalled()
   })
 

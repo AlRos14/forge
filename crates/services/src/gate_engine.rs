@@ -1,4 +1,7 @@
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use db::{
     new_uuid_v4, now_rfc3339, ActorKind, ActorRef, ArtifactKind, CollaborationRepo,
@@ -7,8 +10,9 @@ use db::{
     GateEvaluationOutcome, GateEvaluationWrite, GatePolicyRevision, GateRepo, GateScopeKind,
     ProposalStatus, RoleMembershipRepo, RoleMembershipStatus, SqliteDb,
     TaskIntegrationOperationKind, TaskIntegrationOperationRepo, TaskLifecycleRepo,
-    TaskLifecycleState, TaskLifecycleTransitionFact, TaskRepo, TaskRoleRepo, ValidationRunRepo,
-    ValidationRunStatus, WorkUnitRepo, WorkUnitStatus,
+    TaskLifecycleState, TaskLifecycleTransitionFact, TaskRepo, TaskRepositoryMergeBatchRepo,
+    TaskRepositorySetRepo, TaskRoleRepo, ValidationRunRepo, ValidationRunStatus, WorkUnitRepo,
+    WorkUnitStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -69,6 +73,47 @@ pub struct GatePolicyDocumentV2 {
     pub required_checks: Vec<RequiredCheck>,
 }
 
+/// Exact repository-scoped catalog check used by Gate policy schema v3.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequiredCheckV3 {
+    pub repo_id: String,
+    pub check_key: String,
+    pub definition_digest: String,
+    pub required_outcome: ValidationRunStatus,
+}
+
+/// Gate policy schema v3 retains the common policy requirements and pins
+/// catalog checks to one repository each. Existing v1/v2 payloads remain
+/// decoded by their original structs and retain their serialized shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatePolicyDocumentV3 {
+    pub schema_version: u32,
+    #[serde(default)]
+    pub scope_requirement: Option<GateScopeRequirement>,
+    #[serde(default)]
+    pub review: Option<ReviewSetPolicy>,
+    #[serde(default)]
+    pub validations: Vec<ValidationRequirement>,
+    #[serde(default)]
+    pub decisions: Vec<DecisionRequirement>,
+    #[serde(default)]
+    pub work_units: Vec<WorkUnitRequirement>,
+    #[serde(default)]
+    pub required_checks: Vec<RequiredCheckV3>,
+}
+
+/// Changed repository subject supplied by deterministic integration. Checks
+/// consume this exact Workspace and commit rather than resolving a Task-wide
+/// integration Workspace by recency or primary-repository shorthand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryValidationSubject {
+    pub repo_id: String,
+    pub workspace_id: String,
+    pub commit_sha: String,
+}
+
 const MAX_REQUIRED_CHECKS: usize = 16;
 
 impl GatePolicyDocumentV2 {
@@ -94,6 +139,37 @@ impl GatePolicyDocumentV2 {
     fn from_parts(base: GatePolicyDocument, required_checks: Vec<RequiredCheck>) -> Self {
         Self {
             schema_version: 2,
+            scope_requirement: base.scope_requirement,
+            review: base.review,
+            validations: base.validations,
+            decisions: base.decisions,
+            work_units: base.work_units,
+            required_checks,
+        }
+    }
+}
+
+impl GatePolicyDocumentV3 {
+    fn into_parts(self) -> Result<(GatePolicyDocument, Vec<RequiredCheckV3>)> {
+        if self.schema_version != 3 {
+            return Err(invalid("Gate policy v3 must use schema version 3"));
+        }
+        Ok((
+            GatePolicyDocument {
+                schema_version: 1,
+                scope_requirement: self.scope_requirement,
+                review: self.review,
+                validations: self.validations,
+                decisions: self.decisions,
+                work_units: self.work_units,
+            },
+            self.required_checks,
+        ))
+    }
+
+    fn from_parts(base: GatePolicyDocument, required_checks: Vec<RequiredCheckV3>) -> Self {
+        Self {
+            schema_version: 3,
             scope_requirement: base.scope_requirement,
             review: base.review,
             validations: base.validations,
@@ -134,6 +210,45 @@ fn normalize_required_checks(mut checks: Vec<RequiredCheck>) -> Result<Vec<Requi
         .any(|pair| pair[0].check_key == pair[1].check_key)
     {
         return Err(invalid("required_checks contains a duplicate check_key"));
+    }
+    Ok(checks)
+}
+
+fn normalize_required_checks_v3(mut checks: Vec<RequiredCheckV3>) -> Result<Vec<RequiredCheckV3>> {
+    if checks.len() > MAX_REQUIRED_CHECKS {
+        return Err(invalid("Gate policy accepts at most 16 required_checks"));
+    }
+    for check in &checks {
+        validate_text("required_checks.repo_id", &check.repo_id, 128)?;
+        if !crate::validation_catalog::is_valid_check_key(&check.check_key) {
+            return Err(invalid(
+                "required_checks check_key must be a slug of 1 to 64 [a-z0-9_-] bytes",
+            ));
+        }
+        if check.definition_digest.len() != 64
+            || !check
+                .definition_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(invalid(
+                "required_checks definition_digest must be 64 lowercase hex characters",
+            ));
+        }
+        if check.required_outcome != ValidationRunStatus::Passed {
+            return Err(invalid("required_checks must require the passed outcome"));
+        }
+    }
+    checks.sort_by(|left, right| {
+        (&left.repo_id, &left.check_key).cmp(&(&right.repo_id, &right.check_key))
+    });
+    if checks
+        .windows(2)
+        .any(|pair| pair[0].repo_id == pair[1].repo_id && pair[0].check_key == pair[1].check_key)
+    {
+        return Err(invalid(
+            "required_checks contains a duplicate repository and check_key",
+        ));
     }
     Ok(checks)
 }
@@ -304,6 +419,54 @@ struct InputDraft {
     status: String,
 }
 
+fn exact_reviewed_result_matches(
+    actual: &Value,
+    expected: &crate::task_rework::WorkUnitReviewSubject,
+) -> bool {
+    let mut expected_json = json!({
+        "execution_id": expected.result_execution_id,
+        "artifact_id": expected.result_artifact_id,
+        "commit_sha": expected.result_commit_sha,
+        "workspace_id": expected.result_workspace_id,
+        "workspace_snapshot_digest": expected.workspace_snapshot_digest,
+    });
+    if actual.get("repository_results").is_some() {
+        expected_json["repository_results"] = json!(expected
+            .repositories
+            .iter()
+            .map(|repository| json!({
+                "repo_id": repository.repo_id,
+                "reviewed_work_unit_version": repository.reviewed_work_unit_version,
+                "result_execution_id": repository.result_execution_id,
+                "result_artifact_id": repository.result_artifact_id,
+                "result_commit_sha": repository.result_commit_sha,
+                "result_workspace_id": repository.result_workspace_id,
+                "workspace_snapshot_digest": repository.workspace_snapshot_digest,
+            }))
+            .collect::<Vec<_>>());
+    } else {
+        // Reports written before M2 carried only the scalar result. Accept
+        // that shape only when its scalar pins fully represent the repository
+        // set (empty for workspace-free work, or one matching primary result).
+        let legacy_scalar_is_exact = match expected.repositories.as_slice() {
+            [] => true,
+            [repository] => {
+                repository.reviewed_work_unit_version == expected.reviewed_work_unit_version
+                    && repository.result_execution_id == expected.result_execution_id
+                    && repository.result_artifact_id == expected.result_artifact_id
+                    && repository.result_commit_sha == expected.result_commit_sha
+                    && repository.result_workspace_id == expected.result_workspace_id
+                    && repository.workspace_snapshot_digest == expected.workspace_snapshot_digest
+            }
+            _ => false,
+        };
+        if !legacy_scalar_is_exact {
+            return false;
+        }
+    }
+    actual == &expected_json
+}
+
 impl GateEngine {
     pub fn new(db: Arc<SqliteDb>, event_bus: Arc<events::EventBus>) -> Self {
         Self { db, event_bus }
@@ -370,6 +533,20 @@ impl GateEngine {
     ) -> Result<(Gate, GatePolicyRevision)> {
         let (base, checks) = policy.into_parts()?;
         self.create_gate_with_policy(task_id, gate_kind, scope_kind, scope_id, base, Some(checks))
+            .await
+    }
+
+    /// Create a Gate whose policy revision uses repo-scoped catalog checks.
+    pub async fn create_gate_with_initial_policy_v3(
+        &self,
+        task_id: &str,
+        gate_kind: &str,
+        scope_kind: GateScopeKind,
+        scope_id: &str,
+        policy: GatePolicyDocumentV3,
+    ) -> Result<(Gate, GatePolicyRevision)> {
+        let (base, checks) = policy.into_parts()?;
+        self.create_gate_with_policy_v3(task_id, gate_kind, scope_kind, scope_id, base, checks)
             .await
     }
 
@@ -456,6 +633,87 @@ impl GateEngine {
         Ok((gate_write.record, policy_write.record))
     }
 
+    async fn create_gate_with_policy_v3(
+        &self,
+        task_id: &str,
+        gate_kind: &str,
+        scope_kind: GateScopeKind,
+        scope_id: &str,
+        mut policy: GatePolicyDocument,
+        required_checks: Vec<RequiredCheckV3>,
+    ) -> Result<(Gate, GatePolicyRevision)> {
+        validate_text("task_id", task_id, 128)?;
+        validate_text("gate_kind", gate_kind, 64)?;
+        validate_text("scope_id", scope_id, 128)?;
+        normalize_policy(&mut policy)?;
+        let required_checks = normalize_required_checks_v3(required_checks)?;
+        let gate_id = new_uuid_v4();
+        let now = now_rfc3339();
+        let gate = Gate {
+            id: gate_id.clone(),
+            task_id: task_id.to_owned(),
+            gate_kind: gate_kind.to_owned(),
+            scope_kind,
+            scope_id: scope_id.to_owned(),
+            active_policy_revision: Some(1),
+            created_at: now.clone(),
+        };
+        self.validate_policy_scope(&gate, &policy, !required_checks.is_empty())
+            .await?;
+        self.validate_required_check_repositories(task_id, &required_checks)
+            .await?;
+        self.validate_role_snapshots(&gate, &policy).await?;
+        let policy_json =
+            serde_json::to_string(&GatePolicyDocumentV3::from_parts(policy, required_checks))
+                .map_err(|error| invalid(format!("Gate policy cannot be serialized: {error}")))?;
+        let policy_digest = sha256(policy_json.as_bytes());
+        let policy_revision_id = format!("{gate_id}:policy:1");
+        let gate_created_event = gate_event(
+            "gate.created",
+            "gate",
+            &gate_id,
+            task_id,
+            None,
+            json!({"gate_id": gate_id, "gate_kind": gate_kind, "scope_kind": scope_kind, "scope_id": scope_id}),
+            &now,
+        );
+        let policy_event = gate_event(
+            "gate.policy_revised",
+            "gate",
+            &policy_revision_id,
+            task_id,
+            None,
+            json!({"gate_id": gate_id, "revision": 1, "policy_digest": policy_digest}),
+            &now,
+        );
+        let (gate_write, policy_write) = GateRepo::create_gate_with_initial_policy(
+            &*self.db,
+            CreateGate {
+                id: gate_id,
+                task_id: task_id.to_owned(),
+                gate_kind: gate_kind.to_owned(),
+                scope_kind,
+                scope_id: scope_id.to_owned(),
+                created_at: now.clone(),
+                event: gate_created_event,
+            },
+            CreateGatePolicyRevision {
+                gate_id: gate.id.clone(),
+                expected_active_revision: None,
+                revision: 1,
+                schema_version: 3,
+                policy_json,
+                policy_digest,
+                created_at: now,
+                event: policy_event,
+            },
+        )
+        .await?;
+        crate::DomainEventService::publish_committed_hint(&self.event_bus, &gate_write.event);
+        crate::DomainEventService::publish_committed_hint(&self.event_bus, &policy_write.event);
+        Ok((gate_write.record, policy_write.record))
+    }
+
     pub async fn revise_policy(
         &self,
         gate_id: &str,
@@ -475,6 +733,17 @@ impl GateEngine {
     ) -> Result<GatePolicyRevision> {
         let (base, checks) = policy.into_parts()?;
         self.revise_gate_policy(gate_id, expected_active_revision, base, Some(checks))
+            .await
+    }
+
+    pub async fn revise_policy_v3(
+        &self,
+        gate_id: &str,
+        expected_active_revision: Option<i64>,
+        policy: GatePolicyDocumentV3,
+    ) -> Result<GatePolicyRevision> {
+        let (base, checks) = policy.into_parts()?;
+        self.revise_gate_policy_v3(gate_id, expected_active_revision, base, checks)
             .await
     }
 
@@ -531,6 +800,57 @@ impl GateEngine {
         Ok(write.record)
     }
 
+    async fn revise_gate_policy_v3(
+        &self,
+        gate_id: &str,
+        expected_active_revision: Option<i64>,
+        mut policy: GatePolicyDocument,
+        required_checks: Vec<RequiredCheckV3>,
+    ) -> Result<GatePolicyRevision> {
+        let gate = GateRepo::get_gate(&*self.db, gate_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("gate", gate_id.to_owned()))?;
+        normalize_policy(&mut policy)?;
+        let required_checks = normalize_required_checks_v3(required_checks)?;
+        self.validate_policy_scope(&gate, &policy, !required_checks.is_empty())
+            .await?;
+        self.validate_required_check_repositories(&gate.task_id, &required_checks)
+            .await?;
+        self.validate_role_snapshots(&gate, &policy).await?;
+        let policy_json =
+            serde_json::to_string(&GatePolicyDocumentV3::from_parts(policy, required_checks))
+                .map_err(|error| invalid(format!("Gate policy cannot be serialized: {error}")))?;
+        let policy_digest = sha256(policy_json.as_bytes());
+        let revision = expected_active_revision.unwrap_or(0) + 1;
+        let now = now_rfc3339();
+        let policy_revision_id = format!("{gate_id}:policy:{revision}");
+        let event = gate_event(
+            "gate.policy_revised",
+            "gate",
+            &policy_revision_id,
+            &gate.task_id,
+            None,
+            json!({"gate_id": gate_id, "revision": revision, "policy_digest": policy_digest}),
+            &now,
+        );
+        let write = GateRepo::create_gate_policy_revision(
+            &*self.db,
+            CreateGatePolicyRevision {
+                gate_id: gate_id.to_owned(),
+                expected_active_revision,
+                revision,
+                schema_version: 3,
+                policy_json,
+                policy_digest,
+                created_at: now,
+                event,
+            },
+        )
+        .await?;
+        crate::DomainEventService::publish_committed_hint(&self.event_bus, &write.event);
+        Ok(write.record)
+    }
+
     pub async fn evaluate_active(&self, gate_id: &str) -> Result<GateEvaluationWrite> {
         let gate = GateRepo::get_gate(&*self.db, gate_id)
             .await?
@@ -550,11 +870,58 @@ impl GateEngine {
             .await
     }
 
+    /// Evaluate the active merge-readiness Gate against the exact changed
+    /// repository subjects supplied by the integration/merge lane.
+    pub async fn evaluate_required_checks_by_repo(
+        &self,
+        task_id: &str,
+        changed_repositories: &[RepositoryValidationSubject],
+    ) -> Result<GateEvaluation> {
+        let mut candidates = GateRepo::list_active_gate_policies(&*self.db, task_id)
+            .await?
+            .into_iter()
+            .filter(|(gate, revision)| {
+                gate.gate_kind == "merge_readiness"
+                    && gate.active_policy_revision == Some(revision.revision)
+            });
+        let Some((gate, revision)) = candidates.next() else {
+            return Err(ServiceError::not_found(
+                "merge-readiness gate",
+                task_id.to_owned(),
+            ));
+        };
+        if candidates.next().is_some() {
+            return Err(invalid(
+                "repository-scoped validation requires exactly one active merge-readiness Gate",
+            ));
+        }
+        let write = self
+            .evaluate_revision_with_subjects(
+                gate,
+                revision.revision,
+                None,
+                Some(changed_repositories),
+            )
+            .await?;
+        Ok(write.evaluation)
+    }
+
     async fn evaluate_revision_with_cause(
         &self,
         gate: Gate,
         revision: i64,
         causation_id: Option<String>,
+    ) -> Result<GateEvaluationWrite> {
+        self.evaluate_revision_with_subjects(gate, revision, causation_id, None)
+            .await
+    }
+
+    async fn evaluate_revision_with_subjects(
+        &self,
+        gate: Gate,
+        revision: i64,
+        causation_id: Option<String>,
+        repository_subjects: Option<&[RepositoryValidationSubject]>,
     ) -> Result<GateEvaluationWrite> {
         let policy_revision = GateRepo::get_gate_policy_revision(&*self.db, &gate.id, revision)
             .await?
@@ -565,7 +932,8 @@ impl GateEngine {
         let mut missing = Vec::new();
         let mut inputs = Vec::new();
         let mut required_checks: Vec<RequiredCheck> = Vec::new();
-        let (outcome, policy) = if !matches!(policy_revision.schema_version, 1 | 2) {
+        let mut required_checks_v3: Vec<RequiredCheckV3> = Vec::new();
+        let (outcome, policy) = if !matches!(policy_revision.schema_version, 1..=3) {
             issues.push("unknown_policy_schema".to_owned());
             (GateEvaluationOutcome::Indeterminate, None)
         } else if sha256(policy_revision.policy_json.as_bytes()) != policy_revision.policy_digest {
@@ -576,6 +944,27 @@ impl GateEngine {
                 Ok(policy) if policy.schema_version == 2 => match policy.into_parts() {
                     Ok((base, checks)) => {
                         required_checks = checks;
+                        (GateEvaluationOutcome::Unsatisfied, Some(base))
+                    }
+                    Err(_) => {
+                        issues.push("invalid_policy_shape".to_owned());
+                        (GateEvaluationOutcome::Indeterminate, None)
+                    }
+                },
+                Ok(_) => {
+                    issues.push("unknown_policy_schema".to_owned());
+                    (GateEvaluationOutcome::Indeterminate, None)
+                }
+                Err(_) => {
+                    issues.push("invalid_policy_shape".to_owned());
+                    (GateEvaluationOutcome::Indeterminate, None)
+                }
+            }
+        } else if policy_revision.schema_version == 3 {
+            match serde_json::from_str::<GatePolicyDocumentV3>(&policy_revision.policy_json) {
+                Ok(policy) if policy.schema_version == 3 => match policy.into_parts() {
+                    Ok((base, checks)) => {
+                        required_checks_v3 = checks;
                         (GateEvaluationOutcome::Unsatisfied, Some(base))
                     }
                     Err(_) => {
@@ -609,7 +998,10 @@ impl GateEngine {
         };
 
         if let Some(policy) = policy.as_ref() {
-            if !policy_has_requirements(policy) && required_checks.is_empty() {
+            if !policy_has_requirements(policy)
+                && required_checks.is_empty()
+                && required_checks_v3.is_empty()
+            {
                 issues.push("empty_policy".to_owned());
             } else {
                 self.evaluate_scope_requirement(
@@ -633,6 +1025,23 @@ impl GateEngine {
                     &mut issues,
                 )
                 .await?;
+                if !required_checks_v3.is_empty() {
+                    match repository_subjects {
+                        Some(subjects) => {
+                            self.evaluate_required_checks_v3(
+                                &gate,
+                                &required_checks_v3,
+                                subjects,
+                                &policy.decisions,
+                                &mut inputs,
+                                &mut missing,
+                                &mut issues,
+                            )
+                            .await?;
+                        }
+                        None => missing.push("repository_validation_subjects".to_owned()),
+                    }
+                }
                 self.evaluate_decisions(&gate, policy, &mut inputs, &mut missing, &mut issues)
                     .await?;
                 self.evaluate_work_units(&gate, policy, &mut inputs, &mut missing, &mut issues)
@@ -860,6 +1269,50 @@ impl GateEngine {
         if evaluation.outcome == GateEvaluationOutcome::Satisfied
             && lifecycle.state == TaskLifecycleState::Active
         {
+            let has_repository_set_revision: i64 = sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1 FROM sqlite_master
+                     WHERE type = 'table' AND name = 'task_repository_set_revision'
+                 )",
+            )
+            .fetch_one(self.db.pool())
+            .await?;
+            let repository_set = if has_repository_set_revision != 0 {
+                TaskRepositorySetRepo::get_current(&*self.db, &task.id).await?
+            } else {
+                None
+            };
+            if let Some(repository_set) = repository_set {
+                let writable_count = repository_set
+                    .repositories
+                    .iter()
+                    .filter(|repository| {
+                        matches!(
+                            repository.role,
+                            db::TaskRepositoryRole::Primary | db::TaskRepositoryRole::Affected
+                        )
+                    })
+                    .count();
+                if writable_count > 1 {
+                    let batches =
+                        TaskRepositoryMergeBatchRepo::list_by_task(&*self.db, &task.id).await?;
+                    let ready_batch_exists = batches.iter().any(|batch| {
+                        batch.gate_evaluation_id == evaluation.id
+                            && batch.repository_set_revision == repository_set.revision
+                            && matches!(
+                                batch.state,
+                                db::TaskRepositoryMergeBatchState::Open
+                                    | db::TaskRepositoryMergeBatchState::Completed
+                            )
+                    });
+                    // Multi-repository merge admission prepares the exact batch
+                    // before lifecycle readiness. The human merge action owns
+                    // that preparation; evaluating the Gate alone stays read-only.
+                    if !ready_batch_exists {
+                        return Ok(());
+                    }
+                }
+            }
             let idempotency_key = format!("gate-evaluation:{}:ready-to-merge", evaluation.id);
             if !TaskLifecycleRepo::has_task_lifecycle_transition(
                 &*self.db,
@@ -974,6 +1427,48 @@ impl GateEngine {
             return Err(invalid(
                 "Gate policy must contain at least one deterministic requirement",
             ));
+        }
+        Ok(())
+    }
+
+    async fn validate_required_check_repositories(
+        &self,
+        task_id: &str,
+        required_checks: &[RequiredCheckV3],
+    ) -> Result<()> {
+        if required_checks.is_empty() {
+            return Ok(());
+        }
+        let repository_set = TaskRepositorySetRepo::get_current(&*self.db, task_id)
+            .await?
+            .ok_or_else(|| invalid("repo-scoped checks require a current Task repository set"))?;
+        let task = TaskRepo::get_by_id(&*self.db, task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+        for check in required_checks {
+            let writable: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM task_repository_set_revision_repo AS revision_repo
+                    JOIN repo AS r ON r.id = revision_repo.repo_id
+                    WHERE revision_repo.task_id = ?
+                      AND revision_repo.revision = ?
+                      AND revision_repo.repo_id = ?
+                      AND revision_repo.role IN ('primary', 'affected')
+                      AND r.project_id = ?
+                )",
+            )
+            .bind(task_id)
+            .bind(repository_set.revision)
+            .bind(&check.repo_id)
+            .bind(&task.project_id)
+            .fetch_one(self.db.pool())
+            .await?;
+            if writable == 0 {
+                return Err(invalid(
+                    "repo-scoped required check must name a writable repository in the Task set",
+                ));
+            }
         }
         Ok(())
     }
@@ -1417,14 +1912,9 @@ impl GateEngine {
                             .get("reviewed_work_unit_version")
                             .and_then(Value::as_i64)
                             == result.reviewed_work_unit_version
-                        && subject.get("reviewed_result")
-                            == Some(&serde_json::json!({
-                                "execution_id": result.result_execution_id,
-                                "artifact_id": result.result_artifact_id,
-                                "commit_sha": result.result_commit_sha,
-                                "workspace_id": result.result_workspace_id,
-                                "workspace_snapshot_digest": result.workspace_snapshot_digest,
-                            }))
+                        && subject
+                            .get("reviewed_result")
+                            .is_some_and(|actual| exact_reviewed_result_matches(actual, result))
                 }),
                 None => {
                     execution.work_unit_id.is_none() && subject.get("reviewed_result").is_none()
@@ -1718,8 +2208,40 @@ impl GateEngine {
             issues.push("required_checks_require_merge_readiness".to_owned());
             return Ok(());
         }
-        let Some(workspace) =
-            db::WorkspaceRepo::get_integration_by_task_id(&*self.db, &gate.task_id).await?
+        let Some(repository_set) =
+            TaskRepositorySetRepo::get_current(&*self.db, &gate.task_id).await?
+        else {
+            missing.push("task_repository_set".to_owned());
+            return Ok(());
+        };
+        let writable_repository_count = repository_set
+            .repositories
+            .iter()
+            .filter(|repository| {
+                matches!(
+                    repository.role,
+                    db::TaskRepositoryRole::Primary | db::TaskRepositoryRole::Affected
+                )
+            })
+            .count();
+        if writable_repository_count != 1 {
+            issues.push("required_check_repository_scoped_policy_required".to_owned());
+            return Ok(());
+        }
+        let Some(primary) = repository_set
+            .repositories
+            .iter()
+            .find(|repository| repository.role == db::TaskRepositoryRole::Primary)
+        else {
+            issues.push("required_check_primary_repository_unavailable".to_owned());
+            return Ok(());
+        };
+        let Some(workspace) = db::WorkspaceRepo::get_integration_by_task_repo(
+            &*self.db,
+            &gate.task_id,
+            &primary.repo_id,
+        )
+        .await?
         else {
             missing.push("integration_workspace".to_owned());
             return Ok(());
@@ -1853,6 +2375,256 @@ impl GateEngine {
                 issues.push(format!(
                     "required_check_evidence_mismatch:{}",
                     check.check_key
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn evaluate_required_checks_v3(
+        &self,
+        gate: &Gate,
+        required_checks: &[RequiredCheckV3],
+        changed_repositories: &[RepositoryValidationSubject],
+        decisions: &[DecisionRequirement],
+        inputs: &mut Vec<InputDraft>,
+        missing: &mut Vec<String>,
+        issues: &mut Vec<String>,
+    ) -> Result<()> {
+        if required_checks.is_empty() {
+            return Ok(());
+        }
+        if gate.gate_kind != "merge_readiness" {
+            issues.push("required_checks_require_merge_readiness".to_owned());
+            return Ok(());
+        }
+        let Some(repository_set) =
+            TaskRepositorySetRepo::get_current(&*self.db, &gate.task_id).await?
+        else {
+            issues.push("required_check_repository_set_unavailable".to_owned());
+            return Ok(());
+        };
+        let task = TaskRepo::get_by_id(&*self.db, &gate.task_id, false).await?;
+        let Some(task) = task else {
+            issues.push("required_check_task_unavailable".to_owned());
+            return Ok(());
+        };
+
+        let mut subjects_by_repo = BTreeMap::new();
+        for subject in changed_repositories {
+            if subjects_by_repo
+                .insert(subject.repo_id.as_str(), subject)
+                .is_some()
+            {
+                issues.push(format!(
+                    "required_check_duplicate_repository_subject:{}",
+                    subject.repo_id
+                ));
+            }
+        }
+
+        let mut resolved = BTreeMap::new();
+        for (repo_id, subject) in subjects_by_repo {
+            let writable: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM task_repository_set_revision_repo AS revision_repo
+                    JOIN repo AS r ON r.id = revision_repo.repo_id
+                    WHERE revision_repo.task_id = ?
+                      AND revision_repo.revision = ?
+                      AND revision_repo.repo_id = ?
+                      AND revision_repo.role IN ('primary', 'affected')
+                      AND r.project_id = ?
+                )",
+            )
+            .bind(&gate.task_id)
+            .bind(repository_set.revision)
+            .bind(repo_id)
+            .bind(&task.project_id)
+            .fetch_one(self.db.pool())
+            .await?;
+            if writable == 0 {
+                issues.push(format!(
+                    "required_check_subject_repository_unwritable:{repo_id}"
+                ));
+                continue;
+            }
+            let workspace = db::WorkspaceRepo::get_by_id(&*self.db, &subject.workspace_id)
+                .await?
+                .filter(|workspace| {
+                    workspace.task_id == gate.task_id
+                        && workspace.repo_id == repo_id
+                        && workspace.status == db::WorkspaceStatus::Ready
+                });
+            let Some(workspace) = workspace else {
+                issues.push(format!("required_check_subject_unavailable:{repo_id}"));
+                continue;
+            };
+            let integration =
+                db::WorkspaceRepo::get_integration_by_task_repo(&*self.db, &gate.task_id, repo_id)
+                    .await?;
+            if integration.as_ref().map(|item| item.id.as_str())
+                != Some(subject.workspace_id.as_str())
+            {
+                issues.push(format!("required_check_subject_not_integration:{repo_id}"));
+                continue;
+            }
+            let commit_sha = crate::validation_service::read_head(&workspace.worktree_path).await?;
+            if commit_sha != subject.commit_sha {
+                issues.push(format!("required_check_subject_stale:{repo_id}"));
+                continue;
+            }
+            let snapshot_digest =
+                crate::ValidationService::snapshot_digest(&workspace.worktree_path).await?;
+            let runs = ValidationRunRepo::list_validation_runs_for_subject(
+                &*self.db,
+                &gate.task_id,
+                &workspace.id,
+                &commit_sha,
+                &snapshot_digest,
+                None,
+            )
+            .await?;
+            resolved.insert(
+                repo_id.to_owned(),
+                (workspace, commit_sha, snapshot_digest, runs),
+            );
+        }
+
+        for check in required_checks {
+            let Some((workspace, commit_sha, snapshot_digest, runs)) = resolved.get(&check.repo_id)
+            else {
+                // A repo that is not in the changed set has no candidate and
+                // therefore does not acquire a required check or PR.
+                continue;
+            };
+            let prefix: String = check.definition_digest.chars().take(16).collect();
+            let identity = format!("catalog:{}@{prefix}", check.check_key);
+            let matching: Vec<_> = runs
+                .iter()
+                .filter(|run| {
+                    run.check_identity == identity
+                        && run.definition_digest.as_deref()
+                            == Some(check.definition_digest.as_str())
+                        && run.run_origin != db::ValidationRunOrigin::LegacyCommand
+                })
+                .collect();
+            let run = match matching.as_slice() {
+                [] => {
+                    missing.push(format!(
+                        "required_check:{}:{}",
+                        check.repo_id, check.check_key
+                    ));
+                    continue;
+                }
+                [run] => *run,
+                _ => {
+                    issues.push(format!(
+                        "required_check_ambiguous:{}:{}",
+                        check.repo_id, check.check_key
+                    ));
+                    continue;
+                }
+            };
+            if run.status == ValidationRunStatus::Running {
+                missing.push(format!(
+                    "required_check:{}:{}",
+                    check.repo_id, check.check_key
+                ));
+                continue;
+            }
+            let evidence = ValidationRunRepo::list_evidence_for_validation_run(&*self.db, &run.id)
+                .await?
+                .into_iter()
+                .find(|item| item.kind == "deterministic_check_output");
+            let Some(evidence) = evidence else {
+                missing.push(format!(
+                    "required_check_evidence:{}:{}",
+                    check.repo_id, check.check_key
+                ));
+                continue;
+            };
+            let mut waived = false;
+            if run.status != check.required_outcome {
+                let comparison = match run.check_request_id.as_deref() {
+                    Some(request_id) => {
+                        db::ValidationComparisonRepo::get_validation_comparison_by_request(
+                            &*self.db, request_id,
+                        )
+                        .await?
+                    }
+                    None => None,
+                };
+                let waiver_ref = format!(
+                    "validation_waiver:{}:{}@{prefix}",
+                    check.repo_id, check.check_key
+                );
+                waived = comparison.is_some_and(|comparison| {
+                    comparison.candidate_run_id == run.id
+                        && comparison.classification
+                            == db::ValidationComparisonClass::PreExistingFailure
+                }) && decisions
+                    .iter()
+                    .any(|decision| decision.policy_ref.as_deref() == Some(waiver_ref.as_str()));
+                if !waived {
+                    issues.push(format!(
+                        "required_check_outcome_mismatch:{}:{}:{}",
+                        check.repo_id, check.check_key, run.status
+                    ));
+                }
+            }
+            let subject = json!({
+                "repo_id": check.repo_id,
+                "check_identity": run.check_identity,
+                "config_digest": run.config_digest,
+                "workspace_id": workspace.id,
+                "commit_sha": commit_sha,
+                "workspace_snapshot_digest": snapshot_digest,
+                "definition_digest": check.definition_digest,
+            });
+            let run_digest = sha256(
+                json!({
+                    "id": run.id,
+                    "task_id": run.task_id,
+                    "repo_id": check.repo_id,
+                    "check_identity": run.check_identity,
+                    "config_digest": run.config_digest,
+                    "workspace_id": run.workspace_id,
+                    "commit_sha": run.commit_sha,
+                    "workspace_snapshot_digest": run.workspace_snapshot_digest,
+                    "status": run.status,
+                    "exit_code": run.exit_code,
+                    "finished_at": run.finished_at,
+                })
+                .to_string()
+                .as_bytes(),
+            );
+            if !waived {
+                inputs.push(InputDraft {
+                    input_kind: "validation_run".to_owned(),
+                    input_id: run.id.clone(),
+                    input_version: 1,
+                    input_digest: run_digest,
+                    producer_ref: None,
+                    subject_json: subject.to_string(),
+                    status: run.status.to_string(),
+                });
+            }
+            if evidence.producer_validation_run_id == run.id {
+                inputs.push(InputDraft {
+                    input_kind: "evidence".to_owned(),
+                    input_id: evidence.id,
+                    input_version: 1,
+                    input_digest: evidence.digest,
+                    producer_ref: Some(run.id.clone()),
+                    subject_json: subject.to_string(),
+                    status: run.status.to_string(),
+                });
+            } else {
+                issues.push(format!(
+                    "required_check_evidence_mismatch:{}:{}",
+                    check.repo_id, check.check_key
                 ));
             }
         }
@@ -2477,6 +3249,220 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn multirepo_lifecycle_gate_checks_only_changed_repositories() {
+        use std::path::Path;
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().expect("temporary directory");
+        let pool = db::create_sqlite_pool("sqlite::memory:")
+            .await
+            .expect("SQLite pool");
+        db::run_migrations(&pool).await.expect("migrations");
+        let db = Arc::new(SqliteDb::new(pool));
+        let now = now_rfc3339();
+        let project_id = new_uuid_v4();
+        let task_id = new_uuid_v4();
+        let primary_repo_id = new_uuid_v4();
+        let affected_repo_id = new_uuid_v4();
+        let primary_path = temp.path().join("primary");
+        let affected_path = temp.path().join("affected");
+        for (path, body) in [
+            (&primary_path, "primary base\n"),
+            (&affected_path, "affected base\n"),
+        ] {
+            std::fs::create_dir_all(path).expect("repository directory");
+            git::init(path).await.expect("Git repository");
+            let checkout = tokio::process::Command::new("git")
+                .args(["checkout", "-B", "main"])
+                .current_dir(path)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .output()
+                .await
+                .expect("main branch setup");
+            assert!(checkout.status.success(), "main branch setup succeeds");
+            std::fs::write(path.join("base.txt"), body).expect("base file");
+            git::commit_all(path, "base")
+                .await
+                .expect("repository base commit");
+        }
+        db::ProjectRepo::create(
+            &*db,
+            db::CreateProject {
+                id: project_id.clone(),
+                name: "M3 repository-scoped Gate".to_owned(),
+                settings: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("Project");
+        for (id, name, path) in [
+            (&primary_repo_id, "primary", &primary_path),
+            (&affected_repo_id, "affected", &affected_path),
+        ] {
+            db::RepoRepo::create(
+                &*db,
+                db::CreateRepo {
+                    id: id.clone(),
+                    project_id: project_id.clone(),
+                    name: name.to_owned(),
+                    remote_url: path.to_string_lossy().into_owned(),
+                    local_path: Some(path.to_string_lossy().into_owned()),
+                    work_mode: db::WorkMode::DirectMerge,
+                    default_branch: "main".to_owned(),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+            )
+            .await
+            .expect("repository");
+        }
+        db::TaskRepo::create(
+            &*db,
+            db::CreateTask {
+                id: task_id.clone(),
+                project_id,
+                repo_id: Some(primary_repo_id.clone()),
+                repositories: vec![
+                    db::TaskRepositoryWrite {
+                        repo_id: primary_repo_id.clone(),
+                        role: db::TaskRepositoryRole::Primary,
+                    },
+                    db::TaskRepositoryWrite {
+                        repo_id: affected_repo_id.clone(),
+                        role: db::TaskRepositoryRole::Affected,
+                    },
+                ],
+                parent_task_id: None,
+                title: "Repository-scoped checks".to_owned(),
+                description: None,
+                lifecycle_state: db::TaskLifecycleState::Active,
+                is_automation: false,
+                priority: 0,
+                subtask_order: None,
+                merge_config: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("Task with a primary and an affected repository");
+
+        let primary_commit = git::get_current_sha(Path::new(&primary_path))
+            .await
+            .expect("primary commit");
+        let affected_commit = git::get_current_sha(Path::new(&affected_path))
+            .await
+            .expect("affected commit");
+        let primary_workspace_id = new_uuid_v4();
+        let affected_workspace_id = new_uuid_v4();
+        for (id, repo_id, path, commit) in [
+            (
+                &primary_workspace_id,
+                &primary_repo_id,
+                &primary_path,
+                &primary_commit,
+            ),
+            (
+                &affected_workspace_id,
+                &affected_repo_id,
+                &affected_path,
+                &affected_commit,
+            ),
+        ] {
+            db::WorkspaceRepo::create(
+                &*db,
+                db::CreateWorkspace {
+                    id: id.clone(),
+                    task_id: task_id.clone(),
+                    repo_id: repo_id.clone(),
+                    worktree_path: path.to_string_lossy().into_owned(),
+                    branch: "main".to_owned(),
+                    status: db::WorkspaceStatus::Ready,
+                    before_sha: Some(commit.clone()),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+            )
+            .await
+            .expect("repo-scoped integration Workspace");
+        }
+
+        let engine = GateEngine::new(Arc::clone(&db), Arc::new(events::EventBus::new(16)));
+        let (gate, _) = engine
+            .create_gate_with_initial_policy_v3(
+                &task_id,
+                "merge_readiness",
+                GateScopeKind::Task,
+                &task_id,
+                GatePolicyDocumentV3 {
+                    schema_version: 3,
+                    scope_requirement: None,
+                    review: None,
+                    validations: Vec::new(),
+                    decisions: Vec::new(),
+                    work_units: Vec::new(),
+                    required_checks: vec![RequiredCheckV3 {
+                        repo_id: affected_repo_id.clone(),
+                        check_key: "affected-tests".to_owned(),
+                        definition_digest: "a".repeat(64),
+                        required_outcome: ValidationRunStatus::Passed,
+                    }],
+                },
+            )
+            .await
+            .expect("repo-scoped merge-readiness policy");
+        assert_eq!(gate.gate_kind, "merge_readiness");
+
+        let primary_only = engine
+            .evaluate_required_checks_by_repo(
+                &task_id,
+                &[RepositoryValidationSubject {
+                    repo_id: primary_repo_id.clone(),
+                    workspace_id: primary_workspace_id.clone(),
+                    commit_sha: primary_commit.clone(),
+                }],
+            )
+            .await
+            .expect("unmodified affected repository is excluded from required checks");
+        assert_eq!(primary_only.outcome, GateEvaluationOutcome::Satisfied);
+
+        let both_changed = engine
+            .evaluate_required_checks_by_repo(
+                &task_id,
+                &[
+                    RepositoryValidationSubject {
+                        repo_id: primary_repo_id,
+                        workspace_id: primary_workspace_id,
+                        commit_sha: primary_commit,
+                    },
+                    RepositoryValidationSubject {
+                        repo_id: affected_repo_id.clone(),
+                        workspace_id: affected_workspace_id,
+                        commit_sha: affected_commit,
+                    },
+                ],
+            )
+            .await
+            .expect("changed affected repository is subject to its pinned check");
+        assert_eq!(both_changed.outcome, GateEvaluationOutcome::Unsatisfied);
+        let result: GateEvaluationResult =
+            serde_json::from_str(&both_changed.result_json).expect("Gate result JSON");
+        assert!(
+            result
+                .missing_inputs
+                .iter()
+                .any(|missing| missing
+                    == &format!("required_check:{affected_repo_id}:affected-tests"))
+        );
+    }
+
+    #[tokio::test]
     async fn task_role_reviewer_snapshot_is_rechecked_against_membership_fence() {
         let pool = db::create_sqlite_pool("sqlite::memory:")
             .await
@@ -2520,6 +3506,7 @@ mod tests {
         db::TaskRepo::create(
             &*db,
             db::CreateTask {
+                repositories: Vec::new(),
                 id: task_id.clone(),
                 project_id,
                 repo_id: None,
@@ -3090,6 +4077,7 @@ mod tests {
         db::TaskRepo::create(
             &*db,
             db::CreateTask {
+                repositories: Vec::new(),
                 id: task_id.clone(),
                 project_id,
                 repo_id: None,
@@ -3140,6 +4128,7 @@ mod tests {
         WorkUnitRepo::create(
             &*db,
             db::CreateWorkUnit {
+                repository_ids: Vec::new(),
                 id: unit_id.clone(),
                 task_id: task_id.clone(),
                 parent_work_unit_id: None,
@@ -3198,7 +4187,7 @@ mod tests {
                 },
                 work_unit_id: unit_id.clone(),
                 work_unit_version: 1,
-                workspace_lease: None,
+                workspace_leases: Vec::new(),
             },
             gate_event(
                 "execution.started",
@@ -3393,6 +4382,7 @@ mod tests {
         db::TaskRepo::create(
             &*db,
             db::CreateTask {
+                repositories: Vec::new(),
                 id: task_id.clone(),
                 project_id,
                 repo_id: None,

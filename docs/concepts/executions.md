@@ -11,6 +11,7 @@ Execution
   work_unit_id?
   harness_session_id?
   workspace_id?
+  repository_results[]
   parent_execution_id?
   status
   configuration_snapshot
@@ -49,6 +50,21 @@ the `repository_write` capability through WorkspaceLease admission after the
 current TaskRole, ownership, and workspace checks pass. The WorkUnit
 `requires_integration` mode and the exact Role do not grant a broader
 capability.
+
+## Repository results
+
+A multi-repository WorkUnit runs from one persisted workspace group containing
+its exact repository worktrees. Each writable repository receives its own
+Workspace and WorkspaceLease; selected context repositories are pinned
+read-only inputs and receive no lease. The root-level `FORGE_WORKSPACE.md`
+describes the exact repo IDs and writable status.
+
+Before a terminal Execution event, Forge records one immutable repository
+result for each selected writable repo: its `repo_id`, `workspace_id`, base and
+result commits, and captured workspace snapshot digest. `Execution.workspace_id`,
+`before_sha`, and `after_sha` continue to represent the primary repository only
+when the WorkUnit selected it. For a single-repository WorkUnit, the scalar
+fields retain their prior values and the result list has one row.
 
 Actor-driven validation cognition, such as investigation, reproduction, or
 interpretation, is ordinary WorkUnit work. Deterministic commands and trusted
@@ -106,6 +122,35 @@ exact external session through its HarnessAdapter. Unknown or unsupported
 resume fails explicitly. Start may advance through the configured fallback
 route, and its actual winner's candidate and capability evidence are stored on
 the Execution and any newly established HarnessSession.
+
+## Git attribution
+
+An Agent Execution that has a repository Workspace runs Git as its own author
+and committer, derived from the Agent Actor and the Execution's TaskRole:
+
+- name `<role> (<agent display name>)`;
+- email `agent+<role>.<first 8 agent id characters>@agents.forge.invalid`, a
+  reserved non-routable domain.
+
+Forge injects `GIT_AUTHOR_*` and `GIT_COMMITTER_*` plus `FORGE_AGENT_ROLE` and
+`FORGE_EXECUTION_ID` through the in-memory `runtime_env` of the invocation
+snapshot. `runtime_env` is applied after Agent-configured `env`, so an Agent
+cannot substitute a human identity; Agent-authored `GIT_CONFIG_*` entries are
+dropped. The values are not persisted in the Execution snapshot; they are
+recomputable from the Execution's Agent, role, and id and are visible in the
+resulting commits.
+
+Commits carry the trailers `Agent-Role: <role>` and `Agent-Run: <execution id>`.
+For commits made by the harness, a per-Execution `commit-msg` hook directory
+(next to the Execution log, never inside a repository or worktree) is selected
+with `GIT_CONFIG_COUNT`/`core.hooksPath` process environment and runs
+`git interpret-trailers --if-exists replace`; it chains to the repository's own
+hooks. The user's own repositories and shells are unaffected. Forge's adapter
+auto-commit appends the same trailers and identity directly.
+
+Deterministic Git operations performed by Forge itself (integration and merge
+commits, rebases) use the fixed `Forge <forge@agents.forge.invalid>` identity
+instead of the machine's global Git identity.
 
 ## Recovery
 

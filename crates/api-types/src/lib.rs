@@ -35,6 +35,7 @@ mod runtime;
 mod settings;
 mod task_coordination;
 mod task_dispatch;
+mod task_repositories;
 mod terminal;
 mod validation_catalog;
 mod work_unit;
@@ -73,6 +74,7 @@ pub use runtime::*;
 pub use settings::*;
 pub use task_coordination::*;
 pub use task_dispatch::*;
+pub use task_repositories::*;
 pub use terminal::*;
 pub use validation_catalog::*;
 pub use work_unit::*;
@@ -105,6 +107,17 @@ fn export_typescript() {
 
     CreateProjectRequest::export().expect("export CreateProjectRequest");
     UpdateProjectRequest::export().expect("export UpdateProjectRequest");
+    UpdateTaskRepositoriesRequest::export().expect("export UpdateTaskRepositoriesRequest");
+    TaskRepositoryRole::export().expect("export TaskRepositoryRole");
+    TaskRepositoryInput::export().expect("export TaskRepositoryInput");
+    TaskRepositoryMergeState::export().expect("export TaskRepositoryMergeState");
+    TaskRepositoryChangeState::export().expect("export TaskRepositoryChangeState");
+    TaskRepositoryIntegrationResponse::export().expect("export TaskRepositoryIntegrationResponse");
+    TaskRepositoryMergeBatchState::export().expect("export TaskRepositoryMergeBatchState");
+    TaskRepositoryMergeResponse::export().expect("export TaskRepositoryMergeResponse");
+    TaskRepositoryMergeBatchResponse::export().expect("export TaskRepositoryMergeBatchResponse");
+    TaskRepositoryPullRequestResponse::export().expect("export TaskRepositoryPullRequestResponse");
+    TaskRepositoryResponse::export().expect("export TaskRepositoryResponse");
     ProjectResponse::export().expect("export ProjectResponse");
     ProjectTaskRoleDefault::export().expect("export ProjectTaskRoleDefault");
     ProjectTaskRoleConfiguration::export().expect("export ProjectTaskRoleConfiguration");
@@ -247,10 +260,12 @@ fn export_typescript() {
     TaskReworkAutomationIntentsResponse::export()
         .expect("export TaskReworkAutomationIntentsResponse");
     ReviewSubjectResponse::export().expect("export ReviewSubjectResponse");
+    ReviewSubjectRepositoryResponse::export().expect("export ReviewSubjectRepositoryResponse");
     FollowUpRequest::export().expect("export FollowUpRequest");
     RecoverWorkUnitExecutionRequest::export().expect("export RecoverWorkUnitExecutionRequest");
     ClaimOverrides::export().expect("export ClaimOverrides");
     ExecutionResponse::export().expect("export ExecutionResponse");
+    ExecutionRepositoryResultResponse::export().expect("export ExecutionRepositoryResultResponse");
     ExecutionUsageResponse::export().expect("export ExecutionUsageResponse");
     TaskUsageSummaryResponse::export().expect("export TaskUsageSummaryResponse");
     ExecutionLogKind::export().expect("export ExecutionLogKind");
@@ -365,6 +380,8 @@ fn export_typescript() {
     WorkUnitResponse::export().expect("export WorkUnitResponse");
     WorkUnitIntegrationRequest::export().expect("export WorkUnitIntegrationRequest");
     WorkUnitIntegrationResponse::export().expect("export WorkUnitIntegrationResponse");
+    WorkUnitRepositoryIntegrationResponse::export()
+        .expect("export WorkUnitRepositoryIntegrationResponse");
     WorkUnitIntegrationOutcome::export().expect("export WorkUnitIntegrationOutcome");
     WorkUnitProvenance::export().expect("export WorkUnitProvenance");
     WorkUnitStatus::export().expect("export WorkUnitStatus");

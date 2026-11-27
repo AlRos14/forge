@@ -149,6 +149,15 @@ describe('routeSsePayload', () => {
         ],
       ],
       [
+        'task.repository_set_replanned',
+        [
+          'tasks::task-1::coordination',
+          'tasks::task-1',
+          'task-dispatch::task-1',
+          'tasks::task-1::work-units',
+        ],
+      ],
+      [
         'task.quality_requested',
         [
           'tasks::task-1::quality-requests',

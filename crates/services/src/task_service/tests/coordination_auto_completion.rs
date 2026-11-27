@@ -105,6 +105,7 @@ async fn auto_completion_revalidates_coordination_inside_the_work_unit_transacti
     WorkUnitRepo::create(
         &*db,
         CreateWorkUnit {
+            repository_ids: Vec::new(),
             id: unit_id.clone(),
             task_id: task.id.clone(),
             parent_work_unit_id: None,

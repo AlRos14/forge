@@ -183,4 +183,19 @@ pub struct ReviewSubjectResponse {
     pub result_commit_sha: Option<String>,
     pub result_workspace_id: Option<String>,
     pub workspace_snapshot_digest: Option<String>,
+    #[serde(default)]
+    pub repository_results: Vec<ReviewSubjectRepositoryResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct ReviewSubjectRepositoryResponse {
+    pub repo_id: String,
+    #[ts(type = "number | null")]
+    pub reviewed_work_unit_version: Option<i64>,
+    pub result_execution_id: Option<String>,
+    pub result_artifact_id: Option<String>,
+    pub result_commit_sha: Option<String>,
+    pub result_workspace_id: Option<String>,
+    pub workspace_snapshot_digest: Option<String>,
 }

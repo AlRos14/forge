@@ -9,6 +9,21 @@ pub enum PublicEventType {
     #[serde(rename = "task.lifecycle_changed")]
     #[ts(rename = "task.lifecycle_changed")]
     TaskLifecycleChanged,
+    #[serde(rename = "task.repositories_changed")]
+    #[ts(rename = "task.repositories_changed")]
+    TaskRepositoriesChanged,
+    #[serde(rename = "task.repository_set_replanned")]
+    #[ts(rename = "task.repository_set_replanned")]
+    TaskRepositorySetReplanned,
+    #[serde(rename = "work_unit.repository_integration_changed")]
+    #[ts(rename = "work_unit.repository_integration_changed")]
+    WorkUnitRepositoryIntegrationChanged,
+    #[serde(rename = "task.repository_merge_batch_changed")]
+    #[ts(rename = "task.repository_merge_batch_changed")]
+    TaskRepositoryMergeBatchChanged,
+    #[serde(rename = "task.repository_pr_status_changed")]
+    #[ts(rename = "task.repository_pr_status_changed")]
+    TaskRepositoryPrStatusChanged,
     #[serde(rename = "gate.created")]
     #[ts(rename = "gate.created")]
     GateCreated,
@@ -30,6 +45,9 @@ pub enum PublicEventType {
     #[serde(rename = "execution.cancelled")]
     #[ts(rename = "execution.cancelled")]
     ExecutionCancelled,
+    #[serde(rename = "execution.repository_results_recorded")]
+    #[ts(rename = "execution.repository_results_recorded")]
+    ExecutionRepositoryResultsRecorded,
     #[serde(rename = "execution.stalled")]
     #[ts(rename = "execution.stalled")]
     ExecutionStalled,
@@ -191,10 +209,26 @@ pub enum PublicEventType {
     EventsResyncRequired,
 }
 
+/// Public payload for the Task repository-scope runtime hint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TaskRepositoriesChangedPayload {
+    pub task_id: String,
+    pub task_version: i64,
+    pub repositories: Vec<crate::TaskRepositoryInput>,
+}
+
 impl PublicEventType {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::TaskLifecycleChanged => "task.lifecycle_changed",
+            Self::TaskRepositoriesChanged => "task.repositories_changed",
+            Self::TaskRepositorySetReplanned => "task.repository_set_replanned",
+            Self::WorkUnitRepositoryIntegrationChanged => {
+                "work_unit.repository_integration_changed"
+            }
+            Self::TaskRepositoryMergeBatchChanged => "task.repository_merge_batch_changed",
+            Self::TaskRepositoryPrStatusChanged => "task.repository_pr_status_changed",
             Self::GateCreated => "gate.created",
             Self::GatePolicyRevised => "gate.policy_revised",
             Self::GateEvaluated => "gate.evaluated",
@@ -202,6 +236,7 @@ impl PublicEventType {
             Self::ExecutionCompleted => "execution.completed",
             Self::ExecutionFailed => "execution.failed",
             Self::ExecutionCancelled => "execution.cancelled",
+            Self::ExecutionRepositoryResultsRecorded => "execution.repository_results_recorded",
             Self::ExecutionStalled => "execution.stalled",
             Self::ValidationRunStarted => "validation_run.started",
             Self::ValidationRunCompleted => "validation_run.completed",

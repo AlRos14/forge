@@ -1314,6 +1314,7 @@ mod tests {
         TaskRepo::create(
             &*db,
             CreateTask {
+                repositories: Vec::new(),
                 id: task_id.clone(),
                 project_id: project_id.clone(),
                 repo_id: None,

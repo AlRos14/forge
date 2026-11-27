@@ -2,6 +2,7 @@ use super::*;
 use crate::CreateWorkUnitReviewSubject;
 use crate::FollowUpExecutionReceipt;
 use sqlx::Column;
+use std::collections::HashSet;
 
 async fn task_role_has_capability_in_tx(
     tx: &mut Transaction<'_, Sqlite>,
@@ -301,12 +302,186 @@ fn map_integration(row: SqliteRow) -> Result<WorkUnitIntegration> {
     })
 }
 
+fn map_review_subject_repository(row: SqliteRow) -> Result<crate::WorkUnitReviewSubjectRepository> {
+    Ok(crate::WorkUnitReviewSubjectRepository {
+        review_work_unit_id: row.try_get("review_work_unit_id")?,
+        task_id: row.try_get("task_id")?,
+        repo_id: row.try_get("repo_id")?,
+        reviewed_work_unit_id: row.try_get("reviewed_work_unit_id")?,
+        reviewed_work_unit_version: row.try_get("reviewed_work_unit_version")?,
+        result_execution_id: row.try_get("result_execution_id")?,
+        result_artifact_id: row.try_get("result_artifact_id")?,
+        result_commit_sha: row.try_get("result_commit_sha")?,
+        result_workspace_id: row.try_get("result_workspace_id")?,
+        workspace_snapshot_digest: row.try_get("workspace_snapshot_digest")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+fn map_result_requirement_repository(
+    row: SqliteRow,
+) -> Result<crate::WorkUnitResultRequirementRepository> {
+    Ok(crate::WorkUnitResultRequirementRepository {
+        work_unit_id: row.try_get("work_unit_id")?,
+        task_id: row.try_get("task_id")?,
+        repo_id: row.try_get("repo_id")?,
+        source_work_unit_id: row.try_get("source_work_unit_id")?,
+        source_work_unit_version: row.try_get("source_work_unit_version")?,
+        result_execution_id: row.try_get("result_execution_id")?,
+        result_artifact_id: row.try_get("result_artifact_id")?,
+        result_commit_sha: row.try_get("result_commit_sha")?,
+        result_workspace_id: row.try_get("result_workspace_id")?,
+        workspace_snapshot_digest: row.try_get("workspace_snapshot_digest")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
 async fn append_event(
     db: &SqliteDb,
     tx: &mut Transaction<'_, Sqlite>,
     event: &CreateDomainEvent,
 ) -> Result<DomainEvent> {
     DomainEventRepo::append_event_in_tx(db, tx, event).await
+}
+
+struct WorkUnitExecutionWorkspace {
+    workspace_id: String,
+    repo_id: String,
+    base_ref: String,
+}
+
+async fn validate_work_unit_execution_leases_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    admission: &CreateWorkUnitExecution,
+    requires_integration: bool,
+) -> Result<()> {
+    let reviewer = admission.execution.role.eq_ignore_ascii_case("reviewer")
+        || task_role_has_capability_in_tx(
+            tx,
+            &admission.execution.task_id,
+            &admission.execution.role,
+            "formal_review",
+        )
+        .await?;
+    let expected_workspaces = if requires_integration && !reviewer {
+        sqlx::query(
+            "SELECT workspace.id AS workspace_id, workspace.repo_id,
+                    COALESCE(workspace.before_sha, repo.default_branch) AS base_ref
+             FROM workspace_scope scope
+             JOIN workspace_group group_row
+               ON group_row.id = scope.workspace_group_id
+              AND group_row.task_id = scope.task_id
+              AND group_row.work_unit_id = scope.work_unit_id
+             JOIN workspace workspace
+               ON workspace.id = scope.workspace_id AND workspace.task_id = scope.task_id
+             JOIN work_unit_repository_set_revision pin
+               ON pin.work_unit_id = scope.work_unit_id AND pin.task_id = scope.task_id
+             JOIN task_repository_set_revision_repo repository
+               ON repository.task_id = pin.task_id AND repository.revision = pin.revision
+              AND repository.repo_id = workspace.repo_id
+              AND repository.role IN ('primary', 'affected')
+             JOIN repo repo ON repo.id = workspace.repo_id
+             WHERE scope.work_unit_id = ? AND scope.task_id = ?
+               AND scope.scope_kind = 'work_unit'
+               AND workspace.status = 'ready'
+               AND (NOT EXISTS (
+                   SELECT 1 FROM work_unit_repository selected
+                   WHERE selected.work_unit_id = scope.work_unit_id
+               ) OR EXISTS (
+                   SELECT 1 FROM work_unit_repository selected
+                   WHERE selected.work_unit_id = scope.work_unit_id
+                     AND selected.repo_id = workspace.repo_id
+               ))
+             ORDER BY repository.position, workspace.repo_id",
+        )
+        .bind(&admission.work_unit_id)
+        .bind(&admission.execution.task_id)
+        .fetch_all(&mut **tx)
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(WorkUnitExecutionWorkspace {
+                workspace_id: row.try_get("workspace_id")?,
+                repo_id: row.try_get("repo_id")?,
+                base_ref: row.try_get("base_ref")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+
+    if requires_integration && !reviewer && expected_workspaces.is_empty() {
+        return Err(DbError::WorkUnitWorkspaceUnavailable);
+    }
+
+    let primary_workspace_id: Option<String> = sqlx::query_scalar(
+        "SELECT scope.workspace_id
+         FROM workspace_scope scope
+         JOIN workspace workspace
+           ON workspace.id = scope.workspace_id AND workspace.task_id = scope.task_id
+         JOIN work_unit_repository_set_revision pin
+           ON pin.work_unit_id = scope.work_unit_id AND pin.task_id = scope.task_id
+         JOIN task_repository_set_revision_repo repository
+           ON repository.task_id = pin.task_id AND repository.revision = pin.revision
+          AND repository.role = 'primary'
+         WHERE scope.work_unit_id = ? AND scope.task_id = ?
+           AND scope.scope_kind = 'work_unit' AND workspace.repo_id = repository.repo_id",
+    )
+    .bind(&admission.work_unit_id)
+    .bind(&admission.execution.task_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let expected_execution_workspace = if requires_integration && !reviewer {
+        primary_workspace_id
+    } else {
+        None
+    };
+    if admission.execution.workspace_id != expected_execution_workspace {
+        return Err(DbError::Check(
+            "WorkUnit Execution Workspace must mirror its selected primary repository".to_owned(),
+        ));
+    }
+
+    if expected_workspaces.len() != admission.workspace_leases.len() {
+        return Err(DbError::Check(
+            "WorkUnit repository Execution requires one exact WorkspaceLease per writable Workspace"
+                .to_owned(),
+        ));
+    }
+    let actor = admission.execution.actor_ref.as_ref();
+    let mut lease_workspace_ids = HashSet::with_capacity(admission.workspace_leases.len());
+    for lease in &admission.workspace_leases {
+        let expected = expected_workspaces
+            .iter()
+            .find(|workspace| {
+                workspace.workspace_id == lease.workspace_id.as_deref().unwrap_or_default()
+            })
+            .ok_or_else(|| {
+                DbError::Check(
+                    "WorkUnit WorkspaceLease does not bind a writable Workspace in its group"
+                        .to_owned(),
+                )
+            })?;
+        if lease.task_id != admission.execution.task_id
+            || lease.work_unit_id.as_deref() != Some(admission.work_unit_id.as_str())
+            || lease.workspace_id.as_deref() != Some(expected.workspace_id.as_str())
+            || lease.repository_binding_id != expected.repo_id
+            || lease.base_ref != expected.base_ref
+            || lease.execution_id != admission.execution.id
+            || lease.role != "worker"
+            || Some(lease.assigned_principal_type.as_str())
+                != actor.map(|actor| actor.kind().to_string()).as_deref()
+            || actor.map(|actor| actor.id()) != Some(lease.assigned_principal_id.as_str())
+            || !lease_workspace_ids.insert(expected.workspace_id.as_str())
+        {
+            return Err(DbError::Check(
+                "WorkUnit WorkspaceLease does not match its Execution and repository binding"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn insert_work_unit_execution_in_tx(
@@ -325,42 +500,12 @@ async fn insert_work_unit_execution_in_tx(
     .await?
     .ok_or(DbError::NotFound)?
         != 0;
-    if admission.execution.status != ExecutionStatus::Running
-        || requires_integration != admission.workspace_lease.is_some()
-    {
+    if admission.execution.status != ExecutionStatus::Running {
         return Err(DbError::Check(
-            "WorkUnit Executions require a running Execution and repository work requires an exact WorkspaceLease"
-                .to_owned(),
+            "WorkUnit Executions require a running Execution".to_owned(),
         ));
     }
-    if let Some(lease) = admission.workspace_lease.as_ref() {
-        let actor = admission.execution.actor_ref.as_ref();
-        let expected_lease_role = if task_role_has_capability_in_tx(
-            tx,
-            &admission.execution.task_id,
-            &admission.execution.role,
-            "formal_review",
-        )
-        .await?
-        {
-            "reviewer"
-        } else {
-            "worker"
-        };
-        if lease.task_id != admission.execution.task_id
-            || lease.work_unit_id.as_deref() != Some(admission.work_unit_id.as_str())
-            || lease.workspace_id != admission.execution.workspace_id
-            || lease.execution_id != admission.execution.id
-            || lease.role != expected_lease_role
-            || Some(lease.assigned_principal_type.as_str())
-                != actor.map(|actor| actor.kind().to_string()).as_deref()
-            || actor.map(|actor| actor.id()) != Some(lease.assigned_principal_id.as_str())
-        {
-            return Err(DbError::Check(
-                "WorkUnit WorkspaceLease does not match its Execution binding".to_owned(),
-            ));
-        }
-    }
+    validate_work_unit_execution_leases_in_tx(tx, &admission, requires_integration).await?;
 
     let execution = SqliteDb::create_execution_in_tx(
         tx,
@@ -381,7 +526,7 @@ async fn insert_work_unit_execution_in_tx(
         )
         .await?;
     }
-    if let Some(lease) = admission.workspace_lease {
+    for lease in admission.workspace_leases {
         super::workspace_lease::insert_workspace_lease_in_tx(tx, lease).await?;
     }
     let event = append_event(db, tx, event_input).await?;
@@ -436,6 +581,9 @@ fn work_unit_write_error(error: sqlx::Error) -> DbError {
         if message.contains("version") || message.contains("immutable") {
             return DbError::VersionConflict;
         }
+        if message.contains("workunit repository scope must be writable") {
+            return DbError::Check(database_error.message().to_owned());
+        }
         if message.contains("constraint failed")
             || message.contains("invalid")
             || message == "review subject must name an exact same-task result and independent formal reviewer"
@@ -450,6 +598,7 @@ async fn create_work_unit_row(
     db: &SqliteDb,
     input: CreateWorkUnit,
     subject: Option<CreateWorkUnitReviewSubject>,
+    subject_repositories: Option<&[crate::WorkUnitReviewSubjectRepository]>,
     event_input: CreateDomainEvent,
 ) -> Result<CollaborationWrite<WorkUnit>> {
     let (assigned_kind, assigned_id) = actor_columns(input.assigned_actor.as_ref());
@@ -458,7 +607,10 @@ async fn create_work_unit_row(
     let created_kind = input.created_by.kind().to_string();
     let created_id = input.created_by.id().to_owned();
     let now = input.created_at.clone();
-    let mut tx = db.pool.begin().await?;
+    let mut tx = db.pool.begin_with("BEGIN IMMEDIATE").await?;
+    let revision =
+        super::task_repository::ensure_initial_current_revision_in_tx(&mut tx, &input.task_id)
+            .await?;
     sqlx::query(
         "INSERT INTO work_unit (
                 id, task_id, parent_work_unit_id, title, scope, status, role,
@@ -490,6 +642,29 @@ async fn create_work_unit_row(
     .execute(&mut *tx)
     .await
     .map_err(work_unit_write_error)?;
+    sqlx::query(
+        "INSERT INTO work_unit_repository_set_revision (work_unit_id, task_id, revision)
+         VALUES (?, ?, ?)",
+    )
+    .bind(&input.id)
+    .bind(&input.task_id)
+    .bind(revision.revision)
+    .execute(&mut *tx)
+    .await
+    .map_err(work_unit_write_error)?;
+    for repo_id in &input.repository_ids {
+        sqlx::query(
+            "INSERT INTO work_unit_repository (work_unit_id, task_id, repo_id, created_at)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(&input.id)
+        .bind(&input.task_id)
+        .bind(repo_id)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await
+        .map_err(work_unit_write_error)?;
+    }
     for artifact_id in &input.artifact_input_ids {
         let artifact = sqlx::query(
             "SELECT artifact.digest, producer.execution_id
@@ -631,6 +806,45 @@ async fn create_work_unit_row(
         .execute(&mut *tx)
         .await
         .map_err(work_unit_write_error)?;
+        if let Some(repositories) = subject_repositories {
+            for repository in repositories {
+                if repository.review_work_unit_id != subject.review_work_unit_id
+                    || repository.task_id != subject.task_id
+                    || repository.reviewed_work_unit_id != subject.reviewed_work_unit_id
+                {
+                    return Err(DbError::Check(
+                        "review subject repository identity must match its scalar subject"
+                            .to_owned(),
+                    ));
+                }
+                sqlx::query(
+                    "INSERT INTO work_unit_review_subject_repository (
+                        review_work_unit_id, task_id, repo_id, reviewed_work_unit_id,
+                        reviewed_work_unit_version, result_execution_id, result_artifact_id,
+                        result_commit_sha, result_workspace_id, workspace_snapshot_digest,
+                        created_at
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(&repository.review_work_unit_id)
+                .bind(&repository.task_id)
+                .bind(&repository.repo_id)
+                .bind(&repository.reviewed_work_unit_id)
+                .bind(repository.reviewed_work_unit_version)
+                .bind(repository.result_execution_id.as_deref())
+                .bind(repository.result_artifact_id.as_deref())
+                .bind(repository.result_commit_sha.as_deref())
+                .bind(repository.result_workspace_id.as_deref())
+                .bind(repository.workspace_snapshot_digest.as_deref())
+                .bind(&repository.created_at)
+                .execute(&mut *tx)
+                .await
+                .map_err(work_unit_write_error)?;
+            }
+        }
+    } else if subject_repositories.is_some_and(|repositories| !repositories.is_empty()) {
+        return Err(DbError::Check(
+            "review subject repositories require their scalar subject".to_owned(),
+        ));
     }
     let event = append_event(db, &mut tx, &event_input).await?;
     let record = WorkUnit {
@@ -663,7 +877,7 @@ impl WorkUnitRepo for SqliteDb {
         input: CreateWorkUnit,
         event: CreateDomainEvent,
     ) -> Result<CollaborationWrite<WorkUnit>> {
-        create_work_unit_row(self, input, None, event).await
+        create_work_unit_row(self, input, None, None, event).await
     }
 
     async fn create_with_review_subject(
@@ -672,7 +886,17 @@ impl WorkUnitRepo for SqliteDb {
         subject: CreateWorkUnitReviewSubject,
         event: CreateDomainEvent,
     ) -> Result<CollaborationWrite<WorkUnit>> {
-        create_work_unit_row(self, input, Some(subject), event).await
+        create_work_unit_row(self, input, Some(subject), None, event).await
+    }
+
+    async fn create_with_review_subject_repositories(
+        &self,
+        input: CreateWorkUnit,
+        subject: CreateWorkUnitReviewSubject,
+        repositories: &[crate::WorkUnitReviewSubjectRepository],
+        event: CreateDomainEvent,
+    ) -> Result<CollaborationWrite<WorkUnit>> {
+        create_work_unit_row(self, input, Some(subject), Some(repositories), event).await
     }
 
     async fn get_task_id(&self, id: &str) -> Result<Option<String>> {
@@ -701,6 +925,202 @@ impl WorkUnitRepo for SqliteDb {
             .into_iter()
             .map(map_work_unit)
             .collect()
+    }
+
+    async fn list_repository_ids(&self, work_unit_id: &str) -> Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT scope.repo_id
+             FROM work_unit_repository scope
+             JOIN work_unit_repository_set_revision pin
+               ON pin.work_unit_id = scope.work_unit_id AND pin.task_id = scope.task_id
+             JOIN task_repository_set_revision_repo repository
+               ON repository.task_id = pin.task_id AND repository.revision = pin.revision
+              AND repository.repo_id = scope.repo_id
+             WHERE scope.work_unit_id = ?
+             ORDER BY repository.position, scope.repo_id",
+        )
+        .bind(work_unit_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn list_review_subject_repositories(
+        &self,
+        work_unit_id: &str,
+    ) -> Result<Vec<crate::WorkUnitReviewSubjectRepository>> {
+        sqlx::query(
+            "SELECT subject.*
+             FROM work_unit_review_subject_repository subject
+             JOIN work_unit_repository_set_revision pin
+               ON pin.work_unit_id = subject.reviewed_work_unit_id
+              AND pin.task_id = subject.task_id
+             LEFT JOIN task_repository_set_revision_repo repository
+               ON repository.task_id = pin.task_id AND repository.revision = pin.revision
+              AND repository.repo_id = subject.repo_id
+             WHERE subject.review_work_unit_id = ?
+             ORDER BY repository.position, subject.repo_id",
+        )
+        .bind(work_unit_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(map_review_subject_repository)
+        .collect()
+    }
+
+    async fn freeze_review_subject_repositories(
+        &self,
+        review_work_unit_id: &str,
+        rows: &[crate::WorkUnitReviewSubjectRepository],
+    ) -> Result<Vec<crate::WorkUnitReviewSubjectRepository>> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let existing_rows = sqlx::query(
+            "SELECT * FROM work_unit_review_subject_repository
+             WHERE review_work_unit_id = ? ORDER BY repo_id",
+        )
+        .bind(review_work_unit_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(map_review_subject_repository)
+        .collect::<Result<Vec<_>>>()?;
+        if existing_rows.len() != rows.len() {
+            return Err(DbError::VersionConflict);
+        }
+
+        for row in rows {
+            if row.review_work_unit_id != review_work_unit_id {
+                return Err(DbError::Check(
+                    "review subject repositories must bind the exact reviewer WorkUnit".to_owned(),
+                ));
+            }
+            let current = existing_rows
+                .iter()
+                .find(|existing| existing.repo_id == row.repo_id)
+                .ok_or(DbError::VersionConflict)?;
+            let identity_matches = current.task_id == row.task_id
+                && current.reviewed_work_unit_id == row.reviewed_work_unit_id
+                && current.created_at == row.created_at;
+            if !identity_matches {
+                return Err(DbError::VersionConflict);
+            }
+            if row.reviewed_work_unit_version.is_none() || row.result_execution_id.is_none() {
+                return Err(DbError::Check(
+                    "frozen review subject repository requires its exact version and Execution"
+                        .to_owned(),
+                ));
+            }
+            if current == row {
+                continue;
+            }
+            if current.reviewed_work_unit_version.is_some()
+                || current.result_execution_id.is_some()
+                || row.reviewed_work_unit_version.is_none()
+                || row.result_execution_id.is_none()
+            {
+                return Err(DbError::VersionConflict);
+            }
+            let updated = sqlx::query(
+                "UPDATE work_unit_review_subject_repository
+                 SET reviewed_work_unit_version = ?, result_execution_id = ?,
+                     result_artifact_id = ?, result_commit_sha = ?,
+                     result_workspace_id = ?, workspace_snapshot_digest = ?
+                 WHERE review_work_unit_id = ? AND repo_id = ?",
+            )
+            .bind(row.reviewed_work_unit_version)
+            .bind(row.result_execution_id.as_deref())
+            .bind(row.result_artifact_id.as_deref())
+            .bind(row.result_commit_sha.as_deref())
+            .bind(row.result_workspace_id.as_deref())
+            .bind(row.workspace_snapshot_digest.as_deref())
+            .bind(review_work_unit_id)
+            .bind(&row.repo_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(work_unit_write_error)?;
+            if updated.rows_affected() != 1 {
+                return Err(DbError::VersionConflict);
+            }
+        }
+
+        let frozen = sqlx::query(
+            "SELECT * FROM work_unit_review_subject_repository
+             WHERE review_work_unit_id = ? ORDER BY repo_id",
+        )
+        .bind(review_work_unit_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(map_review_subject_repository)
+        .collect::<Result<Vec<_>>>()?;
+        if frozen.len() != rows.len() || frozen.iter().any(|row| !rows.contains(row)) {
+            return Err(DbError::VersionConflict);
+        }
+        tx.commit().await?;
+        Ok(frozen)
+    }
+
+    async fn list_result_requirement_repositories(
+        &self,
+        work_unit_id: &str,
+    ) -> Result<Vec<crate::WorkUnitResultRequirementRepository>> {
+        sqlx::query(
+            "SELECT requirement.*
+             FROM work_unit_result_requirement_repository requirement
+             JOIN work_unit_repository_set_revision pin
+               ON pin.work_unit_id = requirement.source_work_unit_id
+              AND pin.task_id = requirement.task_id
+             LEFT JOIN task_repository_set_revision_repo repository
+               ON repository.task_id = pin.task_id AND repository.revision = pin.revision
+              AND repository.repo_id = requirement.repo_id
+             WHERE requirement.work_unit_id = ?
+             ORDER BY repository.position, requirement.repo_id",
+        )
+        .bind(work_unit_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(map_result_requirement_repository)
+        .collect()
+    }
+
+    async fn insert_result_requirement_repositories_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        rows: &[crate::WorkUnitResultRequirementRepository],
+    ) -> Result<()> {
+        let mut keys = HashSet::with_capacity(rows.len());
+        for row in rows {
+            if !keys.insert((row.work_unit_id.as_str(), row.repo_id.as_str())) {
+                return Err(DbError::Check(
+                    "result requirement repositories contain a duplicate WorkUnit/repository"
+                        .to_owned(),
+                ));
+            }
+            sqlx::query(
+                "INSERT INTO work_unit_result_requirement_repository (
+                    work_unit_id, task_id, repo_id, source_work_unit_id,
+                    source_work_unit_version, result_execution_id, result_artifact_id,
+                    result_commit_sha, result_workspace_id, workspace_snapshot_digest,
+                    created_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&row.work_unit_id)
+            .bind(&row.task_id)
+            .bind(&row.repo_id)
+            .bind(&row.source_work_unit_id)
+            .bind(row.source_work_unit_version)
+            .bind(&row.result_execution_id)
+            .bind(row.result_artifact_id.as_deref())
+            .bind(row.result_commit_sha.as_deref())
+            .bind(row.result_workspace_id.as_deref())
+            .bind(row.workspace_snapshot_digest.as_deref())
+            .bind(&row.created_at)
+            .execute(&mut **tx)
+            .await
+            .map_err(work_unit_write_error)?;
+        }
+        Ok(())
     }
 
     async fn update(
@@ -1663,7 +2083,7 @@ impl WorkUnitExecutionRepo for SqliteDb {
                 .checked_add(1)
                 .ok_or_else(|| DbError::Check("Task version overflow".to_owned()))?;
         }
-        if let Some(lease) = admission.workspace_lease.as_ref() {
+        for lease in &admission.workspace_leases {
             if lease.task_version != final_task_version {
                 return Err(DbError::Check(
                     "WorkUnit WorkspaceLease Task version does not match lifecycle admission"
@@ -2174,43 +2594,18 @@ impl WorkUnitExecutionRepo for SqliteDb {
         .await?
         .ok_or(DbError::NotFound)?
             != 0;
-        if requires_integration != admission.workspace_lease.is_some() {
-            return Err(DbError::Check(
-                "recovery repository work requires its exact WorkspaceLease".to_owned(),
-            ));
-        }
-        if let Some(lease) = admission.workspace_lease.as_ref() {
-            let actor = admission.execution.actor_ref.as_ref();
-            let expected_lease_role = if task_role_has_capability_in_tx(
-                &mut tx,
-                &admission.execution.task_id,
-                &admission.execution.role,
-                "formal_review",
-            )
-            .await?
-            {
-                "reviewer"
-            } else {
-                "worker"
-            };
-            if lease.task_id != admission.execution.task_id
-                || lease.work_unit_id.as_deref() != Some(admission.work_unit_id.as_str())
-                || lease.workspace_id != admission.execution.workspace_id
-                || lease.execution_id != admission.execution.id
-                || lease.task_version
-                    != if lifecycle_state == crate::TaskLifecycleState::Blocked {
-                        input
-                            .expected_task_version
-                            .checked_add(1)
-                            .ok_or_else(|| DbError::Check("Task version overflow".to_owned()))?
-                    } else {
-                        input.expected_task_version
-                    }
-                || lease.role != expected_lease_role
-                || Some(lease.assigned_principal_type.as_str())
-                    != actor.map(|actor| actor.kind().to_string()).as_deref()
-                || actor.map(|actor| actor.id()) != Some(lease.assigned_principal_id.as_str())
-            {
+        validate_work_unit_execution_leases_in_tx(&mut tx, &admission, requires_integration)
+            .await?;
+        let lease_task_version = if lifecycle_state == crate::TaskLifecycleState::Blocked {
+            input
+                .expected_task_version
+                .checked_add(1)
+                .ok_or_else(|| DbError::Check("Task version overflow".to_owned()))?
+        } else {
+            input.expected_task_version
+        };
+        for lease in &admission.workspace_leases {
+            if lease.task_version != lease_task_version {
                 return Err(DbError::Check(
                     "recovery WorkspaceLease does not match its exact Task and Execution"
                         .to_owned(),
@@ -2282,30 +2677,59 @@ impl WorkUnitWorkspaceRepo for SqliteDb {
             Ok(WorkspaceScope {
                 workspace_id: row.try_get("workspace_id")?,
                 task_id: row.try_get("task_id")?,
+                repo_id: row.try_get("repo_id")?,
                 kind: parse_enum(row.try_get::<String, _>("scope_kind")?)?,
                 work_unit_id: row.try_get("work_unit_id")?,
+                workspace_group_id: row.try_get("workspace_group_id")?,
                 created_at: row.try_get("created_at")?,
             })
         })
         .transpose()
     }
 
-    async fn get_by_work_unit_id(&self, work_unit_id: &str) -> Result<Option<Workspace>> {
+    async fn list_by_work_unit_id(&self, work_unit_id: &str) -> Result<Vec<Workspace>> {
         sqlx::query(
             "SELECT w.* FROM workspace w
              JOIN workspace_scope s ON s.workspace_id = w.id AND s.task_id = w.task_id
-             WHERE s.work_unit_id = ? AND s.scope_kind = 'work_unit'",
+             LEFT JOIN work_unit_repository_set_revision pin
+               ON pin.work_unit_id = s.work_unit_id AND pin.task_id = s.task_id
+             LEFT JOIN task_repository_set_revision_repo repository
+               ON repository.task_id = pin.task_id
+              AND repository.revision = pin.revision AND repository.repo_id = s.repo_id
+             WHERE s.work_unit_id = ? AND s.scope_kind = 'work_unit'
+             ORDER BY repository.position, s.repo_id, w.id",
         )
         .bind(work_unit_id)
-        .fetch_optional(&self.pool)
+        .fetch_all(&self.pool)
         .await?
+        .into_iter()
         .map(map_workspace)
-        .transpose()
+        .collect()
     }
 
     async fn create_for_work_unit(&self, input: CreateWorkUnitWorkspace) -> Result<Workspace> {
         let ws = input.workspace;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let pinned_revision: Option<i64> = sqlx::query_scalar(
+            "SELECT revision FROM work_unit_repository_set_revision
+             WHERE work_unit_id = ? AND task_id = ?",
+        )
+        .bind(&input.work_unit_id)
+        .bind(&ws.task_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if pinned_revision.is_none() {
+            let current_revision =
+                super::task_repository::ensure_initial_current_revision_in_tx(&mut tx, &ws.task_id)
+                    .await?;
+            super::task_repository::pin_work_unit_in_tx(
+                &mut tx,
+                &input.work_unit_id,
+                &ws.task_id,
+                current_revision.revision,
+            )
+            .await?;
+        }
         sqlx::query(
             "INSERT INTO workspace (id, task_id, repo_id, worktree_path, branch, status,
                                     before_sha, created_at, updated_at)
@@ -2324,12 +2748,16 @@ impl WorkUnitWorkspaceRepo for SqliteDb {
         .await
         .map_err(work_unit_write_error)?;
         sqlx::query(
-            "INSERT INTO workspace_scope (workspace_id, task_id, scope_kind, work_unit_id, created_at)
-             VALUES (?, ?, 'work_unit', ?, ?)",
+            "INSERT INTO workspace_scope (
+                workspace_id, task_id, repo_id, scope_kind, work_unit_id,
+                workspace_group_id, created_at
+             ) VALUES (?, ?, ?, 'work_unit', ?, ?, ?)",
         )
         .bind(&ws.id)
         .bind(&ws.task_id)
+        .bind(&ws.repo_id)
         .bind(&input.work_unit_id)
+        .bind(&input.workspace_group_id)
         .bind(&ws.created_at)
         .execute(&mut *tx)
         .await

@@ -536,34 +536,62 @@ impl ClaudeCodeAdapter {
             resume_session_id.as_deref(),
             agent_session_id.as_deref(),
         )?;
+        let group_worktrees =
+            executors::workspace_group_writable_paths(Path::new(&ctx.worktree_path));
         let after_sha = if status == ExecutionOutcome::Completed
             && (!ctx.has_repository_workspace || ctx.role == "project_copilot")
         {
             None
         } else if status == ExecutionOutcome::Completed {
             let subject = crate::commit::build_commit_subject(Some(&ctx.description), &ctx.task_id);
-            match crate::commit::commit_worktree_changes_for_role(
-                &ctx.role,
-                Path::new(&ctx.worktree_path),
-                &subject,
-            )
-            .await
-            {
-                Ok(Some(sha)) => Some(sha),
-                Ok(None) => git::get_current_sha(Path::new(&ctx.worktree_path))
+            if let Some(worktrees) = group_worktrees {
+                for worktree in worktrees {
+                    if let Err(error) = crate::commit::commit_worktree_changes_for_role(
+                        &ctx.role,
+                        &worktree,
+                        &subject,
+                        &ctx.agent_config,
+                    )
                     .await
-                    .ok(),
-                Err(error) => {
-                    return Ok(ExecutionResult {
-                        status: ExecutionOutcome::Failed,
-                        after_sha: None,
-                        agent_session_id: agent_session_id.clone(),
-                        summary: stream.summary,
-                        assistant_output: stream.assistant_output,
-                        error: Some(error.to_string()),
-                        usage: stream.usage,
-                        ..Default::default()
-                    });
+                    {
+                        return Ok(ExecutionResult {
+                            status: ExecutionOutcome::Failed,
+                            after_sha: None,
+                            agent_session_id: agent_session_id.clone(),
+                            summary: stream.summary,
+                            assistant_output: stream.assistant_output,
+                            error: Some(error.to_string()),
+                            usage: stream.usage,
+                            ..Default::default()
+                        });
+                    }
+                }
+                None
+            } else {
+                match crate::commit::commit_worktree_changes_for_role(
+                    &ctx.role,
+                    Path::new(&ctx.worktree_path),
+                    &subject,
+                    &ctx.agent_config,
+                )
+                .await
+                {
+                    Ok(Some(sha)) => Some(sha),
+                    Ok(None) => git::get_current_sha(Path::new(&ctx.worktree_path))
+                        .await
+                        .ok(),
+                    Err(error) => {
+                        return Ok(ExecutionResult {
+                            status: ExecutionOutcome::Failed,
+                            after_sha: None,
+                            agent_session_id: agent_session_id.clone(),
+                            summary: stream.summary,
+                            assistant_output: stream.assistant_output,
+                            error: Some(error.to_string()),
+                            usage: stream.usage,
+                            ..Default::default()
+                        });
+                    }
                 }
             }
         } else {

@@ -327,6 +327,56 @@ async fn task_launch_is_idempotent_and_pause_blocks_new_admissions() {
 }
 
 #[tokio::test]
+async fn task_role_membership_can_be_ended_through_its_route() {
+    let repo_dir = TestDir::new("task-role-member-repo");
+    let repo_path = setup_git_repo(repo_dir.path());
+    let workspaces = TestDir::new("task-role-member-workspaces");
+    let harness = test_app(workspaces.path(), "task-role-member").await;
+    let (project_id, _repo_id) =
+        create_project_and_repo(&harness.app, "Task role member", &repo_path).await;
+    let (agent_id, _second_agent_id) =
+        create_shell_agents(&harness.app, workspaces.path(), "task-role-member").await;
+    let task: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({"title": "End a membership"}),
+        StatusCode::OK,
+    )
+    .await;
+    let _: serde_json::Value = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/task-roles", task.id),
+        json!({"role": "implementer", "coordination_mode": "independent", "policy": {}}),
+        StatusCode::OK,
+    )
+    .await;
+    let member: serde_json::Value = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/task-roles/implementer/members", task.id),
+        json!({"actor_ref": {"kind": "agent", "id": agent_id}}),
+        StatusCode::OK,
+    )
+    .await;
+    let membership_id = member["id"].as_str().expect("membership id");
+    let version = member["version"].as_i64().expect("membership version");
+    let ended: serde_json::Value = json_request(
+        &harness.app,
+        Method::PATCH,
+        &format!(
+            "/api/v1/tasks/{}/task-roles/implementer/members/{membership_id}",
+            task.id
+        ),
+        json!({"expected_version": version, "status": "ended"}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(ended["status"], "ended");
+}
+
+#[tokio::test]
 async fn pause_blocks_a_pending_provider_start_without_claiming_it() {
     let repo_dir = TestDir::new("task-dispatch-pending-repo");
     let repo_path = setup_git_repo(repo_dir.path());
