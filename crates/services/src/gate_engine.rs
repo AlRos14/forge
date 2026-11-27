@@ -27,7 +27,8 @@ use crate::{
 mod review_coverage;
 
 pub use review_coverage::{
-    encode_gate_policy_v4, merge_policy_preserving_coverage, GatePolicyDocumentV4,
+    encode_gate_policy_v4, infer_review_coverage_workspace_root, merge_policy_preserving_coverage,
+    review_coverage_evidence, snapshot_gate_review_coverage, GatePolicyDocumentV4,
     GateReviewCoverageRequirement, RepositoryCoverageSubject, ReviewCoverageEvidence,
 };
 
@@ -185,6 +186,11 @@ impl GatePolicyDocumentV3 {
             required_checks,
         }
     }
+}
+
+fn decode_gate_policy_v4(value: Value) -> Result<GatePolicyDocumentV4> {
+    serde_json::from_value(value)
+        .map_err(|error| invalid(format!("invalid Gate policy v4 document: {error}")))
 }
 
 fn normalize_required_checks(mut checks: Vec<RequiredCheck>) -> Result<Vec<RequiredCheck>> {
@@ -525,6 +531,29 @@ impl GateEngine {
         scope_id: &str,
         policy: GatePolicyDocument,
     ) -> Result<(Gate, GatePolicyRevision)> {
+        let policy_value = self
+            .coverage_policy_for_new_gate(
+                task_id,
+                gate_kind,
+                serde_json::to_value(&policy).map_err(|error| {
+                    invalid(format!("Gate policy cannot be serialized: {error}"))
+                })?,
+                None,
+            )
+            .await?;
+        if policy_value.get("schema_version").and_then(Value::as_u64) == Some(4) {
+            return self
+                .create_gate_with_initial_policy_v4(
+                    task_id,
+                    gate_kind,
+                    scope_kind,
+                    scope_id,
+                    decode_gate_policy_v4(policy_value)?,
+                )
+                .await;
+        }
+        let policy: GatePolicyDocument = serde_json::from_value(policy_value)
+            .map_err(|error| invalid(format!("invalid Gate policy document: {error}")))?;
         self.create_gate_with_policy(task_id, gate_kind, scope_kind, scope_id, policy, None)
             .await
     }
@@ -538,6 +567,29 @@ impl GateEngine {
         scope_id: &str,
         policy: GatePolicyDocumentV2,
     ) -> Result<(Gate, GatePolicyRevision)> {
+        let encoded = serde_json::to_value(&policy)
+            .map_err(|error| invalid(format!("Gate policy cannot be serialized: {error}")))?;
+        let primary_repo_id = if gate_kind == "merge_readiness"
+            && self.current_review_policy(task_id).await?.is_some()
+        {
+            self.primary_repository_id(task_id).await?
+        } else {
+            None
+        };
+        let policy_value = self
+            .coverage_policy_for_new_gate(task_id, gate_kind, encoded, primary_repo_id.as_deref())
+            .await?;
+        if policy_value.get("schema_version").and_then(Value::as_u64) == Some(4) {
+            return self
+                .create_gate_with_initial_policy_v4(
+                    task_id,
+                    gate_kind,
+                    scope_kind,
+                    scope_id,
+                    decode_gate_policy_v4(policy_value)?,
+                )
+                .await;
+        }
         let (base, checks) = policy.into_parts()?;
         self.create_gate_with_policy(task_id, gate_kind, scope_kind, scope_id, base, Some(checks))
             .await
@@ -552,11 +604,58 @@ impl GateEngine {
         scope_id: &str,
         policy: GatePolicyDocumentV3,
     ) -> Result<(Gate, GatePolicyRevision)> {
+        let policy_value = self
+            .coverage_policy_for_new_gate(
+                task_id,
+                gate_kind,
+                serde_json::to_value(&policy).map_err(|error| {
+                    invalid(format!("Gate policy cannot be serialized: {error}"))
+                })?,
+                None,
+            )
+            .await?;
+        if policy_value.get("schema_version").and_then(Value::as_u64) == Some(4) {
+            return self
+                .create_gate_with_initial_policy_v4(
+                    task_id,
+                    gate_kind,
+                    scope_kind,
+                    scope_id,
+                    decode_gate_policy_v4(policy_value)?,
+                )
+                .await;
+        }
         let (base, checks) = policy.into_parts()?;
         self.create_gate_with_repository_policy(
             task_id, gate_kind, scope_kind, scope_id, base, checks, None,
         )
         .await
+    }
+
+    async fn coverage_policy_for_new_gate(
+        &self,
+        task_id: &str,
+        gate_kind: &str,
+        next: Value,
+        v2_check_repo_id: Option<&str>,
+    ) -> Result<Value> {
+        if gate_kind != "merge_readiness" {
+            return Ok(next);
+        }
+        let current = self.current_review_policy(task_id).await?;
+        merge_policy_preserving_coverage(next, current.as_ref(), v2_check_repo_id)
+    }
+
+    async fn primary_repository_id(&self, task_id: &str) -> Result<Option<String>> {
+        Ok(TaskRepositorySetRepo::get_current(&*self.db, task_id)
+            .await?
+            .and_then(|revision| {
+                revision
+                    .repositories
+                    .into_iter()
+                    .find(|repository| repository.role == db::TaskRepositoryRole::Primary)
+                    .map(|repository| repository.repo_id)
+            }))
     }
 
     /// Create a merge-readiness Gate whose policy revision requires review
@@ -569,6 +668,17 @@ impl GateEngine {
         scope_id: &str,
         policy: GatePolicyDocumentV4,
     ) -> Result<(Gate, GatePolicyRevision)> {
+        let policy_value = self
+            .coverage_policy_for_new_gate(
+                task_id,
+                gate_kind,
+                serde_json::to_value(&policy).map_err(|error| {
+                    invalid(format!("Gate policy cannot be serialized: {error}"))
+                })?,
+                None,
+            )
+            .await?;
+        let policy = decode_gate_policy_v4(policy_value)?;
         let (base, checks, coverage) = policy.into_parts()?;
         self.validate_review_coverage_binding(task_id, gate_kind, &coverage)
             .await?;
@@ -795,6 +905,28 @@ impl GateEngine {
         expected_active_revision: Option<i64>,
         policy: GatePolicyDocument,
     ) -> Result<GatePolicyRevision> {
+        let gate = GateRepo::get_gate(&*self.db, gate_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("gate", gate_id.to_owned()))?;
+        let policy_value = self
+            .coverage_policy_for_new_gate(
+                &gate.task_id,
+                &gate.gate_kind,
+                serde_json::to_value(&policy).map_err(|error| {
+                    invalid(format!("Gate policy cannot be serialized: {error}"))
+                })?,
+                None,
+            )
+            .await?;
+        if policy_value.get("schema_version").and_then(Value::as_u64) == Some(4) {
+            return self
+                .revise_policy_v4(
+                    gate_id,
+                    expected_active_revision,
+                    decode_gate_policy_v4(policy_value)?,
+                )
+                .await;
+        }
         self.revise_gate_policy(gate_id, expected_active_revision, policy, None)
             .await
     }
@@ -806,6 +938,35 @@ impl GateEngine {
         expected_active_revision: Option<i64>,
         policy: GatePolicyDocumentV2,
     ) -> Result<GatePolicyRevision> {
+        let gate = GateRepo::get_gate(&*self.db, gate_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("gate", gate_id.to_owned()))?;
+        let primary_repo_id = if gate.gate_kind == "merge_readiness"
+            && self.current_review_policy(&gate.task_id).await?.is_some()
+        {
+            self.primary_repository_id(&gate.task_id).await?
+        } else {
+            None
+        };
+        let policy_value = self
+            .coverage_policy_for_new_gate(
+                &gate.task_id,
+                &gate.gate_kind,
+                serde_json::to_value(&policy).map_err(|error| {
+                    invalid(format!("Gate policy cannot be serialized: {error}"))
+                })?,
+                primary_repo_id.as_deref(),
+            )
+            .await?;
+        if policy_value.get("schema_version").and_then(Value::as_u64) == Some(4) {
+            return self
+                .revise_policy_v4(
+                    gate_id,
+                    expected_active_revision,
+                    decode_gate_policy_v4(policy_value)?,
+                )
+                .await;
+        }
         let (base, checks) = policy.into_parts()?;
         self.revise_gate_policy(gate_id, expected_active_revision, base, Some(checks))
             .await
@@ -817,6 +978,28 @@ impl GateEngine {
         expected_active_revision: Option<i64>,
         policy: GatePolicyDocumentV3,
     ) -> Result<GatePolicyRevision> {
+        let gate = GateRepo::get_gate(&*self.db, gate_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("gate", gate_id.to_owned()))?;
+        let policy_value = self
+            .coverage_policy_for_new_gate(
+                &gate.task_id,
+                &gate.gate_kind,
+                serde_json::to_value(&policy).map_err(|error| {
+                    invalid(format!("Gate policy cannot be serialized: {error}"))
+                })?,
+                None,
+            )
+            .await?;
+        if policy_value.get("schema_version").and_then(Value::as_u64) == Some(4) {
+            return self
+                .revise_policy_v4(
+                    gate_id,
+                    expected_active_revision,
+                    decode_gate_policy_v4(policy_value)?,
+                )
+                .await;
+        }
         let (base, checks) = policy.into_parts()?;
         self.revise_repository_policy(gate_id, expected_active_revision, base, checks, None)
             .await
@@ -829,10 +1012,20 @@ impl GateEngine {
         expected_active_revision: Option<i64>,
         policy: GatePolicyDocumentV4,
     ) -> Result<GatePolicyRevision> {
-        let (base, checks, coverage) = policy.into_parts()?;
         let gate = GateRepo::get_gate(&*self.db, gate_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("gate", gate_id.to_owned()))?;
+        let policy_value = self
+            .coverage_policy_for_new_gate(
+                &gate.task_id,
+                &gate.gate_kind,
+                serde_json::to_value(&policy).map_err(|error| {
+                    invalid(format!("Gate policy cannot be serialized: {error}"))
+                })?,
+                None,
+            )
+            .await?;
+        let (base, checks, coverage) = decode_gate_policy_v4(policy_value)?.into_parts()?;
         self.validate_review_coverage_binding(&gate.task_id, &gate.gate_kind, &coverage)
             .await?;
         self.revise_repository_policy(
@@ -1055,6 +1248,25 @@ impl GateEngine {
             .ok_or_else(|| {
                 ServiceError::not_found("gate policy revision", format!("{}:{revision}", gate.id))
             })?;
+        let inferred_coverage = if gate.gate_kind == "merge_readiness"
+            && policy_revision.schema_version == 4
+            && coverage_evidence.is_none()
+        {
+            let workspace_root =
+                review_coverage::infer_review_coverage_workspace_root(&self.db, &gate.task_id)
+                    .await?;
+            Some(
+                review_coverage::snapshot_gate_review_coverage(
+                    Arc::clone(&self.db),
+                    workspace_root,
+                    &gate.task_id,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let coverage_evidence = coverage_evidence.or(inferred_coverage.as_ref());
         let mut issues = Vec::new();
         let mut missing = Vec::new();
         let mut inputs = Vec::new();

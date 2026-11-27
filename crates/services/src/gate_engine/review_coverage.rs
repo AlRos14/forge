@@ -5,7 +5,11 @@
 //! dropped. The evaluator is pure and fails closed: without exact, current
 //! coverage evidence a v4 policy is never satisfied.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use api_types::ReviewCoverageStatus;
 use serde::{Deserialize, Serialize};
@@ -18,6 +22,156 @@ use super::{
     RequiredCheckV3, ReviewSetPolicy, ValidationRequirement, WorkUnitRequirement,
 };
 use crate::{Result, ServiceError};
+
+/// Recompute the current Task coverage using lane B's Git-facts and durable-row
+/// snapshot boundary. The transaction only re-reads SQLite facts; Git work is
+/// completed by `prepare` before it starts.
+pub async fn snapshot_gate_review_coverage(
+    db: Arc<db::SqliteDb>,
+    workspace_root: PathBuf,
+    task_id: &str,
+) -> Result<ReviewCoverageEvidence> {
+    use db::{
+        ReviewLedgerRepo, TaskRepositoryRole, TaskRepositorySetRepo,
+        WorkUnitRepositoryIntegrationOutcome,
+    };
+
+    let service = crate::review_range::ReviewCoverageService::new(db.clone(), workspace_root);
+    let mut candidates = Vec::new();
+    if let Some(repository_set) = TaskRepositorySetRepo::get_current(&*db, task_id).await? {
+        for repository in repository_set.repositories.iter().filter(|repository| {
+            matches!(
+                repository.role,
+                TaskRepositoryRole::Primary | TaskRepositoryRole::Affected
+            )
+        }) {
+            let rows =
+                ReviewLedgerRepo::load_review_coverage_rows(&*db, task_id, &repository.repo_id)
+                    .await?;
+            let latest = rows
+                .integrations
+                .iter()
+                .filter(|integration| {
+                    integration.outcome == WorkUnitRepositoryIntegrationOutcome::Success
+                })
+                .filter_map(|integration| {
+                    integration
+                        .target_after_sha
+                        .as_deref()
+                        .map(|sha| ((&integration.started_at, &integration.id), sha))
+                })
+                .max_by_key(|(order, _)| *order)
+                .map(|(_, sha)| sha);
+            if let Some(commit_sha) = latest {
+                candidates.push(crate::review_range::RepoCandidate {
+                    repo_id: repository.repo_id.clone(),
+                    commit_sha: commit_sha.to_owned(),
+                });
+            }
+        }
+    }
+    candidates.sort_by(|left, right| left.repo_id.cmp(&right.repo_id));
+
+    let facts = service.prepare(task_id, &candidates).await?;
+    let mut tx = db.pool().begin().await.map_err(db::DbError::from)?;
+    let snapshot = service.snapshot_in_tx(&mut tx, &facts).await?;
+    tx.commit().await.map_err(db::DbError::from)?;
+    Ok(review_coverage_evidence(snapshot))
+}
+
+/// Infer the configured workspace root from a Forge-managed integration
+/// workspace. Coverage fact collection resolves remote repository caches below
+/// this root; local repository paths do not depend on it.
+pub async fn infer_review_coverage_workspace_root(
+    db: &db::SqliteDb,
+    task_id: &str,
+) -> Result<PathBuf> {
+    use db::{TaskRepositoryRole, TaskRepositorySetRepo, WorkspaceRepo};
+    use std::ffi::OsStr;
+
+    let Some(repository_set) = TaskRepositorySetRepo::get_current(db, task_id).await? else {
+        return Ok(PathBuf::from("."));
+    };
+    for repository in repository_set.repositories.iter().filter(|repository| {
+        matches!(
+            repository.role,
+            TaskRepositoryRole::Primary | TaskRepositoryRole::Affected
+        )
+    }) {
+        let Some(workspace) =
+            WorkspaceRepo::get_integration_by_task_repo(db, task_id, &repository.repo_id).await?
+        else {
+            continue;
+        };
+        let worktree = PathBuf::from(workspace.worktree_path);
+        let task_root = worktree.parent().ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "integration workspace path has no Task directory for review coverage",
+            )
+        })?;
+        if task_root.file_name() != Some(OsStr::new(task_id)) {
+            return Err(ServiceError::invalid_operation(
+                "integration workspace path does not identify its Task for review coverage",
+            ));
+        }
+        return task_root.parent().map(Path::to_path_buf).ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "integration workspace path has no workspace root for review coverage",
+            )
+        });
+    }
+    Ok(PathBuf::from("."))
+}
+
+/// Narrow adapter from lane B's authoritative coverage snapshot to Gate v4's
+/// immutable evaluation input shape.
+pub fn review_coverage_evidence(
+    snapshot: crate::review_range::CoverageSnapshot,
+) -> ReviewCoverageEvidence {
+    ReviewCoverageEvidence {
+        policy: snapshot.policy,
+        repositories: snapshot
+            .repos
+            .into_iter()
+            .map(|repository| RepositoryCoverageSubject {
+                repo_id: repository.repo_id,
+                revision: repository.revision,
+                status: match repository.status {
+                    crate::review_range::ReviewCoverageStatus::NotRequired => {
+                        ReviewCoverageStatus::NotRequired
+                    }
+                    crate::review_range::ReviewCoverageStatus::Unchanged => {
+                        ReviewCoverageStatus::Unchanged
+                    }
+                    crate::review_range::ReviewCoverageStatus::Uncovered => {
+                        ReviewCoverageStatus::Uncovered
+                    }
+                    crate::review_range::ReviewCoverageStatus::Partial => {
+                        ReviewCoverageStatus::Partial
+                    }
+                    crate::review_range::ReviewCoverageStatus::InReview => {
+                        ReviewCoverageStatus::InReview
+                    }
+                    crate::review_range::ReviewCoverageStatus::FindingsOpen => {
+                        ReviewCoverageStatus::FindingsOpen
+                    }
+                    crate::review_range::ReviewCoverageStatus::HistoryRewritten => {
+                        ReviewCoverageStatus::HistoryRewritten
+                    }
+                    crate::review_range::ReviewCoverageStatus::Blocked => {
+                        ReviewCoverageStatus::Blocked
+                    }
+                    crate::review_range::ReviewCoverageStatus::Satisfied => {
+                        ReviewCoverageStatus::Satisfied
+                    }
+                },
+                snapshot_digest: repository.snapshot_digest,
+                base_commit: repository.base_commit,
+                candidate_commit: repository.candidate_commit,
+            })
+            .collect(),
+    }
+}
 
 const COVERAGE_MISSING: &str = "gate.review_coverage_missing";
 const FACTS_STALE: &str = "review.coverage.facts_stale";

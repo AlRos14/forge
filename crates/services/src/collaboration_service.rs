@@ -1,4 +1,4 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use db::{
     new_uuid_v4, now_rfc3339, ActorRef, AgentRepo, Artifact, ArtifactKind, ArtifactStorageKind,
@@ -12,7 +12,11 @@ use db::{
 use events::EventBus;
 use sha2::{Digest, Sha256};
 
-use crate::{domain_event_service::DomainEventService, Result, ServiceError};
+use crate::{
+    domain_event_service::DomainEventService, work_unit_service::range_review, Result, ServiceError,
+};
+
+mod range_report;
 
 /// A write principal comes from authenticated Human context or a persisted
 /// Execution. API request DTOs never deserialize this value.
@@ -96,6 +100,8 @@ struct EventScope<'a> {
 pub struct CollaborationService {
     db: Arc<SqliteDb>,
     domain_events: DomainEventService,
+    /// Required to attribute the findings of a commit-range review.
+    review_workspace_root: Option<PathBuf>,
 }
 
 type ReviewReportInputs = (Vec<String>, Vec<String>, Option<String>, Option<i64>);
@@ -122,7 +128,15 @@ impl CollaborationService {
         Self {
             domain_events: DomainEventService::new(Arc::clone(&db), event_bus),
             db,
+            review_workspace_root: None,
         }
+    }
+
+    /// Enable commit-range finding attribution, which resolves repositories under
+    /// this root. Without it a range report with locations fails closed.
+    pub(crate) fn with_review_workspace_root(mut self, workspace_root: PathBuf) -> Self {
+        self.review_workspace_root = Some(workspace_root);
+        self
     }
 
     /// Recompute and compare the complete durable subject of a workspace-bound
@@ -154,6 +168,18 @@ impl CollaborationService {
             let Some(review_work_unit_id) = execution.work_unit_id.as_deref() else {
                 return Ok(());
             };
+            if range_review::frozen_range(&self.db, review_work_unit_id)
+                .await?
+                .is_some()
+            {
+                range_review::verify_range_checkout(
+                    &self.db,
+                    &execution.task_id,
+                    review_work_unit_id,
+                )
+                .await?;
+                return Ok(());
+            }
             let Some(subject) =
                 crate::task_rework::get_review_subject(&self.db, review_work_unit_id).await?
             else {
@@ -318,6 +344,18 @@ impl CollaborationService {
             ExecutionRepo::get_review_execution_subject(&*self.db, &execution.id).await?;
         let value: serde_json::Value = serde_json::from_str(content)
             .map_err(|error| invalid(format!("ReviewReport JSON is invalid: {error}")))?;
+        if let Some(review_work_unit_id) = execution.work_unit_id.as_deref() {
+            if let Some(frozen) = range_review::frozen_range(&self.db, review_work_unit_id).await? {
+                if persisted_subject.is_some() || execution.workspace_id.is_some() {
+                    return Err(invalid(
+                        "range Review Execution unexpectedly has a Workspace subject",
+                    ));
+                }
+                self.ensure_exact_range_report(execution, &frozen, &value)
+                    .await?;
+                return Ok(Some(report));
+            }
+        }
         let relation_review_subject = match execution.work_unit_id.as_deref() {
             Some(review_work_unit_id) => {
                 crate::task_rework::get_review_subject(&self.db, review_work_unit_id).await?
@@ -833,7 +871,39 @@ impl CollaborationService {
                 }
             }
         }
-        let structured = parse_review_result(assistant_output)?;
+        // A commit-range reviewer uses the version 2 contract; a result
+        // reviewer only version 1.
+        let frozen_range = match execution.work_unit_id.as_deref() {
+            Some(work_unit_id) => range_review::frozen_range(&self.db, work_unit_id).await?,
+            None => None,
+        };
+        let range_report = match frozen_range {
+            Some(frozen) => {
+                if requested_inputs
+                    .as_ref()
+                    .is_some_and(|(_, _, id, version)| id.is_some() || version.is_some())
+                {
+                    return Err(range_review::mismatch(
+                        "a commit-range review has no reviewed WorkUnit result",
+                    ));
+                }
+                let input = range_report::parse_range_review_result(assistant_output)?;
+                Some((frozen, input))
+            }
+            None => None,
+        };
+        let structured = match range_report.as_ref() {
+            // Only the evidence references are shared with the version 1 path.
+            Some((_, input)) => ParsedReviewResult {
+                verdict: "questions",
+                criteria: Vec::new(),
+                summary: String::new(),
+                findings: Vec::new(),
+                questions: Vec::new(),
+                evidence_considered: input.evidence_considered.clone(),
+            },
+            None => parse_review_result(assistant_output)?,
+        };
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
             .await?
             .ok_or_else(|| not_found("task", execution.task_id.clone()))?;
@@ -1002,6 +1072,20 @@ impl CollaborationService {
                     }));
                 }
             }
+        }
+
+        if let Some((frozen, input)) = range_report {
+            return self
+                .create_range_review_report(
+                    &execution,
+                    &actor,
+                    &frozen,
+                    input,
+                    considered,
+                    existing_output,
+                    requested_inputs,
+                )
+                .await;
         }
 
         let subject = if execution.workspace_id.is_some() {

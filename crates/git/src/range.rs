@@ -324,6 +324,20 @@ async fn tree_has_file(repo_path: &Path, commit: &str, path: &str) -> Result<boo
     }))
 }
 
+/// Whether a repository-relative file path exists in the tree of `commit`.
+/// Unsafe paths and directories are reported as absent.
+pub async fn path_exists_at(repo_path: &Path, commit: &str, path: &str) -> Result<bool> {
+    ensure_revision(commit)?;
+    if path.contains(['\0', '\\'])
+        || path
+            .split('/')
+            .any(|segment| matches!(segment, "" | "." | ".."))
+    {
+        return Ok(false);
+    }
+    tree_has_file(repo_path, commit, path).await
+}
+
 /// Whether a repository-relative file path exists at `head`, or existed at
 /// `base` and is absent from `head`. Unsafe or directory paths are `false`.
 pub async fn path_exists_or_deleted(
@@ -566,6 +580,10 @@ mod tests {
                 "{path}"
             );
         }
+        assert!(!path_exists_at(&r.repo, &head, "a.txt").await.unwrap());
+        assert!(path_exists_at(&r.repo, &head, "side file.txt")
+            .await
+            .unwrap());
         for path in [
             "dir",
             "dir/",

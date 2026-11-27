@@ -1,4 +1,6 @@
 mod human_review;
+pub(crate) mod range_review;
+mod range_review_dispatch;
 
 use std::{path::Path, path::PathBuf, sync::Arc};
 
@@ -976,6 +978,11 @@ impl WorkUnitService {
                     "independent review cannot use the Actor assigned to or contributing to the reviewed result",
                 ));
             }
+            if !range_review::range_allocation_is_independent(&self.db, id, assigned_actor).await? {
+                return Err(invalid(
+                    "independent range review cannot use a Human contributor of the range",
+                ));
+            }
             let dependent_reviewer: i64 = sqlx::query_scalar(
                 "SELECT EXISTS(
                     SELECT 1 FROM work_unit_review_subject s
@@ -1519,7 +1526,10 @@ impl WorkUnitService {
             api_types::TaskRoleCapability::FormalReview,
         )
         .await?;
-        let review_subject_ready = if has_review_subject || formal_review {
+        let frozen_range = range_review::frozen_range(&self.db, id).await?;
+        let review_subject_ready = if let Some(frozen) = frozen_range.as_ref() {
+            formal_review && range_review::range_review_ready(&self.db, frozen).await?
+        } else if has_review_subject || formal_review {
             if !has_review_subject || !formal_review {
                 false
             } else {
@@ -1635,6 +1645,11 @@ impl WorkUnitService {
         )
         .await?;
         self.domain_events.publish_committed(&write.event);
+        // The Execution is already admitted; a checkpoint left `pending` is
+        // still reviewable, so this must not turn admission into a failure.
+        if let Err(error) = range_review::mark_range_review_started(&self.db, id).await {
+            tracing::warn!(work_unit_id = %id, %error, "range review checkpoint was not marked in review");
+        }
         Ok(write.record)
     }
 
@@ -1704,6 +1719,7 @@ impl WorkUnitService {
                 continue;
             }
             if formal_review
+                && range_review::frozen_range(&self.db, &id).await?.is_none()
                 && self
                     .freeze_review_subject_repositories(&id)
                     .await?
@@ -1737,6 +1753,9 @@ impl WorkUnitService {
         let task_repositories = TaskRepo::list_repositories(&*self.db, &task.id).await?;
         let mut members = Vec::new();
         if formal_review {
+            if let Some(frozen) = range_review::frozen_range(&self.db, &work_unit.id).await? {
+                return self.range_review_group_members(task, &frozen).await;
+            }
             let subject = self
                 .freeze_review_subject_repositories(&work_unit.id)
                 .await?;
@@ -2205,7 +2224,11 @@ impl WorkUnitService {
                 api_types::TaskRoleCapability::FormalReview,
             )
             .await?;
-            if formal_review {
+            if formal_review
+                && range_review::frozen_range(&self.db, work_unit_id)
+                    .await?
+                    .is_none()
+            {
                 self.freeze_review_subject_repositories(work_unit_id).await?;
             }
             if unit.status != WorkUnitStatus::Open

@@ -287,8 +287,26 @@ pub enum ServiceError {
     TerminalInvalidInput { message: String },
 }
 
+/// A commit-range review submits `structured_findings` and `resolutions` and
+/// leaves the free-text `findings` empty.
+pub(crate) fn require_range_report_fields(
+    report: &api_types::SubmitReviewReportRequest,
+) -> Result<()> {
+    if report.structured_findings.is_none()
+        || report.resolutions.is_none()
+        || !report.findings.is_empty()
+    {
+        return Err(ServiceError::Coordination {
+            code: "review.report.invalid_findings",
+            message: "a commit-range review requires structured_findings and resolutions with empty findings"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// Commit-range ReviewReport fields are not accepted for a WorkUnit result
-/// review, the only review submission currently implemented.
+/// review.
 pub(crate) fn reject_range_report_fields(
     report: &api_types::SubmitReviewReportRequest,
 ) -> Result<()> {

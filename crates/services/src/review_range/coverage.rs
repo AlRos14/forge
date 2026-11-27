@@ -53,6 +53,20 @@ impl ReviewCoverageStatus {
             Self::Satisfied => "satisfied",
         }
     }
+
+    fn gate_status(self) -> api_types::ReviewCoverageStatus {
+        match self {
+            Self::NotRequired => api_types::ReviewCoverageStatus::NotRequired,
+            Self::Unchanged => api_types::ReviewCoverageStatus::Unchanged,
+            Self::Uncovered => api_types::ReviewCoverageStatus::Uncovered,
+            Self::Partial => api_types::ReviewCoverageStatus::Partial,
+            Self::InReview => api_types::ReviewCoverageStatus::InReview,
+            Self::FindingsOpen => api_types::ReviewCoverageStatus::FindingsOpen,
+            Self::HistoryRewritten => api_types::ReviewCoverageStatus::HistoryRewritten,
+            Self::Blocked => api_types::ReviewCoverageStatus::Blocked,
+            Self::Satisfied => api_types::ReviewCoverageStatus::Satisfied,
+        }
+    }
 }
 
 /// Field order is part of the snapshot digest.
@@ -138,6 +152,28 @@ pub struct CoverageSnapshot {
     pub policy: ReviewPolicyRef,
     /// Ordered by `repo_id`.
     pub repos: Vec<RepoCoverage>,
+}
+
+impl CoverageSnapshot {
+    /// Converts the exact prepared snapshot to Gate v4 evidence. Repositories
+    /// retain the snapshot order established by `CoverageFacts`.
+    pub fn gate_evidence(&self) -> crate::gate_engine::ReviewCoverageEvidence {
+        crate::gate_engine::ReviewCoverageEvidence {
+            policy: self.policy.clone(),
+            repositories: self
+                .repos
+                .iter()
+                .map(|repo| crate::gate_engine::RepositoryCoverageSubject {
+                    repo_id: repo.repo_id.clone(),
+                    revision: repo.revision,
+                    status: repo.status.gate_status(),
+                    snapshot_digest: repo.snapshot_digest.clone(),
+                    base_commit: repo.base_commit.clone(),
+                    candidate_commit: repo.candidate_commit.clone(),
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Field order is part of the digest.

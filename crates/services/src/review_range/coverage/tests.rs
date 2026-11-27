@@ -349,6 +349,50 @@ fn review_range_coverage_is_not_required_without_a_policy() {
     );
 }
 
+#[test]
+fn review_range_coverage_gate_evidence_preserves_revision_status_and_subject() {
+    let snapshot = CoverageSnapshot {
+        policy: ReviewPolicyRef {
+            revision: 4,
+            digest: "p".repeat(64),
+        },
+        repos: vec![RepoCoverage {
+            repo_id: "repo".to_owned(),
+            status: ReviewCoverageStatus::Satisfied,
+            reason_code: None,
+            revision: 17,
+            base_commit: Some("base".to_owned()),
+            candidate_commit: Some("head".to_owned()),
+            frontier_commit: Some("head".to_owned()),
+            unreviewed_commits: 0,
+            ranges: Vec::new(),
+            open_findings: SeverityCounts::default(),
+            open_finding_ids: Vec::new(),
+            resolution_ids: Vec::new(),
+            active_checkpoint_id: None,
+            snapshot_digest: "s".repeat(64),
+        }],
+    };
+
+    assert_eq!(
+        snapshot.gate_evidence(),
+        crate::gate_engine::ReviewCoverageEvidence {
+            policy: ReviewPolicyRef {
+                revision: 4,
+                digest: "p".repeat(64),
+            },
+            repositories: vec![crate::gate_engine::RepositoryCoverageSubject {
+                repo_id: "repo".to_owned(),
+                revision: 17,
+                status: api_types::ReviewCoverageStatus::Satisfied,
+                snapshot_digest: "s".repeat(64),
+                base_commit: Some("base".to_owned()),
+                candidate_commit: Some("head".to_owned()),
+            }],
+        }
+    );
+}
+
 #[tokio::test]
 async fn review_range_coverage_collects_git_facts() {
     let dir = tempfile::tempdir().unwrap();

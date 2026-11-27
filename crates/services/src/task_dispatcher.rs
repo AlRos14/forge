@@ -15,6 +15,7 @@ use crate::{project_plan::ProjectPlanService, Result, TaskService};
 mod active_recovery;
 mod dispatch;
 mod fallback;
+mod range_review_prompt;
 pub(crate) use dispatch::work_unit_consumption_context;
 
 pub use dispatch::DispatchOutcome;

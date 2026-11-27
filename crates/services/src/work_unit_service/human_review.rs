@@ -11,7 +11,6 @@ impl WorkUnitService {
         expected_version: i64,
         mut report: api_types::SubmitReviewReportRequest,
     ) -> Result<(Execution, db::Artifact)> {
-        crate::reject_range_report_fields(&report)?;
         let _guard = self
             .integration_locks
             .acquire(&format!("human-work-unit-review:{work_unit_id}"))
@@ -36,6 +35,60 @@ impl WorkUnitService {
                 "Review submission requires the exact assigned Human in a formal_review TaskRole",
             ));
         }
+        let digest = Sha256::digest(format!(
+            "forge.human-work-unit-review.v1:{work_unit_id}:{expected_version}:{user_id}"
+        ));
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        bytes[6] = (bytes[6] & 0x0f) | 0x50;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        let execution_id = Uuid::from_bytes(bytes).to_string();
+        if let Some(frozen) = range_review::frozen_range(&self.db, work_unit_id).await? {
+            crate::require_range_report_fields(&report)?;
+            if report.reviewed_work_unit_id.is_some() || report.reviewed_work_unit_version.is_some()
+            {
+                return Err(range_review::mismatch(
+                    "a commit-range review has no reviewed WorkUnit result",
+                ));
+            }
+            if !range_review::range_allocation_is_independent(
+                &self.db,
+                work_unit_id,
+                &ActorRef::Human(user_id.to_owned()),
+            )
+            .await?
+            {
+                return Err(invalid("Review requires an independent reviewer"));
+            }
+            // A replay finds the checkpoint already reviewed; only a new
+            // attempt prepares the read-only group.
+            if ExecutionRepo::get_by_id(&*self.db, &execution_id)
+                .await?
+                .is_none()
+            {
+                if !range_review::range_review_ready(&self.db, &frozen).await? {
+                    return Err(range_review::mismatch(
+                        "the review checkpoint is no longer active",
+                    ));
+                }
+                if unit.status == WorkUnitStatus::Open {
+                    self.prepare_workspace_group(source.clone(), work_unit_id)
+                        .await?;
+                }
+            }
+            return self
+                .complete_human_review_attempt(
+                    task_service,
+                    source,
+                    &unit,
+                    user_id,
+                    expected_version,
+                    execution_id,
+                    report,
+                )
+                .await;
+        }
+        crate::reject_range_report_fields(&report)?;
         let independent = crate::task_rework::reviewer_is_independent(
             &self.db,
             work_unit_id,
@@ -92,14 +145,32 @@ impl WorkUnitService {
             ));
         }
 
-        let digest = Sha256::digest(format!(
-            "forge.human-work-unit-review.v1:{work_unit_id}:{expected_version}:{user_id}"
-        ));
-        let mut bytes = [0_u8; 16];
-        bytes.copy_from_slice(&digest[..16]);
-        bytes[6] = (bytes[6] & 0x0f) | 0x50;
-        bytes[8] = (bytes[8] & 0x3f) | 0x80;
-        let execution_id = Uuid::from_bytes(bytes).to_string();
+        self.complete_human_review_attempt(
+            task_service,
+            source,
+            &unit,
+            user_id,
+            expected_version,
+            execution_id,
+            report,
+        )
+        .await
+    }
+
+    /// Admit (or replay) the deterministic Human attempt, persist its exact
+    /// report and complete the reviewer WorkUnit.
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_human_review_attempt(
+        &self,
+        task_service: &crate::TaskService,
+        source: CollaborationActorSource,
+        unit: &WorkUnit,
+        user_id: &str,
+        expected_version: i64,
+        execution_id: String,
+        report: api_types::SubmitReviewReportRequest,
+    ) -> Result<(Execution, db::Artifact)> {
+        let work_unit_id = unit.id.as_str();
         if ExecutionRepo::get_by_id(&*self.db, &execution_id)
             .await?
             .is_none()

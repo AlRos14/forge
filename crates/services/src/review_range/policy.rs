@@ -6,11 +6,12 @@ use crate::{
     Result, ServiceError,
 };
 use db::{
-    CreateDomainEvent, DbError, ProjectRepo, ProjectReviewPolicy, RepoRepo, ReviewBaseSource,
-    ReviewLedgerRepo, ReviewPolicyDocument, ReviewPolicyRepo, ReviewPolicySource, ReviewRiskClass,
-    SqliteDb, Task, TaskRepo, TaskRepositoryRole, TaskReviewBase, TaskReviewPolicyRevision,
-    WorkUnitRepositoryIntegration, WorkUnitRepositoryIntegrationOutcome, WriteProjectReviewPolicy,
-    WriteTaskReviewPolicy,
+    CreateDomainEvent, CreateGatePolicyRevision, DbError, GateRepo, ProjectRepo,
+    ProjectReviewPolicy, RepoRepo, ReviewBaseSource, ReviewLedgerRepo, ReviewPolicyDocument,
+    ReviewPolicyRepo, ReviewPolicySource, ReviewRiskClass, ReviseGateWithPolicy, SqliteDb, Task,
+    TaskRepo, TaskRepositoryRole, TaskReviewBase, TaskReviewPolicyRevision,
+    WorkUnitRepositoryIntegration, WorkUnitRepositoryIntegrationOutcome, WorkspaceRepo,
+    WorkspaceStatus, WriteProjectReviewPolicy, WriteTaskReviewPolicy,
 };
 use std::{
     path::{Path, PathBuf},
@@ -102,9 +103,8 @@ impl ReviewPolicyService {
         Ok(self.db.get_current_task_review_policy(task_id).await?)
     }
 
-    /// Writes the next policy revision. A Task that already has a
-    /// `merge_readiness` Gate is rejected until the Gate can be revised to
-    /// policy v4 in the same transaction.
+    /// Writes the next policy revision and pins every active merge-readiness
+    /// Gate to the same exact policy revision in one database transaction.
     pub async fn set(
         &self,
         user_id: &str,
@@ -117,22 +117,95 @@ impl ReviewPolicyService {
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
         self.require_admin(&task.project_id, user_id).await?;
-        let has_merge_gate: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM gate
-             WHERE task_id = ? AND gate_kind = 'merge_readiness')",
+        let merge_gate_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM gate WHERE task_id = ? AND gate_kind = 'merge_readiness'",
         )
         .bind(task_id)
         .fetch_one(self.db.pool())
         .await?;
-        if has_merge_gate {
-            return super::not_implemented(
-                "revising a Task's merge_readiness Gate together with its review policy",
-            );
-        }
         let digest = Self::digest(&policy)?;
         let created_at = db::now_rfc3339();
         let initial_bases = self.initial_bases(&task, &created_at).await?;
         let revision = expected_revision.unwrap_or(0).saturating_add(1);
+        let policy_ref = db::ReviewPolicyRef {
+            revision,
+            digest: digest.clone(),
+        };
+        let repository_set = TaskRepo::list_repositories(&*self.db, task_id).await?;
+        let v2_check_repo_id = repository_set
+            .iter()
+            .find(|repository| repository.role == TaskRepositoryRole::Primary)
+            .map(|repository| repository.repo_id.as_str());
+        let active_gates = GateRepo::list_active_gate_policies(&*self.db, task_id).await?;
+        let active_merge_gates = active_gates
+            .into_iter()
+            .filter(|(gate, _)| gate.gate_kind == "merge_readiness")
+            .collect::<Vec<_>>();
+        if i64::try_from(active_merge_gates.len()).unwrap_or(i64::MAX) != merge_gate_count {
+            return Err(ServiceError::invalid_operation(
+                "every merge_readiness Gate must have an active policy before review policy can be changed",
+            ));
+        }
+        let mut gate_revisions = Vec::with_capacity(active_merge_gates.len());
+        for (gate, active) in active_merge_gates {
+            let policy_value = serde_json::from_str(&active.policy_json).map_err(|error| {
+                ServiceError::invalid_operation(format!(
+                    "active Gate policy is not valid JSON: {error}"
+                ))
+            })?;
+            let v4_value = crate::gate_engine::merge_policy_preserving_coverage(
+                policy_value,
+                Some(&policy_ref),
+                v2_check_repo_id,
+            )?;
+            let v4: crate::gate_engine::GatePolicyDocumentV4 = serde_json::from_value(v4_value)
+                .map_err(|error| {
+                    ServiceError::invalid_operation(format!(
+                        "active Gate policy cannot be converted to v4: {error}"
+                    ))
+                })?;
+            let (policy_json, policy_digest) = crate::gate_engine::encode_gate_policy_v4(v4)?;
+            let gate_revision = active.revision.saturating_add(1);
+            let policy_id = format!("{}:policy:{gate_revision}", gate.id);
+            let event = CreateDomainEvent {
+                id: db::new_uuid_v4(),
+                event_type: "gate.policy_revised".to_owned(),
+                entity_type: "gate".to_owned(),
+                entity_id: policy_id,
+                actor_type: "human".to_owned(),
+                actor_id: Some(user_id.to_owned()),
+                scope_type: "task".to_owned(),
+                scope_id: task_id.to_owned(),
+                correlation_id: task_id.to_owned(),
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: Some(format!(
+                    "gate.policy_revised:{}:policy:{gate_revision}",
+                    gate.id
+                )),
+                payload_json: serde_json::json!({
+                    "gate_id": gate.id.clone(),
+                    "revision": gate_revision,
+                    "policy_digest": policy_digest.clone(),
+                })
+                .to_string(),
+                created_at: created_at.clone(),
+            };
+            gate_revisions.push(ReviseGateWithPolicy {
+                gate_id: gate.id.clone(),
+                expected_active_revision: Some(active.revision),
+                revision: CreateGatePolicyRevision {
+                    gate_id: gate.id,
+                    expected_active_revision: Some(active.revision),
+                    revision: gate_revision,
+                    schema_version: 4,
+                    policy_json,
+                    policy_digest,
+                    created_at: created_at.clone(),
+                    event,
+                },
+            });
+        }
         let event = CreateDomainEvent {
             id: db::new_uuid_v4(),
             event_type: "task.review_policy_updated".to_owned(),
@@ -163,7 +236,7 @@ impl ReviewPolicyService {
                 digest,
                 source: ReviewPolicySource::Owner,
                 created_by_user_id: user_id.to_owned(),
-                gate_revisions: Vec::new(),
+                gate_revisions,
                 initial_bases,
                 events: vec![event],
                 created_at,
@@ -203,18 +276,56 @@ impl ReviewPolicyService {
             .map_err(write_error)
     }
 
-    /// The pinned base of a repository, or `None` when none can be determined
-    /// yet. Pinning outside a policy write needs a persistence writer that does
-    /// not exist yet, so a determinable but unpinned base is an error.
+    /// Pins a repository's first review base from the first successful
+    /// integration, or from the prepared integration Workspace when no
+    /// integration exists yet. Missing or unavailable facts stay unpinned.
     pub async fn pin_base(&self, task_id: &str, repo_id: &str) -> Result<Option<TaskReviewBase>> {
         let rows = self.db.load_review_coverage_rows(task_id, repo_id).await?;
         if rows.base.is_some() {
             return Ok(rows.base);
         }
-        if first_successful_integration(&rows.integrations).is_none() {
+        if self.current(task_id).await?.is_none() {
             return Ok(None);
         }
-        super::not_implemented("pinning a review base outside a policy write")
+        let (base_commit, source) =
+            if let Some(first) = first_successful_integration(&rows.integrations) {
+                (
+                    first.target_before_sha.clone(),
+                    ReviewBaseSource::FirstIntegration,
+                )
+            } else {
+                let Some(workspace) =
+                    WorkspaceRepo::get_integration_by_task_repo(&*self.db, task_id, repo_id)
+                        .await?
+                        .filter(|workspace| workspace.status == WorkspaceStatus::Ready)
+                else {
+                    return Ok(None);
+                };
+                let Some(base) = workspace.before_sha else {
+                    return Ok(None);
+                };
+                (base, ReviewBaseSource::WorkspacePrepare)
+            };
+        let repo = RepoRepo::get_by_id(&*self.db, repo_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("repo", repo_id.to_owned()))?;
+        let source_path = resolve_repo_source(&repo, &self.workspace_root).await?;
+        if !git::commit_exists(Path::new(&source_path), &base_commit).await? {
+            return Ok(None);
+        }
+        let base_tree = git::resolve_tree(Path::new(&source_path), &base_commit).await?;
+        let pinned_at = db::now_rfc3339();
+        let base = TaskReviewBase {
+            task_id: task_id.to_owned(),
+            repo_id: repo_id.to_owned(),
+            revision: 1,
+            base_commit,
+            base_tree,
+            source,
+            decision_id: None,
+            pinned_at,
+        };
+        Ok(Some(self.db.pin_review_base(base, Vec::new()).await?))
     }
 
     async fn require_admin(&self, project_id: &str, user_id: &str) -> Result<()> {
@@ -246,21 +357,42 @@ impl ReviewPolicyService {
             if rows.base.is_some() {
                 continue;
             }
-            let Some(first) = first_successful_integration(&rows.integrations) else {
-                continue;
-            };
+            let (base_commit, base_source) =
+                if let Some(first) = first_successful_integration(&rows.integrations) {
+                    (
+                        first.target_before_sha.clone(),
+                        ReviewBaseSource::FirstIntegration,
+                    )
+                } else {
+                    let Some(workspace) = WorkspaceRepo::get_integration_by_task_repo(
+                        &*self.db,
+                        &task.id,
+                        &member.repo_id,
+                    )
+                    .await?
+                    .filter(|workspace| workspace.status == WorkspaceStatus::Ready) else {
+                        continue;
+                    };
+                    let Some(base) = workspace.before_sha else {
+                        continue;
+                    };
+                    (base, ReviewBaseSource::WorkspacePrepare)
+                };
             let repo = RepoRepo::get_by_id(&*self.db, &member.repo_id)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("repo", member.repo_id.clone()))?;
-            let source = resolve_repo_source(&repo, &self.workspace_root).await?;
-            let base_tree = git::resolve_tree(Path::new(&source), &first.target_before_sha).await?;
+            let repo_path = resolve_repo_source(&repo, &self.workspace_root).await?;
+            if !git::commit_exists(Path::new(&repo_path), &base_commit).await? {
+                continue;
+            }
+            let base_tree = git::resolve_tree(Path::new(&repo_path), &base_commit).await?;
             bases.push(TaskReviewBase {
                 task_id: task.id.clone(),
                 repo_id: member.repo_id,
                 revision: 1,
-                base_commit: first.target_before_sha.clone(),
+                base_commit,
                 base_tree,
-                source: ReviewBaseSource::FirstIntegration,
+                source: base_source,
                 decision_id: None,
                 pinned_at: pinned_at.to_owned(),
             });
