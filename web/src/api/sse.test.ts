@@ -128,6 +128,18 @@ describe('routeSsePayload', () => {
     }
   })
 
+  it('invalidates the review coverage query when review coverage changes', () => {
+    const { queryClient, invalidateQueries } = createMocks()
+    routeSsePayload(
+      event('review.coverage_changed', { payload: { task_id: 'task-1' } }),
+      queryClient,
+      { dispatch: vi.fn() },
+    )
+    expect(invalidateQueries).toHaveBeenCalledWith({
+      queryKey: ['tasks', 'task-1', 'review-coverage'],
+    })
+  })
+
   it('refreshes coordination, quality, and intervention projections from Task events', () => {
     const cases: Array<[string, string[]]> = [
       ['task.review_triaged', ['tasks::task-1::coordination', 'tasks::task-1::work-units']],
