@@ -8,11 +8,11 @@ use db::{
     CreateDomainEvent, CreateGate, CreateGatePolicyRevision, DecisionOutcome, DomainEvent,
     ExecutionRepo, ExecutionStatus, Gate, GateEvaluation, GateEvaluationInput,
     GateEvaluationOutcome, GateEvaluationWrite, GatePolicyRevision, GateRepo, GateScopeKind,
-    ProposalStatus, RoleMembershipRepo, RoleMembershipStatus, SqliteDb,
-    TaskIntegrationOperationKind, TaskIntegrationOperationRepo, TaskLifecycleRepo,
+    ProposalStatus, ReviewLedgerRepo, ReviewPolicyRepo, RoleMembershipRepo, RoleMembershipStatus,
+    SqliteDb, TaskIntegrationOperationKind, TaskIntegrationOperationRepo, TaskLifecycleRepo,
     TaskLifecycleState, TaskLifecycleTransitionFact, TaskRepo, TaskRepositoryMergeBatchRepo,
     TaskRepositorySetRepo, TaskRoleRepo, ValidationRunRepo, ValidationRunStatus, WorkUnitRepo,
-    WorkUnitStatus,
+    WorkUnitRepositoryIntegrationOutcome, WorkUnitStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -22,6 +22,13 @@ use sqlx::Row;
 use crate::{
     task_lifecycle::{LifecycleCause, TaskLifecycleService, TransitionLifecycleInput},
     Result, ServiceError,
+};
+
+mod review_coverage;
+
+pub use review_coverage::{
+    encode_gate_policy_v4, merge_policy_preserving_coverage, GatePolicyDocumentV4,
+    GateReviewCoverageRequirement, RepositoryCoverageSubject, ReviewCoverageEvidence,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -546,8 +553,70 @@ impl GateEngine {
         policy: GatePolicyDocumentV3,
     ) -> Result<(Gate, GatePolicyRevision)> {
         let (base, checks) = policy.into_parts()?;
-        self.create_gate_with_policy_v3(task_id, gate_kind, scope_kind, scope_id, base, checks)
-            .await
+        self.create_gate_with_repository_policy(
+            task_id, gate_kind, scope_kind, scope_id, base, checks, None,
+        )
+        .await
+    }
+
+    /// Create a merge-readiness Gate whose policy revision requires review
+    /// coverage under the current Task review policy.
+    pub async fn create_gate_with_initial_policy_v4(
+        &self,
+        task_id: &str,
+        gate_kind: &str,
+        scope_kind: GateScopeKind,
+        scope_id: &str,
+        policy: GatePolicyDocumentV4,
+    ) -> Result<(Gate, GatePolicyRevision)> {
+        let (base, checks, coverage) = policy.into_parts()?;
+        self.validate_review_coverage_binding(task_id, gate_kind, &coverage)
+            .await?;
+        self.create_gate_with_repository_policy(
+            task_id,
+            gate_kind,
+            scope_kind,
+            scope_id,
+            base,
+            checks,
+            Some(coverage),
+        )
+        .await
+    }
+
+    async fn validate_review_coverage_binding(
+        &self,
+        task_id: &str,
+        gate_kind: &str,
+        requirement: &GateReviewCoverageRequirement,
+    ) -> Result<()> {
+        review_coverage::validate_coverage_requirement(requirement)?;
+        if gate_kind != "merge_readiness" {
+            return Err(invalid(
+                "review_coverage is only valid on a merge-readiness Gate",
+            ));
+        }
+        if !self
+            .current_review_policy(task_id)
+            .await?
+            .is_some_and(|current| review_coverage::requirement_matches(requirement, &current))
+        {
+            return Err(review_coverage::coverage_missing(
+                "review_coverage must pin the current Task review policy",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn current_review_policy(&self, task_id: &str) -> Result<Option<db::ReviewPolicyRef>> {
+        Ok(
+            ReviewPolicyRepo::get_current_task_review_policy(&*self.db, task_id)
+                .await?
+                .map(|current| db::ReviewPolicyRef {
+                    revision: current.revision,
+                    digest: current.digest,
+                }),
+        )
     }
 
     async fn create_gate_with_policy(
@@ -633,7 +702,9 @@ impl GateEngine {
         Ok((gate_write.record, policy_write.record))
     }
 
-    async fn create_gate_with_policy_v3(
+    /// Shared writer for repo-scoped policies: v3, or v4 when `coverage` is set.
+    #[allow(clippy::too_many_arguments)]
+    async fn create_gate_with_repository_policy(
         &self,
         task_id: &str,
         gate_kind: &str,
@@ -641,6 +712,7 @@ impl GateEngine {
         scope_id: &str,
         mut policy: GatePolicyDocument,
         required_checks: Vec<RequiredCheckV3>,
+        coverage: Option<GateReviewCoverageRequirement>,
     ) -> Result<(Gate, GatePolicyRevision)> {
         validate_text("task_id", task_id, 128)?;
         validate_text("gate_kind", gate_kind, 64)?;
@@ -658,14 +730,17 @@ impl GateEngine {
             active_policy_revision: Some(1),
             created_at: now.clone(),
         };
-        self.validate_policy_scope(&gate, &policy, !required_checks.is_empty())
-            .await?;
+        self.validate_policy_scope(
+            &gate,
+            &policy,
+            !required_checks.is_empty() || coverage.is_some(),
+        )
+        .await?;
         self.validate_required_check_repositories(task_id, &required_checks)
             .await?;
         self.validate_role_snapshots(&gate, &policy).await?;
-        let policy_json =
-            serde_json::to_string(&GatePolicyDocumentV3::from_parts(policy, required_checks))
-                .map_err(|error| invalid(format!("Gate policy cannot be serialized: {error}")))?;
+        let (schema_version, policy_json) =
+            serialize_repository_policy(policy, required_checks, coverage)?;
         let policy_digest = sha256(policy_json.as_bytes());
         let policy_revision_id = format!("{gate_id}:policy:1");
         let gate_created_event = gate_event(
@@ -701,7 +776,7 @@ impl GateEngine {
                 gate_id: gate.id.clone(),
                 expected_active_revision: None,
                 revision: 1,
-                schema_version: 3,
+                schema_version,
                 policy_json,
                 policy_digest,
                 created_at: now,
@@ -743,8 +818,31 @@ impl GateEngine {
         policy: GatePolicyDocumentV3,
     ) -> Result<GatePolicyRevision> {
         let (base, checks) = policy.into_parts()?;
-        self.revise_gate_policy_v3(gate_id, expected_active_revision, base, checks)
+        self.revise_repository_policy(gate_id, expected_active_revision, base, checks, None)
             .await
+    }
+
+    /// Revise a merge-readiness Gate with a schema v4 policy.
+    pub async fn revise_policy_v4(
+        &self,
+        gate_id: &str,
+        expected_active_revision: Option<i64>,
+        policy: GatePolicyDocumentV4,
+    ) -> Result<GatePolicyRevision> {
+        let (base, checks, coverage) = policy.into_parts()?;
+        let gate = GateRepo::get_gate(&*self.db, gate_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("gate", gate_id.to_owned()))?;
+        self.validate_review_coverage_binding(&gate.task_id, &gate.gate_kind, &coverage)
+            .await?;
+        self.revise_repository_policy(
+            gate_id,
+            expected_active_revision,
+            base,
+            checks,
+            Some(coverage),
+        )
+        .await
     }
 
     async fn revise_gate_policy(
@@ -800,26 +898,30 @@ impl GateEngine {
         Ok(write.record)
     }
 
-    async fn revise_gate_policy_v3(
+    async fn revise_repository_policy(
         &self,
         gate_id: &str,
         expected_active_revision: Option<i64>,
         mut policy: GatePolicyDocument,
         required_checks: Vec<RequiredCheckV3>,
+        coverage: Option<GateReviewCoverageRequirement>,
     ) -> Result<GatePolicyRevision> {
         let gate = GateRepo::get_gate(&*self.db, gate_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("gate", gate_id.to_owned()))?;
         normalize_policy(&mut policy)?;
         let required_checks = normalize_required_checks_v3(required_checks)?;
-        self.validate_policy_scope(&gate, &policy, !required_checks.is_empty())
-            .await?;
+        self.validate_policy_scope(
+            &gate,
+            &policy,
+            !required_checks.is_empty() || coverage.is_some(),
+        )
+        .await?;
         self.validate_required_check_repositories(&gate.task_id, &required_checks)
             .await?;
         self.validate_role_snapshots(&gate, &policy).await?;
-        let policy_json =
-            serde_json::to_string(&GatePolicyDocumentV3::from_parts(policy, required_checks))
-                .map_err(|error| invalid(format!("Gate policy cannot be serialized: {error}")))?;
+        let (schema_version, policy_json) =
+            serialize_repository_policy(policy, required_checks, coverage)?;
         let policy_digest = sha256(policy_json.as_bytes());
         let revision = expected_active_revision.unwrap_or(0) + 1;
         let now = now_rfc3339();
@@ -839,7 +941,7 @@ impl GateEngine {
                 gate_id: gate_id.to_owned(),
                 expected_active_revision,
                 revision,
-                schema_version: 3,
+                schema_version,
                 policy_json,
                 policy_digest,
                 created_at: now,
@@ -877,6 +979,29 @@ impl GateEngine {
         task_id: &str,
         changed_repositories: &[RepositoryValidationSubject],
     ) -> Result<GateEvaluation> {
+        self.evaluate_merge_readiness(task_id, changed_repositories, None)
+            .await
+    }
+
+    /// [`Self::evaluate_required_checks_by_repo`] with the exact coverage
+    /// evidence a schema v4 policy needs. Without it v4 is never satisfied.
+    pub async fn evaluate_merge_readiness_with_coverage(
+        &self,
+        task_id: &str,
+        changed_repositories: &[RepositoryValidationSubject],
+        coverage: &ReviewCoverageEvidence,
+    ) -> Result<GateEvaluation> {
+        review_coverage::validate_evidence(coverage)?;
+        self.evaluate_merge_readiness(task_id, changed_repositories, Some(coverage))
+            .await
+    }
+
+    async fn evaluate_merge_readiness(
+        &self,
+        task_id: &str,
+        changed_repositories: &[RepositoryValidationSubject],
+        coverage: Option<&ReviewCoverageEvidence>,
+    ) -> Result<GateEvaluation> {
         let mut candidates = GateRepo::list_active_gate_policies(&*self.db, task_id)
             .await?
             .into_iter()
@@ -901,6 +1026,7 @@ impl GateEngine {
                 revision.revision,
                 None,
                 Some(changed_repositories),
+                coverage,
             )
             .await?;
         Ok(write.evaluation)
@@ -912,7 +1038,7 @@ impl GateEngine {
         revision: i64,
         causation_id: Option<String>,
     ) -> Result<GateEvaluationWrite> {
-        self.evaluate_revision_with_subjects(gate, revision, causation_id, None)
+        self.evaluate_revision_with_subjects(gate, revision, causation_id, None, None)
             .await
     }
 
@@ -922,6 +1048,7 @@ impl GateEngine {
         revision: i64,
         causation_id: Option<String>,
         repository_subjects: Option<&[RepositoryValidationSubject]>,
+        coverage_evidence: Option<&ReviewCoverageEvidence>,
     ) -> Result<GateEvaluationWrite> {
         let policy_revision = GateRepo::get_gate_policy_revision(&*self.db, &gate.id, revision)
             .await?
@@ -933,7 +1060,8 @@ impl GateEngine {
         let mut inputs = Vec::new();
         let mut required_checks: Vec<RequiredCheck> = Vec::new();
         let mut required_checks_v3: Vec<RequiredCheckV3> = Vec::new();
-        let (outcome, policy) = if !matches!(policy_revision.schema_version, 1..=3) {
+        let mut coverage_requirement: Option<GateReviewCoverageRequirement> = None;
+        let (outcome, policy) = if !matches!(policy_revision.schema_version, 1..=4) {
             issues.push("unknown_policy_schema".to_owned());
             (GateEvaluationOutcome::Indeterminate, None)
         } else if sha256(policy_revision.policy_json.as_bytes()) != policy_revision.policy_digest {
@@ -981,6 +1109,28 @@ impl GateEngine {
                     (GateEvaluationOutcome::Indeterminate, None)
                 }
             }
+        } else if policy_revision.schema_version == 4 {
+            match serde_json::from_str::<GatePolicyDocumentV4>(&policy_revision.policy_json) {
+                Ok(policy) if policy.schema_version == 4 => match policy.into_parts() {
+                    Ok((base, checks, coverage)) => {
+                        required_checks_v3 = checks;
+                        coverage_requirement = Some(coverage);
+                        (GateEvaluationOutcome::Unsatisfied, Some(base))
+                    }
+                    Err(_) => {
+                        issues.push("invalid_policy_shape".to_owned());
+                        (GateEvaluationOutcome::Indeterminate, None)
+                    }
+                },
+                Ok(_) => {
+                    issues.push("unknown_policy_schema".to_owned());
+                    (GateEvaluationOutcome::Indeterminate, None)
+                }
+                Err(_) => {
+                    issues.push("invalid_policy_shape".to_owned());
+                    (GateEvaluationOutcome::Indeterminate, None)
+                }
+            }
         } else {
             match serde_json::from_str::<GatePolicyDocument>(&policy_revision.policy_json) {
                 Ok(policy) if policy.schema_version == 1 => {
@@ -1001,6 +1151,7 @@ impl GateEngine {
             if !policy_has_requirements(policy)
                 && required_checks.is_empty()
                 && required_checks_v3.is_empty()
+                && coverage_requirement.is_none()
             {
                 issues.push("empty_policy".to_owned());
             } else {
@@ -1047,6 +1198,16 @@ impl GateEngine {
                 self.evaluate_work_units(&gate, policy, &mut inputs, &mut missing, &mut issues)
                     .await?;
             }
+            self.evaluate_coverage_requirement(
+                &gate,
+                coverage_requirement.as_ref(),
+                repository_subjects,
+                coverage_evidence,
+                &mut inputs,
+                &mut missing,
+                &mut issues,
+            )
+            .await?;
         }
 
         inputs.sort_by(|left, right| {
@@ -1137,6 +1298,72 @@ impl GateEngine {
             crate::DomainEventService::publish_committed_hint(&self.event_bus, event);
         }
         Ok(write)
+    }
+
+    /// A Task with a current review policy is merge ready only through a
+    /// schema v4 Gate whose coverage evaluates exactly.
+    #[allow(clippy::too_many_arguments)]
+    async fn evaluate_coverage_requirement(
+        &self,
+        gate: &Gate,
+        requirement: Option<&GateReviewCoverageRequirement>,
+        repository_subjects: Option<&[RepositoryValidationSubject]>,
+        evidence: Option<&ReviewCoverageEvidence>,
+        inputs: &mut Vec<InputDraft>,
+        missing: &mut Vec<String>,
+        issues: &mut Vec<String>,
+    ) -> Result<()> {
+        if gate.gate_kind != "merge_readiness" {
+            if requirement.is_some() {
+                issues.push("review_coverage_requires_merge_readiness".to_owned());
+            }
+            return Ok(());
+        }
+        let current = self.current_review_policy(&gate.task_id).await?;
+        let Some(requirement) = requirement else {
+            if current.is_some() {
+                issues.push("gate.review_coverage_missing".to_owned());
+            }
+            return Ok(());
+        };
+        let Some(repository_set) =
+            TaskRepositorySetRepo::get_current(&*self.db, &gate.task_id).await?
+        else {
+            missing.push("task_repository_set".to_owned());
+            return Ok(());
+        };
+        let mut repository_revisions = BTreeMap::new();
+        for repository in repository_set.repositories.iter().filter(|repository| {
+            matches!(
+                repository.role,
+                db::TaskRepositoryRole::Primary | db::TaskRepositoryRole::Affected
+            )
+        }) {
+            let rows = ReviewLedgerRepo::load_review_coverage_rows(
+                &*self.db,
+                &gate.task_id,
+                &repository.repo_id,
+            )
+            .await?;
+            if rows.integrations.iter().any(|integration| {
+                integration.outcome == WorkUnitRepositoryIntegrationOutcome::Success
+            }) {
+                repository_revisions.insert(repository.repo_id.clone(), rows.state_revision);
+            }
+        }
+        review_coverage::evaluate_review_coverage(
+            requirement,
+            &review_coverage::CoverageExpectation {
+                current_policy: current.as_ref(),
+                repository_revisions: &repository_revisions,
+                repository_subjects,
+            },
+            evidence,
+            inputs,
+            missing,
+            issues,
+        );
+        Ok(())
     }
 
     /// Durable domain events trigger exact-policy reevaluation. EventBus hints
@@ -1953,6 +2180,7 @@ impl GateEngine {
                     .get("workspace_snapshot_digest")
                     .and_then(Value::as_str)
                     == candidate.subject.workspace_snapshot_digest.as_deref()
+                && subject.get("kind").and_then(Value::as_str) != Some("commit_range")
                 && delivered_is_exact
                 && delivered_pin_matches;
             let actor_ok = execution.actor_ref().as_ref() == Some(producer_actor)
@@ -3076,6 +3304,30 @@ fn serialize_policy(
         Some(checks) => serde_json::to_string(&GatePolicyDocumentV2::from_parts(policy, checks)),
     };
     encoded.map_err(|error| invalid(format!("Gate policy cannot be serialized: {error}")))
+}
+
+fn serialize_repository_policy(
+    policy: GatePolicyDocument,
+    required_checks: Vec<RequiredCheckV3>,
+    coverage: Option<GateReviewCoverageRequirement>,
+) -> Result<(i64, String)> {
+    let (schema_version, encoded) = match coverage {
+        None => (
+            3,
+            serde_json::to_string(&GatePolicyDocumentV3::from_parts(policy, required_checks)),
+        ),
+        Some(coverage) => (
+            4,
+            serde_json::to_string(&GatePolicyDocumentV4::from_parts(
+                policy,
+                required_checks,
+                coverage,
+            )),
+        ),
+    };
+    let policy_json =
+        encoded.map_err(|error| invalid(format!("Gate policy cannot be serialized: {error}")))?;
+    Ok((schema_version, policy_json))
 }
 
 fn policy_has_requirements(policy: &GatePolicyDocument) -> bool {
