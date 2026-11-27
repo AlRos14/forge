@@ -273,6 +273,15 @@ async fn review_range_gate_generators_preserve_current_review_coverage() {
         StatusCode::OK,
     )
     .await;
+    // A Task has one merge_readiness Gate per scope, so each generator gets its own Task.
+    let v2_task: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({"title": "Preserve coverage on generated v2 Gates"}),
+        StatusCode::OK,
+    )
+    .await;
     let owner_id: String = sqlx::query_scalar("SELECT owner_id FROM project WHERE id = ?")
         .bind(&project_id)
         .fetch_one(harness.state.db.pool())
@@ -291,20 +300,22 @@ async fn review_range_gate_generators_preserve_current_review_coverage() {
         "max_checkpoints_per_repo": 12
     });
     let review_policy_digest = "a".repeat(64);
-    sqlx::query(
-        "INSERT INTO task_review_policy_revision (
+    for task_id in [&task.id, &v2_task.id] {
+        sqlx::query(
+            "INSERT INTO task_review_policy_revision (
              task_id, revision, state, policy_json, digest, risk_class,
              coverage_required, source, created_by_user_id, created_at, superseded_at
          ) VALUES (?, 1, 'current', ?, ?, 'r1', 1, 'owner', ?, ?, NULL)",
-    )
-    .bind(&task.id)
-    .bind(review_policy.to_string())
-    .bind(&review_policy_digest)
-    .bind(&owner_id)
-    .bind(db::now_rfc3339())
-    .execute(harness.state.db.pool())
-    .await
-    .expect("current Task review policy");
+        )
+        .bind(task_id)
+        .bind(review_policy.to_string())
+        .bind(&review_policy_digest)
+        .bind(&owner_id)
+        .bind(db::now_rfc3339())
+        .execute(harness.state.db.pool())
+        .await
+        .expect("current Task review policy");
+    }
 
     let decision = json!({
         "proposal_id": "proposal-exact",
@@ -345,7 +356,7 @@ async fn review_range_gate_generators_preserve_current_review_coverage() {
     let v2_gate: GateResponse = json_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/tasks/{}/gates", task.id),
+        &format!("/api/v1/tasks/{}/gates", v2_task.id),
         json!({
             "gate_kind": "merge_readiness",
             "policy": {
