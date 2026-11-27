@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -35,6 +36,7 @@ use crate::{
 };
 
 mod external_feedback;
+mod range_review;
 mod replan;
 mod turn_outputs;
 mod validation_findings;
@@ -55,6 +57,7 @@ const MAX_QUALITY_FINDINGS: usize = 64;
 const MAX_QUALITY_FINDING_BYTES: usize = 4096;
 const MAX_RESOLUTION_BYTES: usize = 4096;
 const MAX_INSTRUCTION_BYTES: usize = 16 * 1024;
+const MAX_PLAN_REVIEW_CHECKPOINTS: usize = 8;
 
 fn coordination_error(code: &'static str, message: impl Into<String>) -> ServiceError {
     ServiceError::Coordination {
@@ -630,6 +633,13 @@ pub struct WorkUnitPlan {
     pub envelope_digest: String,
     pub objective_digest: String,
     pub work_units: Vec<PlanWorkUnit>,
+    /// Explicit review boundaries for integrated repository work. Empty on
+    /// Tasks without a review policy so historical plan digests stay stable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub review_checkpoints: Vec<api_types::PlanReviewCheckpoint>,
+    /// Digest of the exact Task review policy used to propose these boundaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_policy_digest: Option<String>,
     /// Optional complete Task repository set proposed by a coordinator replan.
     /// Omission preserves the existing plan wire representation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -640,6 +650,123 @@ pub struct WorkUnitPlan {
     pub review: Option<Value>,
     #[serde(default)]
     pub limits: Option<Value>,
+}
+
+fn validate_review_plan_checkpoints(
+    plan: &WorkUnitPlan,
+    policy: Option<&db::TaskReviewPolicyRevision>,
+    writable_repository_ids: &HashSet<String>,
+) -> Result<()> {
+    let Some(policy) = policy else {
+        if !plan.review_checkpoints.is_empty() || plan.review_policy_digest.is_some() {
+            return Err(invalid_plan(
+                "review checkpoints and policy digest require a current Task review policy",
+            ));
+        }
+        return Ok(());
+    };
+
+    if plan.review_policy_digest.as_deref() != Some(policy.digest.as_str())
+        || policy.digest.len() != 64
+        || !policy
+            .digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(coordination_error(
+            "coordination.plan_review_policy_stale",
+            "the plan must pin the current Task review policy digest",
+        ));
+    }
+    if plan.review_checkpoints.len() > MAX_PLAN_REVIEW_CHECKPOINTS {
+        return Err(invalid_plan(
+            "a plan may contain at most 8 review checkpoints",
+        ));
+    }
+
+    let units = plan
+        .work_units
+        .iter()
+        .map(|unit| (unit.key.as_str(), unit))
+        .collect::<HashMap<_, _>>();
+    let mut checkpoint_keys = HashSet::with_capacity(plan.review_checkpoints.len());
+    for checkpoint in &plan.review_checkpoints {
+        if checkpoint.key.is_empty()
+            || checkpoint.key.len() > 64
+            || !checkpoint.key.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-".contains(&byte)
+            })
+            || !checkpoint_keys.insert(checkpoint.key.as_str())
+        {
+            return Err(invalid_plan(
+                "review checkpoint keys must be unique slugs of 1 to 64 lowercase ASCII characters",
+            ));
+        }
+        if checkpoint.after_work_unit_keys.is_empty() || checkpoint.after_work_unit_keys.len() > 32
+        {
+            return Err(invalid_plan(
+                "a review checkpoint must name 1 to 32 integrated WorkUnits",
+            ));
+        }
+        if checkpoint.reason.trim().is_empty() || checkpoint.reason.len() > 1024 {
+            return Err(invalid_plan(
+                "review checkpoint reason must contain 1 to 1024 UTF-8 bytes",
+            ));
+        }
+
+        let mut after_keys = HashSet::with_capacity(checkpoint.after_work_unit_keys.len());
+        let mut written_repositories = HashSet::new();
+        for key in &checkpoint.after_work_unit_keys {
+            if !after_keys.insert(key.as_str()) {
+                return Err(invalid_plan(
+                    "review checkpoint WorkUnit keys must be unique",
+                ));
+            }
+            let Some(unit) = units.get(key.as_str()).copied() else {
+                return Err(invalid_plan(
+                    "review checkpoint keys must name WorkUnits in this plan",
+                ));
+            };
+            if !unit.requires_integration {
+                return Err(invalid_plan(
+                    "review checkpoint WorkUnits must require integration",
+                ));
+            }
+            if unit.repository_ids.is_empty() {
+                written_repositories.extend(writable_repository_ids.iter().cloned());
+            } else {
+                written_repositories.extend(unit.repository_ids.iter().cloned());
+            }
+        }
+        let mut selected_repositories = HashSet::new();
+        for repository_id in &checkpoint.repository_ids {
+            if !selected_repositories.insert(repository_id.as_str())
+                || !written_repositories.contains(repository_id)
+            {
+                return Err(invalid_plan(
+                    "review checkpoint repositories must be unique repositories written by its WorkUnits",
+                ));
+            }
+        }
+    }
+
+    if policy.policy.risk_class == db::ReviewRiskClass::R2
+        && plan.review_checkpoints.is_empty()
+        && plan.work_units.iter().any(|unit| {
+            unit.requires_integration
+                && unit.depends_on.iter().any(|dependency| {
+                    units
+                        .get(dependency.as_str())
+                        .is_some_and(|dependency| dependency.requires_integration)
+                })
+        })
+    {
+        return Err(coordination_error(
+            "coordination.plan_review_checkpoint_required",
+            "an R2 plan with dependent integrated WorkUnits requires a review checkpoint",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -825,6 +952,7 @@ pub struct TaskCoordinationService {
     collaboration: CollaborationService,
     domain_events: DomainEventService,
     work_unit_service: Option<Arc<crate::WorkUnitService>>,
+    workspace_root: PathBuf,
 }
 
 impl TaskCoordinationService {
@@ -835,7 +963,13 @@ impl TaskCoordinationService {
             db,
             event_bus,
             work_unit_service: None,
+            workspace_root: crate::task_service::workspace::default_workspace_root(),
         }
+    }
+
+    pub(crate) fn with_workspace_root(mut self, workspace_root: PathBuf) -> Self {
+        self.workspace_root = workspace_root;
+        self
     }
 
     pub fn with_work_unit_service(mut self, service: Arc<crate::WorkUnitService>) -> Self {
@@ -1753,6 +1887,75 @@ impl TaskCoordinationService {
             self.domain_events.publish_committed(event);
         }
         Ok(Some((write.0, write.1.is_some())))
+    }
+
+    pub(super) async fn apply_request_range_review_outputs(
+        &self,
+        request: &TaskCoordinationRequest,
+        execution: &db::Execution,
+        outputs: &[crate::coordinator_outputs::CoordinatorOutput],
+    ) -> Result<()> {
+        if request.execution_id.as_deref() != Some(execution.id.as_str())
+            || execution.task_id != request.task_id
+        {
+            return Err(output_not_permitted(
+                "request_range_review must come from this exact typed coordinator turn",
+            ));
+        }
+        for (ordinal, output) in outputs.iter().enumerate() {
+            let crate::coordinator_outputs::CoordinatorOutput::RequestRangeReview(value) = output
+            else {
+                continue;
+            };
+            let policy =
+                db::ReviewPolicyRepo::get_current_task_review_policy(&*self.db, &request.task_id)
+                    .await?
+                    .ok_or_else(|| {
+                        coordination_error(
+                            "review.range.not_permitted",
+                            "the Task has no current review policy",
+                        )
+                    })?;
+            if !policy.policy.coordinator_may_request {
+                return Err(coordination_error(
+                    "review.range.not_permitted",
+                    "the current review policy denies coordinator requests",
+                ));
+            }
+            let repository_set = TaskRepositorySetRepo::get_current(&*self.db, &request.task_id)
+                .await?
+                .ok_or_else(|| invalid_plan("Task has no current repository-set revision"))?;
+            let writable = repository_set.repositories.iter().any(|repository| {
+                repository.repo_id == value.repo_id
+                    && matches!(
+                        repository.role,
+                        db::TaskRepositoryRole::Primary | db::TaskRepositoryRole::Affected
+                    )
+            });
+            if !writable {
+                return Err(coordination_error(
+                    "review.range.not_permitted",
+                    "request_range_review must name a writable repository in the current Task set",
+                ));
+            }
+            crate::review_range::ReviewScheduler::new(
+                Arc::clone(&self.db),
+                self.workspace_root.clone(),
+            )
+            .with_event_bus(Arc::clone(&self.event_bus))
+            .request(
+                crate::review_range::ReviewRequestSource::Coordinator {
+                    execution_id: execution.id.clone(),
+                    request_id: request.id.clone(),
+                },
+                &request.task_id,
+                &value.repo_id,
+                value.reason.clone(),
+                &format!("coordinator:{}:{ordinal}", request.id),
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     /// Reconcile current pending sources after startup/resume. Requests use
@@ -3122,6 +3325,24 @@ impl TaskCoordinationService {
                 "the ReviewFindings triage output exceeds 64 KiB",
             ));
         }
+        let range_report: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM review_range_report
+             WHERE report_artifact_id=? AND task_id=?)",
+        )
+        .bind(
+            request
+                .review_report_artifact_id
+                .as_deref()
+                .unwrap_or_default(),
+        )
+        .bind(&request.task_id)
+        .fetch_one(self.db.pool())
+        .await?;
+        if range_report {
+            return self
+                .complete_range_review_findings_turn(request, execution, allowed_outputs)
+                .await;
+        }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct ReviewFindingsTurn {
@@ -3331,10 +3552,11 @@ impl TaskCoordinationService {
             !matches!(
                 output,
                 crate::coordinator_outputs::CoordinatorOutput::ProposeReplan(_)
+                    | crate::coordinator_outputs::CoordinatorOutput::RequestRangeReview(_)
             )
         }) {
             return Err(crate::task_coordination::output_not_permitted(
-                "ReviewFindings supports propose_replan outputs in this phase",
+                "ReviewFindings supports request_range_review and propose_replan outputs in this phase",
             ));
         }
         if decision.micro_fix.is_some() && propose_replan.is_some() {
@@ -3342,6 +3564,8 @@ impl TaskCoordinationService {
                 "one ReviewFindings turn cannot combine micro_fix and propose_replan",
             ));
         }
+        self.apply_request_range_review_outputs(request, execution, &outputs)
+            .await?;
         crate::task_rework::TaskReworkService::new(
             Arc::clone(&self.db),
             Arc::clone(&self.event_bus),
@@ -3529,15 +3753,59 @@ impl TaskCoordinationService {
                 && action_is_allowed("micro_fix");
             let propose_replan_enabled =
                 envelope.allow_coordinator_replan && action_is_allowed("propose_replan");
+            let range_request_enabled =
+                db::ReviewPolicyRepo::get_current_task_review_policy(&*self.db, &request.task_id)
+                    .await?
+                    .is_some_and(|policy| policy.policy.coordinator_may_request)
+                    && action_is_allowed("request_range_review");
+            if context.get("kind").and_then(Value::as_str) == Some("commit_range") {
+                let policy = db::ReviewPolicyRepo::get_current_task_review_policy(
+                    &*self.db,
+                    &request.task_id,
+                )
+                .await?;
+                let range_request_enabled = policy
+                    .as_ref()
+                    .is_some_and(|policy| policy.policy.coordinator_may_request)
+                    && action_is_allowed("request_range_review");
+                let output_kinds = match (range_request_enabled, propose_replan_enabled) {
+                    (true, true) => "request_range_review and propose_replan",
+                    (true, false) => "request_range_review",
+                    (false, true) => "propose_replan",
+                    (false, false) => "no new outputs",
+                };
+                return Ok(format!(
+                    r#"You are the selected Task coordinator triaging one exact commit-range ReviewReport. Forge reviews integrated repository ranges; WorkUnits are not reviewed one by one. This read-only turn cannot change the report, commits, workspace, attribution, Gate, or reviewer.
+Return exactly one JSON object matching:
+{{"schema_version":3,"request_id":{request_id},"task_id":{task_id},"authorization_version":{authorization_version},"range_review":{{"review_report_artifact_id":{report_id},"report_digest":{report_digest},"findings":[{{"finding_id":"exact id","disposition":"correct|recheck|human|defer","rationale":"1..2048 bytes","instructions":"required for correct; otherwise optional"}}]}},"outputs":[]}}
+Every P0/P1 finding in context needs exactly one correct, recheck, or human disposition. P2/P3 may also use defer. Omit P2/P3 entries you do not need to triage. A correct decision requires bounded actionable instructions; Forge groups corrections by the WorkUnit author of the attributed lines and starts them from the current integrated HEAD. Recheck asks Forge to schedule the same range again. Human identifies the concrete decision needed. Do not include micro_fix.
+The outputs array may contain up to 4 entries and may use {output_kinds}; request_range_review uses only an exact writable repo_id and a 1..1024 byte reason, with no commit or reviewer. {outputs_gate}
+Exact report: {report_id} ({report_digest})
+Range, finding locations, attribution and current repo coverage: {context}"#,
+                    request_id = serde_json::to_string(&request.id).unwrap(),
+                    task_id = serde_json::to_string(&request.task_id).unwrap(),
+                    authorization_version = request.authorization_version,
+                    report_id = serde_json::to_string(report_id).unwrap(),
+                    report_digest = serde_json::to_string(report_digest).unwrap(),
+                    output_kinds = output_kinds,
+                    outputs_gate = if range_request_enabled || propose_replan_enabled {
+                        "Every output still needs explicit TaskRole permission."
+                    } else {
+                        "Keep outputs empty because no output is preauthorized by this TaskRole and review policy."
+                    },
+                    context = serde_json::to_string(context).unwrap_or_else(|_| "{}".to_owned()),
+                ));
+            }
             let micro_fix_instruction = if micro_fix_enabled {
                 "Optional `micro_fix` is permitted only with `correct`; use exact report findings and up to 3 paths explicitly named in those findings. It requests a bounded correction and never supplies a patch."
             } else {
                 "Set `micro_fix` to null because this TaskRole and envelope do not preauthorize a micro-fix."
             };
-            let outputs_instruction = if propose_replan_enabled {
-                "The `outputs` array may contain up to 4 entries and may use `propose_replan` with `reason`, `evidence_links`, and `plan_request.instructions` (<= 4 KiB)."
-            } else {
-                "Keep `outputs` empty; `propose_replan` is not preauthorized by this TaskRole and envelope."
+            let outputs_instruction = match (range_request_enabled, propose_replan_enabled) {
+                (true, true) => "The `outputs` array may contain up to 4 entries and may use `request_range_review` with exact writable `repo_id` and a 1..1024 byte `reason`, or `propose_replan` with `reason`, `evidence_links`, and `plan_request.instructions` (<= 4 KiB).",
+                (true, false) => "The `outputs` array may contain up to 4 entries and may use `request_range_review` with exact writable `repo_id` and a 1..1024 byte `reason`.",
+                (false, true) => "The `outputs` array may contain up to 4 entries and may use `propose_replan` with `reason`, `evidence_links`, and `plan_request.instructions` (<= 4 KiB).",
+                (false, false) => "Keep `outputs` empty; no new output is preauthorized by this TaskRole and review policy.",
             };
             return Ok(format!(
                 r#"You are the selected Task coordinator reviewing one exact request-changes ReviewReport. This execution is read-only and cannot change the report, its verdict, the reviewed result, or a Gate.
@@ -3601,14 +3869,36 @@ Task context: {context}"#,
                 }));
             }
         }
+        let review_policy =
+            db::ReviewPolicyRepo::get_current_task_review_policy(&*self.db, &request.task_id)
+                .await?;
+        let (review_fields, review_guidance) = if let Some(policy) = review_policy.as_ref() {
+            (
+                format!(
+                    ",\"review_policy_digest\":{},\"review_checkpoints\":[]",
+                    serde_json::to_string(&policy.digest).unwrap_or_default()
+                ),
+                format!(
+                    "Task review policy {} ({:?}, coverage_required={}). Forge schedules reviews over exact integrated commit ranges per repository; WorkUnits are not reviewed one by one. Do not create repository `formal_review` WorkUnits or `review_subject_key` entries for integrated work. In R2, add `review_checkpoints` after integrated WorkUnits that other WorkUnits depend on. Each checkpoint has a unique slug key, 1–32 `after_work_unit_keys`, optional writable `repository_ids` (empty means all repositories those WorkUnits write), and a 1–1024 byte reason. Include `review_policy_digest` exactly as the current policy digest. A result review remains valid only for a non-repository deliverable. Coverage and merge readiness remain Rust/SQLite decisions.",
+                    policy.digest,
+                    policy.policy.risk_class,
+                    policy.policy.coverage_required
+                ),
+            )
+        } else {
+            (
+                String::new(),
+                "A formal review WorkUnit must use a TaskRole with the `formal_review` capability, set review_subject_key to another planned key, and use a fresh role-isolated native session; the same Agent profile is allowed, but a Human contributor cannot review their own result. The review role must also appear in the envelope's allowed_review_roles by its exact role name.".to_owned(),
+            )
+        };
         Ok(format!(
             "You are the selected Task coordinator for one bounded preparation turn. This execution is read-only and must not modify repository files, create WorkUnits, call provider APIs, or grant authority.\n\
 Return exactly one JSON object and no markdown fences. The object must match this schema:\n\
 Each `work_units` entry may include `repository_ids`, an array of exact writable repository IDs. Omit it or use `[]` to select every writable repository in the effective Task repository set; `context` repositories are read-only and rejected. During a coordinator replan, IDs are validated against the proposed `repository_set` when supplied, otherwise against the current Task set.\n\
-{{\"schema_version\":1,\"request_id\":{request_id},\"task_id\":{task_id},\"task_version\":{task_version},\"authorization_version\":{authorization_version},\"team_digest\":{team_digest},\"envelope_digest\":{envelope_digest},\"objective_digest\":{objective_digest},\"work_units\":[{{\"key\":\"stable-key\",\"title\":\"...\",\"scope\":\"...\",\"role\":\"exact existing TaskRole role name\",\"assigned_actor\":{{\"kind\":\"agent|human\",\"id\":\"exact eligible member id\"}}|null,\"parent_key\":null,\"depends_on\":[],\"requires_integration\":true,\"execution_instructions\":null,\"review_subject_key\":null,\"acceptance\":[],\"artifact_inputs\":[],\"repository_ids\":[]}}],\"delivery\":null,\"review\":null,\"limits\":null}}\n\
+{{\"schema_version\":1,\"request_id\":{request_id},\"task_id\":{task_id},\"task_version\":{task_version},\"authorization_version\":{authorization_version},\"team_digest\":{team_digest},\"envelope_digest\":{envelope_digest},\"objective_digest\":{objective_digest},\"work_units\":[{{\"key\":\"stable-key\",\"title\":\"...\",\"scope\":\"...\",\"role\":\"exact existing TaskRole role name\",\"assigned_actor\":{{\"kind\":\"agent|human\",\"id\":\"exact eligible member id\"}}|null,\"parent_key\":null,\"depends_on\":[],\"requires_integration\":true,\"execution_instructions\":null,\"review_subject_key\":null,\"acceptance\":[],\"artifact_inputs\":[],\"repository_ids\":[]}}]{review_fields},\"delivery\":null,\"review\":null,\"limits\":null}}\n\
 Optional `repository_set` has shape `[{{\"repo_id\":\"exact Project repo id\",\"role\":\"primary|affected|context\"}}]`. Include it only for a coordinator replan that proposes a repository change; it replaces the complete set, must preserve the primary repository, and requires the exact Human decision before materialization. Omit it when unchanged.\n\
 `requires_integration` must be `true` for every WorkUnit that changes repository content: it receives a repository Workspace, and its exact result must be integrated before dependents run. Use `false` only for non-repository work (research, planning notes), which gets no repository Workspace, no lease, and no integration, and must not list `repository_ids`. A non-review WorkUnit with `repository_ids` and `requires_integration:false` is rejected (`coordination.plan_repository_requires_integration`); formal review WorkUnits are never integrated.\n\
-Create at most {max_work_units} WorkUnits. Use only TaskRole names and active members listed in the team. A formal review WorkUnit must use a TaskRole with the `formal_review` capability, set review_subject_key to another planned key, and must use a fresh role-isolated native session; the same Agent profile is allowed, but a Human contributor cannot review their own result. The review role must also appear in the envelope's allowed_review_roles by its exact role name. Do not create, rename, or grant TaskRoles, memberships, or capabilities. Do not request external actions or merge. A plan outside the envelope will wait for Human approval.\n\
+Create at most {max_work_units} WorkUnits. Use only TaskRole names and active members listed in the team. {review_guidance} Do not create, rename, or grant TaskRoles, memberships, or capabilities. Do not request external actions or merge. A plan outside the envelope will wait for Human approval.\n\
 Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {acceptance}\nContext: {context}\nEnvelope: {envelope_json}\nTeam: {team}\nTask repositories (id, name, role): {task_repositories}\nCurrent Task context: {task_context}",
             request_id = serde_json::to_string(&request.id).unwrap(),
             task_id = serde_json::to_string(&request.task_id).unwrap(),
@@ -3625,6 +3915,8 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
             envelope_json = serde_json::to_string(&envelope).unwrap_or_default(),
             team = serde_json::to_string(&team_rows).unwrap_or_default(),
             task_repositories = serde_json::to_string(&task_repositories).unwrap_or_default(),
+            review_fields = review_fields,
+            review_guidance = review_guidance,
             task_context = serde_json::to_string(context).unwrap_or_else(|_| "{}".to_owned()),
         ))
     }
@@ -5087,6 +5379,9 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
                 .map(|repository| repository.repo_id)
                 .collect::<HashSet<_>>()
         };
+        let review_policy =
+            db::ReviewPolicyRepo::get_current_task_review_policy(&*self.db, &task.id).await?;
+        validate_review_plan_checkpoints(plan, review_policy.as_ref(), &writable_repository_ids)?;
         if plan.task_id != task.id
             || plan.request_id != request.id
             || plan.authorization_version != coordination.authorization_version
@@ -5180,6 +5475,16 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
                     .iter()
                     .find(|candidate| candidate.key == review_key)
                     .ok_or_else(|| invalid_plan("review subject key is missing"))?;
+                if review_policy
+                    .as_ref()
+                    .is_some_and(|policy| policy.policy.coverage_required)
+                    && reviewed.requires_integration
+                {
+                    return Err(coordination_error(
+                        "coordination.plan_result_review_redundant",
+                        "repository WorkUnits are reviewed by commit ranges, not one result review per WorkUnit",
+                    ));
+                }
                 if unit.assigned_actor.is_some()
                     && unit.assigned_actor == reviewed.assigned_actor
                     && matches!(unit.assigned_actor.as_ref(), Some(ApiActorRef::Human(_)))
@@ -5828,6 +6133,8 @@ mod tests {
                     repository_ids: Vec::new(),
                 })
                 .collect(),
+            review_checkpoints: Vec::new(),
+            review_policy_digest: None,
             repository_set: None,
             delivery: None,
             review: None,

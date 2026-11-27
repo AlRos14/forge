@@ -46,6 +46,166 @@ struct MaterializedReviewControl {
     gate_kind: String,
 }
 
+/// Persist the review checkpoint declarations from the exact plan Artifact in
+/// the same transaction that materializes its WorkUnits. This is the durable
+/// writer lane A did not need for its standalone review scheduler paths.
+async fn materialize_review_plan_checkpoints(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    input: &MaterializeTaskCoordinationPlanInput,
+    repository_revision: i64,
+    is_replan: bool,
+) -> Result<()> {
+    let content: Option<String> = sqlx::query_scalar(
+        "SELECT content FROM artifact WHERE id = ? AND task_id = ? AND kind = 'work_unit_plan'",
+    )
+    .bind(&input.plan_artifact_id)
+    .bind(&input.task_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let content = content.ok_or(DbError::NotFound)?;
+    let plan: serde_json::Value = serde_json::from_str(&content).map_err(|error| {
+        DbError::Check(format!("stored coordination plan is invalid JSON: {error}"))
+    })?;
+    let plan_policy_digest = plan
+        .get("review_policy_digest")
+        .and_then(serde_json::Value::as_str);
+    let current_policy_digest: Option<String> = sqlx::query_scalar(
+        "SELECT digest FROM task_review_policy_revision
+         WHERE task_id = ? AND state = 'current'",
+    )
+    .bind(&input.task_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if plan_policy_digest != current_policy_digest.as_deref() {
+        return Err(DbError::Check(
+            "review policy changed after the coordination plan was validated".to_owned(),
+        ));
+    }
+    let checkpoints = plan
+        .get("review_checkpoints")
+        .and_then(serde_json::Value::as_array);
+    if current_policy_digest.is_none() && checkpoints.is_some_and(|items| !items.is_empty()) {
+        return Err(DbError::Check(
+            "review checkpoints require a current Task review policy".to_owned(),
+        ));
+    }
+    if is_replan {
+        sqlx::query(
+            "UPDATE review_plan_checkpoint SET state = 'superseded', superseded_at = ?
+             WHERE task_id = ? AND state = 'active'",
+        )
+        .bind(&input.created_at)
+        .bind(&input.task_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+    let Some(checkpoints) = checkpoints else {
+        return Ok(());
+    };
+    let writable_rows = sqlx::query(
+        "SELECT repo_id FROM task_repository_set_revision_repo
+         WHERE task_id = ? AND revision = ? AND role IN ('primary', 'affected')
+         ORDER BY repo_id",
+    )
+    .bind(&input.task_id)
+    .bind(repository_revision)
+    .fetch_all(&mut **tx)
+    .await?;
+    let writable_repositories = writable_rows
+        .into_iter()
+        .map(|row| Ok(row.try_get::<String, _>("repo_id")?))
+        .collect::<Result<BTreeSet<_>>>()?;
+    let units_by_key = input
+        .work_units
+        .iter()
+        .map(|unit| (unit.key.as_str(), unit))
+        .collect::<BTreeMap<_, _>>();
+    for checkpoint in checkpoints {
+        let key = checkpoint
+            .get("key")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| DbError::Check("review plan checkpoint key is missing".to_owned()))?;
+        let reason = checkpoint
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| DbError::Check("review plan checkpoint reason is missing".to_owned()))?;
+        let after_keys = checkpoint
+            .get("after_work_unit_keys")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                DbError::Check("review plan checkpoint WorkUnits are missing".to_owned())
+            })?;
+        let mut work_unit_ids = Vec::with_capacity(after_keys.len());
+        let mut written_repositories = BTreeSet::new();
+        for after_key in after_keys {
+            let after_key = after_key
+                .as_str()
+                .ok_or_else(|| DbError::Check("review plan WorkUnit key is invalid".to_owned()))?;
+            let unit = units_by_key
+                .get(after_key)
+                .ok_or_else(|| DbError::Check("review plan WorkUnit key is unknown".to_owned()))?;
+            if unit.repository_ids.is_empty() {
+                written_repositories.extend(writable_repositories.iter().cloned());
+            } else {
+                written_repositories.extend(unit.repository_ids.iter().cloned());
+            }
+            work_unit_ids.push(unit.id.clone());
+        }
+        let requested_repositories = checkpoint
+            .get("repository_ids")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|repo| {
+                repo.as_str().map(str::to_owned).ok_or_else(|| {
+                    DbError::Check("review plan repository ID is invalid".to_owned())
+                })
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+        let repositories = if requested_repositories.is_empty() {
+            written_repositories
+        } else {
+            requested_repositories
+        };
+        if work_unit_ids.is_empty()
+            || repositories.is_empty()
+            || repositories.iter().any(|repo_id| {
+                !writable_repositories.contains(repo_id) || !written_repositories.contains(repo_id)
+            })
+        {
+            return Err(DbError::Check(
+                "review plan checkpoint scope must name integrated WorkUnits and their writable repositories".to_owned(),
+            ));
+        }
+        let work_unit_ids_json = serde_json::to_string(&work_unit_ids).map_err(|error| {
+            DbError::Check(format!("serialize review checkpoint WorkUnits: {error}"))
+        })?;
+        let repository_ids_json = serde_json::to_string(
+            &repositories.into_iter().collect::<Vec<_>>(),
+        )
+        .map_err(|error| {
+            DbError::Check(format!("serialize review checkpoint repositories: {error}"))
+        })?;
+        sqlx::query(
+            "INSERT INTO review_plan_checkpoint (
+                 task_id, plan_artifact_id, plan_key, work_unit_ids_json,
+                 repository_ids_json, reason, state, created_at, superseded_at
+             ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, NULL)",
+        )
+        .bind(&input.task_id)
+        .bind(&input.plan_artifact_id)
+        .bind(key)
+        .bind(work_unit_ids_json)
+        .bind(repository_ids_json)
+        .bind(reason)
+        .bind(&input.created_at)
+        .execute(&mut **tx)
+        .await
+        .map_err(check_error)?;
+    }
+    Ok(())
+}
+
 async fn authorize_task_coordination_write(
     db: &SqliteDb,
     input: AuthorizeTaskCoordinationInput,
@@ -2668,6 +2828,13 @@ impl TaskCoordinationRepo for SqliteDb {
                 .map_err(check_error)?;
             }
         }
+        materialize_review_plan_checkpoints(
+            &mut tx,
+            &input,
+            repository_revision_to_pin,
+            replan_classification.is_some(),
+        )
+        .await?;
         let work_unit_ids = input
             .work_units
             .iter()

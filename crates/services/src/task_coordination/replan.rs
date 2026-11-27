@@ -673,7 +673,54 @@ impl TaskCoordinationService {
         }
         original.current_repository_set_revision = revision;
         original.current_repository_set_digest = digest;
-        Ok(Some((id, classify_replan(plan, envelope, &original))))
+        let mut result = classify_replan(plan, envelope, &original);
+        for checkpoint in
+            db::ReviewCheckpointRepo::list_active_review_plan_checkpoints(&*self.db, &task.id)
+                .await?
+        {
+            let old_artifact =
+                CollaborationRepo::get_artifact(&*self.db, &checkpoint.plan_artifact_id)
+                    .await?
+                    .ok_or_else(|| invalid_plan("active review checkpoint has no plan Artifact"))?;
+            let old_plan =
+                self.parse_plan(old_artifact.content.as_deref().ok_or_else(|| {
+                    invalid_plan("active review checkpoint plan is not inline JSON")
+                })?)?;
+            let old_declaration = old_plan
+                .review_checkpoints
+                .iter()
+                .find(|entry| entry.key == checkpoint.plan_key);
+            let new_declaration = plan
+                .review_checkpoints
+                .iter()
+                .find(|entry| entry.key == checkpoint.plan_key);
+            let declarations_match = match (old_declaration, new_declaration) {
+                (Some(old), Some(new)) => {
+                    old.after_work_unit_keys == new.after_work_unit_keys
+                        && old.repository_ids == new.repository_ids
+                        && old_plan.review_policy_digest == plan.review_policy_digest
+                }
+                _ => false,
+            };
+            let work_units_match = if let Some(entry) = old_declaration {
+                let mut ids = entry
+                    .after_work_unit_keys
+                    .iter()
+                    .map(|key| super::deterministic_work_unit_id(&old_plan.request_id, key))
+                    .collect::<Result<Vec<_>>>()?;
+                ids.sort();
+                let mut existing = checkpoint.work_unit_ids.clone();
+                existing.sort();
+                ids == existing
+            } else {
+                false
+            };
+            if !declarations_match || !work_units_match {
+                result.facts.review_checkpoints_unchanged = false;
+                result.classification = ReplanClassification::ScopeOrAuthorityChange;
+            }
+        }
+        Ok(Some((id, result)))
     }
 
     pub(super) async fn validate_replan_materialization_decision(

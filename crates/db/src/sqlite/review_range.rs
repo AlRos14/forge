@@ -2023,14 +2023,21 @@ async fn apply_corrections_in_tx(
     )?;
     let consumed: i64 = sqlx::query_scalar(
         "SELECT (SELECT COUNT(*) FROM task_rework_receipt WHERE task_id = ?)
-              + (SELECT COUNT(*) FROM review_rework_round WHERE task_id = ?)",
+              + (SELECT COUNT(*) FROM review_rework_round WHERE task_id = ?)
+              + (SELECT COUNT(*) FROM task_review_triage triage WHERE triage.task_id = ?
+                   AND (triage.disposition = 'recheck' OR EXISTS (
+                       SELECT 1 FROM review_finding_triage finding_triage
+                       WHERE finding_triage.report_artifact_id = triage.review_report_artifact_id
+                         AND finding_triage.disposition = 'recheck'
+                   )))",
     )
+    .bind(&round.task_id)
     .bind(&round.task_id)
     .bind(&round.task_id)
     .fetch_one(&mut **tx)
     .await?;
     ensure(
-        consumed < input.max_rework_rounds,
+        consumed < input.max_rework_rounds && round.round == consumed + 1,
         "review.rework.round_budget_exhausted",
     )?;
     sqlx::query(
@@ -2653,6 +2660,38 @@ impl ReviewLedgerRepo for SqliteDb {
             }),
             "finding dispositions must bind the exact triage request",
         )?;
+        if aggregate.disposition == ReviewFindingDisposition::Recheck
+            || input
+                .findings
+                .iter()
+                .any(|finding| finding.disposition == ReviewFindingDisposition::Recheck)
+        {
+            let consumed: i64 = sqlx::query_scalar(
+                "SELECT (SELECT COUNT(*) FROM task_rework_receipt WHERE task_id = ?)
+                      + (SELECT COUNT(*) FROM review_rework_round WHERE task_id = ?)
+                      + (SELECT COUNT(*) FROM task_review_triage triage WHERE triage.task_id = ?
+                           AND (triage.disposition = 'recheck' OR EXISTS (
+                               SELECT 1 FROM review_finding_triage finding_triage
+                               WHERE finding_triage.report_artifact_id = triage.review_report_artifact_id
+                                 AND finding_triage.disposition = 'recheck'
+                           )))",
+            )
+            .bind(&aggregate.task_id)
+            .bind(&aggregate.task_id)
+            .bind(&aggregate.task_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let max_rounds: i64 = sqlx::query_scalar(
+                "SELECT max_rework_rounds FROM task_autonomy_limits WHERE task_id = ?",
+            )
+            .bind(&aggregate.task_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            ensure(
+                consumed < max_rounds,
+                "review.rework.round_budget_exhausted",
+            )?;
+        }
         // The V185 guard revalidates current authority, pause and revocation.
         sqlx::query(
             "INSERT INTO task_review_triage (
@@ -2753,7 +2792,18 @@ impl ReviewLedgerRepo for SqliteDb {
 
     async fn count_review_rework_rounds(&self, task_id: &str) -> Result<i64> {
         Ok(
-            sqlx::query_scalar("SELECT COUNT(*) FROM review_rework_round WHERE task_id = ?")
+            sqlx::query_scalar(
+                "SELECT (SELECT COUNT(*) FROM task_rework_receipt WHERE task_id = ?)
+                      + (SELECT COUNT(*) FROM review_rework_round WHERE task_id = ?)
+                      + (SELECT COUNT(*) FROM task_review_triage triage WHERE triage.task_id = ?
+                           AND (triage.disposition = 'recheck' OR EXISTS (
+                               SELECT 1 FROM review_finding_triage finding_triage
+                               WHERE finding_triage.report_artifact_id = triage.review_report_artifact_id
+                                 AND finding_triage.disposition = 'recheck'
+                           )))",
+            )
+                .bind(task_id)
+                .bind(task_id)
                 .bind(task_id)
                 .fetch_one(&self.pool)
                 .await?,

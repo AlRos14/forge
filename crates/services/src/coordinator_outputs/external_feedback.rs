@@ -609,10 +609,12 @@ pub fn parse_external_feedback_v2(
         ensure_new_kind_permitted(output.kind(), allowed_actions)?;
         if !matches!(
             output,
-            CoordinatorOutput::AskHuman(_) | CoordinatorOutput::ProposeReplan(_)
+            CoordinatorOutput::AskHuman(_)
+                | CoordinatorOutput::ProposeReplan(_)
+                | CoordinatorOutput::RequestRangeReview(_)
         ) {
             return Err(not_permitted(
-                "external_feedback supports ask_human and propose_replan outputs only",
+                "external_feedback supports ask_human, propose_replan and request_range_review outputs only",
             ));
         }
         if let CoordinatorOutput::AskHuman(ask) = &output {

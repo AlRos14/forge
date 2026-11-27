@@ -59,12 +59,22 @@ struct HumanDecisionResumeTurn {
     #[serde(default)]
     coordinator_replan: Option<CoordinatorReplanResumeDecision>,
     #[serde(default)]
+    range_review: Option<RangeReviewHumanResume>,
+    #[serde(default)]
     outputs: Vec<Value>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CoordinatorReplanResumeDecision {
+    decision: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RangeReviewHumanResume {
+    review_report_artifact_id: String,
+    report_digest: String,
     decision: String,
 }
 
@@ -432,6 +442,7 @@ impl TaskCoordinationService {
         let outputs = coordinator_outputs::parse_outputs(turn.outputs, &envelope, allowed_outputs)?;
         let mut ask: Option<AskHumanOutput> = None;
         let mut validations = Vec::new();
+        let mut range_review_requests = Vec::new();
         let mut propose_replan = None;
         for output in outputs {
             match output {
@@ -446,6 +457,9 @@ impl TaskCoordinationService {
                         return Err(invalid_plan("a turn may carry at most one propose_replan"));
                     }
                 }
+                CoordinatorOutput::RequestRangeReview(value) => {
+                    range_review_requests.push(CoordinatorOutput::RequestRangeReview(value));
+                }
             }
         }
         if ask.is_some() && decision.disposition != ValidationTriageDisposition::Human {
@@ -457,6 +471,8 @@ impl TaskCoordinationService {
             self.apply_request_validation(request, execution, value)
                 .await?;
         }
+        self.apply_request_range_review_outputs(request, execution, &range_review_requests)
+            .await?;
         let service = HumanDecisionService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
         let mut raised = None;
         match decision.disposition {
@@ -603,6 +619,37 @@ impl TaskCoordinationService {
                 .complete_replan_human_resume(request, &decision_row, &paused, &output.decision)
                 .await;
         }
+        if paused.kind == TaskCoordinationRequestKind::ReviewFindings {
+            if decision_row.source_kind != HumanDecisionSourceKind::CoordinationRequest
+                || decision_row.source_id != paused.id
+                || !turn.validation_findings.is_empty()
+                || turn.coordinator_replan.is_some()
+            {
+                return Err(output_not_permitted(
+                    "range ReviewFindings resumes only its exact coordination-request Human decision",
+                ));
+            }
+            let range_review = turn.range_review.ok_or_else(|| {
+                invalid_plan("a range HumanDecisionResume must echo its exact range decision")
+            })?;
+            return self
+                .complete_range_human_decision_resume(
+                    request,
+                    execution,
+                    &decision_row,
+                    &paused,
+                    &range_review.review_report_artifact_id,
+                    &range_review.report_digest,
+                    &range_review.decision,
+                    &turn.answered_option_id,
+                )
+                .await;
+        }
+        if turn.range_review.is_some() {
+            return Err(output_not_permitted(
+                "range_review is only valid for a range ReviewFindings HumanDecisionResume",
+            ));
+        }
         if turn.coordinator_replan.is_some() {
             return Err(invalid_plan(
                 "coordinator_replan output is only valid for an exact replan resume",
@@ -706,6 +753,15 @@ impl TaskCoordinationService {
                 "classification": replan.classification,
                 "classification_facts_json": replan.classification_facts_json,
             })
+        } else if paused.kind == TaskCoordinationRequestKind::ReviewFindings
+            && decision.source_kind == HumanDecisionSourceKind::CoordinationRequest
+        {
+            crate::task_rework::TaskReworkService::new(
+                Arc::clone(&self.db),
+                Arc::clone(&self.event_bus),
+            )
+            .exact_review_findings_context(&paused)
+            .await?
         } else {
             Value::Null
         };
@@ -714,6 +770,8 @@ impl TaskCoordinationService {
             serde_json::from_str(&decision.evidence_links_json).unwrap_or(Value::Null);
         Ok(json!({
             "human_decision_id": decision.id,
+            "human_decision_source_kind": decision.source_kind.to_string(),
+            "human_decision_source_id": decision.source_id,
             "question": decision.question,
             "options": options,
             "evidence_links": evidence,
@@ -760,6 +818,44 @@ impl TaskCoordinationService {
                 paused = serde_json::to_string(paused_id).unwrap(),
                 decision = serde_json::to_string(decision_id).unwrap(),
                 answered = serde_json::to_string(answered).unwrap(),
+                context = serde_json::to_string(context).unwrap_or_else(|_| "{}".to_owned()),
+            ));
+        }
+        if resume_context
+            .get("human_decision_source_kind")
+            .and_then(Value::as_str)
+            == Some("coordination_request")
+            && resume_context
+                .get("resumes_request_kind")
+                .and_then(Value::as_str)
+                == Some("review_findings")
+        {
+            let paused_source = resume_context.get("paused_source").ok_or_else(|| {
+                invalid_plan("range HumanDecisionResume has no exact report context")
+            })?;
+            if paused_source.get("kind").and_then(Value::as_str) != Some("commit_range") {
+                return Err(output_not_permitted(
+                    "coordination-request Human decisions are resumable here only for commit-range reports",
+                ));
+            }
+            let report_id = paused_source
+                .get("report_artifact_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid_plan("range HumanDecisionResume has no report ID"))?;
+            let report_digest = paused_source
+                .get("report_digest")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid_plan("range HumanDecisionResume has no report digest"))?;
+            return Ok(format!(
+                "Return exactly one JSON object matching `{{\"schema_version\":2,\"request_id\":{request_id},\"task_id\":{task_id},\"authorization_version\":{authorization_version},\"resumes_request_id\":{paused},\"human_decision_id\":{decision},\"answered_option_id\":{answered},\"range_review\":{{\"review_report_artifact_id\":{report_id},\"report_digest\":{report_digest},\"decision\":{answered}}},\"outputs\":[]}}`. Echo the exact range report, digest, and Human answer. The Human answer is authoritative; do not change its decision. Context: {context}",
+                request_id = serde_json::to_string(&request.id).unwrap(),
+                task_id = serde_json::to_string(&request.task_id).unwrap(),
+                authorization_version = request.authorization_version,
+                paused = serde_json::to_string(paused_id).unwrap(),
+                decision = serde_json::to_string(decision_id).unwrap(),
+                answered = serde_json::to_string(answered).unwrap(),
+                report_id = serde_json::to_string(report_id).unwrap(),
+                report_digest = serde_json::to_string(report_digest).unwrap(),
                 context = serde_json::to_string(context).unwrap_or_else(|_| "{}".to_owned()),
             ));
         }

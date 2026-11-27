@@ -376,7 +376,7 @@ pub(crate) async fn resolve_repo_source(
     Ok(clone_path.to_string_lossy().into_owned())
 }
 
-pub(super) fn default_workspace_root() -> PathBuf {
+pub(crate) fn default_workspace_root() -> PathBuf {
     std::env::var("FORGE_WORKSPACE_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join("forge").join("worktrees"))

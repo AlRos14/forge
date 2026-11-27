@@ -73,6 +73,7 @@ pub struct OrchestratorRuntime {
     event_bus: Arc<EventBus>,
     task_service: Arc<TaskService>,
     gate_engine: crate::gate_engine::GateEngine,
+    review_scheduler: Arc<crate::review_range::ReviewScheduler>,
     consumer_name: String,
     lease_owner: String,
     #[cfg(test)]
@@ -140,6 +141,7 @@ enum OrchestratorActionKind {
     RequestValidation,
     AskHuman,
     ProposeReplan,
+    RequestRangeReview,
     MicroFix,
 }
 
@@ -156,6 +158,9 @@ fn coordinator_output_kinds(
                 }
                 OrchestratorActionKind::AskHuman => Some(CoordinatorOutputKind::AskHuman),
                 OrchestratorActionKind::ProposeReplan => Some(CoordinatorOutputKind::ProposeReplan),
+                OrchestratorActionKind::RequestRangeReview => {
+                    Some(CoordinatorOutputKind::RequestRangeReview)
+                }
                 OrchestratorActionKind::MicroFix => Some(CoordinatorOutputKind::MicroFix),
                 _ => None,
             })
@@ -234,6 +239,7 @@ impl TaskRoleOrchestratorPolicy {
             OrchestratorActionKind::RequestValidation
                 | OrchestratorActionKind::AskHuman
                 | OrchestratorActionKind::ProposeReplan
+                | OrchestratorActionKind::RequestRangeReview
                 | OrchestratorActionKind::MicroFix
         ) {
             // Asymmetric rule: new kinds are never implied by an absent list.
@@ -325,6 +331,13 @@ impl OrchestratorRuntime {
                 Arc::clone(&db),
                 Arc::clone(&event_bus),
             ),
+            review_scheduler: Arc::new(
+                crate::review_range::ReviewScheduler::new(
+                    Arc::clone(&db),
+                    task_service.workspace_root().to_path_buf(),
+                )
+                .with_event_bus(Arc::clone(&event_bus)),
+            ),
             db,
             event_bus,
             task_service,
@@ -368,6 +381,9 @@ impl OrchestratorRuntime {
     }
 
     pub async fn run_once(&self, limit: i64) -> Result<OrchestratorRun> {
+        // Range review recovery is a durable scan, not an EventBus-dependent
+        // side effect. The event hook below keeps normal operation prompt.
+        self.review_scheduler.recover(100).await?;
         // Pending automatic rework is durable and remains pending across a
         // Task pause. The periodic run rechecks it after resume, even though
         // Task dispatch transitions are not EventBus-delivered.
@@ -406,6 +422,7 @@ impl OrchestratorRuntime {
 
         for event in events {
             self.gate_engine.process_domain_event(&event).await?;
+            self.review_scheduler.process_domain_event(&event).await?;
             crate::task_rework::TaskReworkService::new(
                 Arc::clone(&self.db),
                 Arc::clone(&self.event_bus),
@@ -480,6 +497,7 @@ impl OrchestratorRuntime {
             Arc::clone(&self.db),
             Arc::clone(&self.event_bus),
         )
+        .with_workspace_root(self.task_service.workspace_root().to_path_buf())
         .process_pending_review_findings_requests(100)
         .await?;
         {

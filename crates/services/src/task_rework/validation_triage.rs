@@ -152,10 +152,21 @@ impl TaskReworkService {
     ) -> Result<()> {
         let consumed: i64 = sqlx::query_scalar(
             "SELECT (SELECT count(*) FROM task_rework_receipt WHERE task_id=?)
-                  + (SELECT count(*) FROM task_review_triage WHERE task_id=? AND disposition='recheck')
+                  + (SELECT count(*) FROM review_rework_round WHERE task_id=?)
+                  + (SELECT count(*) FROM task_review_triage triage WHERE triage.task_id=?
+                       AND (triage.disposition='recheck' OR EXISTS (
+                           SELECT 1 FROM review_finding_triage finding_triage
+                           WHERE finding_triage.report_artifact_id=triage.review_report_artifact_id
+                             AND finding_triage.disposition='recheck'
+                       )))
                   + (SELECT count(*) FROM task_validation_triage WHERE task_id=? AND disposition IN ('correct','recheck'))
-                  + (SELECT count(*) FROM task_coordination_request r WHERE r.task_id=? AND r.kind='human_decision_resume' AND r.state='triaged')",
+                  + (SELECT count(*) FROM task_coordination_request r
+                       JOIN task_coordination_request paused
+                         ON paused.id=r.resumes_request_id AND paused.task_id=r.task_id
+                        AND paused.kind='validation_findings'
+                     WHERE r.task_id=? AND r.kind='human_decision_resume' AND r.state='triaged')",
         )
+        .bind(task_id)
         .bind(task_id)
         .bind(task_id)
         .bind(task_id)

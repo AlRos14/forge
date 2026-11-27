@@ -98,6 +98,10 @@ pub struct TaskService {
 }
 
 impl TaskService {
+    pub(crate) fn workspace_root(&self) -> &std::path::Path {
+        &self.workspace_root
+    }
+
     /// Complete a coordination-materialized delivery after its exact
     /// Execution produced a result. This is technical completion, not review
     /// approval; reviewed WorkUnits keep their independent review subject and
