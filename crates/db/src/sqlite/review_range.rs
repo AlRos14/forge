@@ -12,14 +12,14 @@ use crate::{
     ProjectReviewPolicy, ProposalTargetKind, ReviewCheckpoint, ReviewCheckpointReason,
     ReviewCheckpointRepo, ReviewCheckpointRequestRecord, ReviewCheckpointState,
     ReviewCommitAttribution, ReviewCorrectionLink, ReviewCoverageRows, ReviewFinding,
-    ReviewFindingFilter, ReviewFindingLocation, ReviewFindingResolution, ReviewFindingSeverity,
-    ReviewFindingTriage, ReviewHumanDecision, ReviewInputFinding, ReviewLedgerRepo,
-    ReviewLocationAttribution, ReviewPlanCheckpoint, ReviewPolicyDocument, ReviewPolicyRepo,
-    ReviewPolicyRevisionState, ReviewPolicySource, ReviewRange, ReviewRangeContributor,
-    ReviewRangeReport, ReviewRangeReportRepo, ReviewResolutionOutcome, ReviewReworkRound,
-    ReviewVerdict, TaskReviewBase, TaskReviewPolicyRevision, TransitionReviewCheckpoint,
-    UpsertQueuedReviewCheckpoint, WorkUnitReviewRange, WriteProjectReviewPolicy,
-    WriteTaskReviewPolicy,
+    ReviewFindingDisposition, ReviewFindingFilter, ReviewFindingLocation, ReviewFindingResolution,
+    ReviewFindingSeverity, ReviewFindingTriage, ReviewHumanDecision, ReviewInputFinding,
+    ReviewLedgerRepo, ReviewLocationAttribution, ReviewPlanCheckpoint, ReviewPolicyDocument,
+    ReviewPolicyRepo, ReviewPolicyRevisionState, ReviewPolicySource, ReviewRange,
+    ReviewRangeContributor, ReviewRangeReport, ReviewRangeReportRepo, ReviewResolutionOutcome,
+    ReviewReworkRound, ReviewVerdict, TaskReviewBase, TaskReviewPolicyRevision,
+    TransitionReviewCheckpoint, UpsertQueuedReviewCheckpoint, WorkUnitReviewRange,
+    WriteProjectReviewPolicy, WriteTaskReviewPolicy,
 };
 use sqlx::SqliteConnection;
 

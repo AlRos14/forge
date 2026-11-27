@@ -163,7 +163,7 @@ async fn materialize_review_plan_checkpoints(
             })
             .collect::<Result<BTreeSet<_>>>()?;
         let repositories = if requested_repositories.is_empty() {
-            written_repositories
+            written_repositories.clone()
         } else {
             requested_repositories
         };
