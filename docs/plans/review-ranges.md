@@ -2593,3 +2593,18 @@ Todos los pasos de CI llevan `if: ${{ !cancelled() }}`.
    requiere decisión.
 3. **Waiver: autoridad.** DR8 dice «Human con referencia»; se congela owner/admin,
    como en el diseño. Confirmar si un miembro sin ese rol debe poder.
+
+### C0.13 Decisiones Human sobre las cuestiones abiertas (2026-11-27)
+
+1. **Checkpoint bloqueado (R4): aceptado.** En v1 un checkpoint `blocked` se
+   resuelve por sus rutas dedicadas y no entra en `human_decision_request`.
+2. **Merge externo con cobertura obsoleta: relajar.** Si la cobertura cambia
+   después de publicar, Forge sigue registrando el resultado de una PR mergeada o
+   cerrada en el proveedor (es un hecho observado, no una admisión nueva). La
+   lane E relaja solo el guard de vigencia que impida *registrar* ese resultado,
+   sin permitir que Forge admita un merge nuevo sin cobertura, y lo prueba.
+3. **Waiver (R10): cualquier Human miembro activo del equipo de la Task.** Sustituye
+   «owner/admin» de R10 y C0.7: puede hacer waiver de P1–P3 un Human con
+   RoleMembership activa en la Task (u owner/admin del Project), siempre con
+   `reference` no vacía y registrado de forma inmutable con su Actor. P0 nunca.
+   Las lanes A/B/C ajustan la comprobación de autoridad del waiver.
