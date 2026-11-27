@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the current workspace implementation on the 0.9.1 source baseline, including migration V181 for Task and WorkUnit repository scopes. The ordered migration contract and invariants are in [Architecture V2](migration/architecture-v2.md); domain details are in [concepts](concepts/).
+This document describes the current workspace implementation on the 0.9.2 source baseline, including the multirepo migrations V181–V183. The ordered migration contract and invariants are in [Architecture V2](migration/architecture-v2.md); domain details are in [concepts](concepts/).
 
 > The Orchestrator owns work boundaries. The harness owns cognition.
 
