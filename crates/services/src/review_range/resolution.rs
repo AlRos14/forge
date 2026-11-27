@@ -465,6 +465,7 @@ impl ReviewFindingService {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn human_decision(
     task_id: &str,
     user_id: &str,
@@ -551,6 +552,7 @@ fn decision_events(decision: &ReviewHumanDecision, now: &str) -> Vec<CreateDomai
     ]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn review_event(
     event_type: &str,
     entity_type: &str,

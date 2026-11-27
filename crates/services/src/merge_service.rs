@@ -637,6 +637,7 @@ impl MergeService {
         Ok(candidates)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn publish_repository_pr(
         &self,
         task: &db::Task,
@@ -853,6 +854,7 @@ impl MergeService {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn merge_repository_direct(
         &self,
         task: &db::Task,

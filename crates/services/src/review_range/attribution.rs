@@ -208,7 +208,7 @@ impl ReviewAttribution {
             }
             let key = (actor.kind().to_string(), actor.id().to_owned());
             *totals.entry(key.clone()).or_default() += location.line_count;
-            let replace = representative.get(&key).map_or(true, |current| {
+            let replace = representative.get(&key).is_none_or(|current| {
                 location.integration_id.as_deref() > current.integration_id.as_deref()
             });
             if replace {

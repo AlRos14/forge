@@ -726,9 +726,8 @@ impl ReviewScheduler {
             db::TaskLifecycleState::Done
                 | db::TaskLifecycleState::Cancelled
                 | db::TaskLifecycleState::Merging
-        ) || dispatch.map_or(true, |dispatch| {
-            dispatch.state != db::TaskDispatchState::Running
-        }) {
+        ) || dispatch.is_none_or(|dispatch| dispatch.state != db::TaskDispatchState::Running)
+        {
             return Err(coordination(
                 NOTHING_TO_REVIEW,
                 "review checkpoints cannot be admitted while the Task is not running",
@@ -1591,6 +1590,7 @@ fn latest_success(
         .max_by(|left, right| (&left.started_at, &left.id).cmp(&(&right.started_at, &right.id)))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn checkpoint_created_event(
     checkpoint_id: &str,
     task_id: &str,
@@ -1620,6 +1620,7 @@ fn checkpoint_created_event(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn review_event(
     event_type: &str,
     entity_type: &str,

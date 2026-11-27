@@ -904,7 +904,7 @@ Exact source: admission {admission_id} ({digest})\nContext: {context}",
                 self.validate_external_feedback_plan(plan, &team)?;
             }
             let classification = classify_rework_scope(parsed.plan.as_ref(), &envelope, &original);
-            self.apply_request_range_review_outputs(&request, &execution, &parsed.outputs)
+            self.apply_request_range_review_outputs(request, execution, &parsed.outputs)
                 .await?;
             apply_external_feedback_triage(
                 &self.db,

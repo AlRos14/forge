@@ -2,8 +2,7 @@
 //! (`docs/plans/review-ranges.md`, contract C0.6).
 //!
 //! Git facts are computed outside transactions; coverage is a pure function of
-//! those facts and durable rows. Operations that are not implemented yet return
-//! an error and never report work as reviewed or covered.
+//! those facts and durable rows.
 
 pub mod attribution;
 pub mod coverage;
@@ -31,10 +30,4 @@ pub(crate) fn canonical_digest<T: Serialize>(value: &T) -> Result<String> {
         ServiceError::invalid_operation(format!("review value cannot be serialized: {error}"))
     })?;
     Ok(hex::encode(Sha256::digest(bytes)))
-}
-
-fn not_implemented<T>(operation: &str) -> Result<T> {
-    Err(ServiceError::invalid_operation(format!(
-        "commit-range review operation is not implemented: {operation}"
-    )))
 }
