@@ -233,7 +233,15 @@ pub async fn update_project(
         project_hooks,
         primary_repo_id,
         version,
+        default_review_policy,
     } = request;
+    // Rejected before any write: the Project review default is not yet writable.
+    if default_review_policy.is_some() {
+        return Err(ApiError::unprocessable(
+            "review.policy.invalid",
+            "default_review_policy is not supported yet",
+        ));
+    }
     let project_hooks_json = match project_hooks {
         Some(rules) => {
             let serialized = serde_json::to_string(&rules).map_err(|error| {

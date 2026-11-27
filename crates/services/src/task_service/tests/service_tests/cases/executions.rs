@@ -162,6 +162,8 @@ fn human_review_request(
         artifact_ids,
         reviewed_work_unit_id: None,
         reviewed_work_unit_version: None,
+        structured_findings: None,
+        resolutions: None,
     }
 }
 

@@ -356,6 +356,7 @@ impl TaskService {
     ) -> Result<(Execution, db::Artifact)> {
         validate_required("execution_id", execution_id)?;
         validate_required("user_id", user_id)?;
+        crate::reject_range_report_fields(&request)?;
         let mut execution = ExecutionRepo::get_by_id(&*self.db, execution_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("execution", execution_id.to_owned()))?;

@@ -16,6 +16,11 @@ pub(crate) struct ReviewFindingsDecision {
 
 use api_types::TaskReviewDisposition as ReviewFindingsDisposition;
 
+/// `defer` applies only to non-blocking findings of a commit-range review.
+fn defer_not_permitted() -> ServiceError {
+    ServiceError::invalid_operation("defer is only valid for commit-range review findings")
+}
+
 impl TaskReworkService {
     pub async fn list_review_triage(
         &self,
@@ -32,6 +37,7 @@ impl TaskReworkService {
                         "correct" => ReviewFindingsDisposition::Correct,
                         "recheck" => ReviewFindingsDisposition::Recheck,
                         "human" => ReviewFindingsDisposition::Human,
+                        "defer" => ReviewFindingsDisposition::Defer,
                         _ => {
                             return Err(ServiceError::invalid_operation(
                                 "Invalid persisted review disposition",
@@ -173,6 +179,9 @@ impl TaskReworkService {
         request_id: &str,
         input: ReviewFindingsDecision,
     ) -> Result<()> {
+        if matches!(input.disposition, ReviewFindingsDisposition::Defer) {
+            return Err(defer_not_permitted());
+        }
         if input.rationale.trim().is_empty()
             || input.rationale.len() > 8192
             || input.instructions.trim().is_empty()
@@ -367,6 +376,7 @@ impl TaskReworkService {
             ReviewFindingsDisposition::Correct => "correct",
             ReviewFindingsDisposition::Recheck => "recheck",
             ReviewFindingsDisposition::Human => "human",
+            ReviewFindingsDisposition::Defer => return Err(defer_not_permitted()),
         };
         sqlx::query("INSERT INTO task_review_triage(review_report_artifact_id,task_id,report_digest,execution_id,authorization_version,disposition,rationale,instructions,decision_digest,review_work_unit_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)")
             .bind(&input.review_report_artifact_id).bind(&task_id).bind(&input.report_digest).bind(execution_id).bind(authorization_version).bind(disposition).bind(&input.rationale).bind(&input.instructions).bind(&decision_digest).bind(review_id.as_deref()).bind(&now).execute(&mut *tx).await?;

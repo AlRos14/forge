@@ -1783,6 +1783,14 @@ impl CollaborationService {
         let proposal = CollaborationRepo::get_proposal(&*self.db, &input.proposal_id)
             .await?
             .ok_or_else(|| not_found("proposal", input.proposal_id.clone()))?;
+        if matches!(
+            proposal.target.kind,
+            ProposalTargetKind::ReviewFinding
+                | ProposalTargetKind::ReviewBase
+                | ProposalTargetKind::ReviewCommit
+        ) {
+            return Err(review_target_denied());
+        }
         if proposal.content_version != input.proposal_version
             || proposal.status != ProposalStatus::Open
         {
@@ -2113,6 +2121,9 @@ impl CollaborationService {
                     .ok_or_else(|| not_found("pr_external_action", target.id.clone()))?;
                 Ok(())
             }
+            ProposalTargetKind::ReviewFinding
+            | ProposalTargetKind::ReviewBase
+            | ProposalTargetKind::ReviewCommit => Err(review_target_denied()),
         }
     }
 
@@ -2423,6 +2434,15 @@ fn not_found(entity: &'static str, id: String) -> ServiceError {
 fn invalid(message: impl Into<String>) -> ServiceError {
     ServiceError::InvalidOperation {
         message: message.into(),
+    }
+}
+
+/// Review-range Proposals are created and decided only by their dedicated Human
+/// routes.
+fn review_target_denied() -> ServiceError {
+    ServiceError::AuthorizationDenied {
+        message: "review-range Proposals cannot be created or decided through the generic routes"
+            .to_owned(),
     }
 }
 

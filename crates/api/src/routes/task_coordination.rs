@@ -343,6 +343,7 @@ fn plan_response(view: PlanView) -> ApiResult<TaskCoordinationPlanResponse> {
         objective_digest: view.parsed.objective_digest,
         work_units,
         repository_set: view.parsed.repository_set,
+        review_checkpoints: Vec::new(),
         proposal_id: view.plan.proposal_id,
         decision_id: view.plan.decision_id,
         materialization: view

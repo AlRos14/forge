@@ -889,6 +889,9 @@ async fn triage_fixture(
             assert_eq!(round, extra_rechecks as i64 + 1);
         }
         api_types::TaskReviewDisposition::Human => assert_eq!(state, "blocked"),
+        api_types::TaskReviewDisposition::Defer => {
+            unreachable!("defer is rejected for WorkUnit result reviews")
+        }
         api_types::TaskReviewDisposition::Recheck => {
             assert_eq!(state, "cancelled");
             let reassessment = WorkUnitRepo::get_by_id(&**db, &recheck.unwrap())

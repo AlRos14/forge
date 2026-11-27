@@ -100,6 +100,7 @@ fn work_unit_response(
         updated_at: unit.updated_at,
         readiness: readiness_to_api(readiness),
         review_subject,
+        review_range: None,
         repository_ids,
         integrations: integrations
             .into_iter()

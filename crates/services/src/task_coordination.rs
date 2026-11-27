@@ -3158,6 +3158,11 @@ impl TaskCoordinationService {
                 "ReviewFindings schema 1 is frozen; micro_fix and outputs require schema 2",
             ));
         }
+        if decision.disposition == api_types::TaskReviewDisposition::Defer {
+            return Err(invalid_plan(
+                "defer is only valid for commit-range review findings",
+            ));
+        }
         if decision.authorization_version != request.authorization_version
             || request.review_report_artifact_id.as_deref()
                 != Some(decision.review_report_artifact_id.as_str())

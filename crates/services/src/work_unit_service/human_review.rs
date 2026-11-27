@@ -11,6 +11,7 @@ impl WorkUnitService {
         expected_version: i64,
         mut report: api_types::SubmitReviewReportRequest,
     ) -> Result<(Execution, db::Artifact)> {
+        crate::reject_range_report_fields(&report)?;
         let _guard = self
             .integration_locks
             .acquire(&format!("human-work-unit-review:{work_unit_id}"))

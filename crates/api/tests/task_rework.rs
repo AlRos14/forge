@@ -740,6 +740,8 @@ async fn request_changes_creates_replay_safe_correction_and_review_round() {
             artifact_ids: vec![],
             reviewed_work_unit_id: None,
             reviewed_work_unit_version: None,
+            structured_findings: None,
+            resolutions: None,
         })
         .expect("review report serializes"),
         StatusCode::OK,

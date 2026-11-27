@@ -137,6 +137,7 @@ pub fn project_response(project: Project) -> ApiResult<ProjectResponse> {
         paused_at: project.paused_at.clone(),
         paused: project.paused_at.is_some(),
         version: project.version,
+        default_review_policy: None,
     })
 }
 

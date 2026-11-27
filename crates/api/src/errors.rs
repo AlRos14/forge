@@ -283,6 +283,7 @@ impl From<ServiceError> for ApiError {
                             | "coordination.coordinator_harness_unsupported"
                             | "pr_feedback.extend_out_of_scope"
                             | "pr_feedback.plan_without_extend"
+                            | "review.report.invalid_findings"
                     )
                 {
                     StatusCode::UNPROCESSABLE_ENTITY
@@ -512,6 +513,16 @@ impl From<DbError> for ApiError {
                 Self::forbidden_with_code(
                     "copilot_authority_lost",
                     "The Project Copilot delegation is no longer valid",
+                )
+            }
+            DbError::Sqlx(error)
+                if error
+                    .as_database_error()
+                    .is_some_and(|error| error.message() == "gate.review_coverage_missing") =>
+            {
+                Self::conflict_with_code(
+                    "gate.review_coverage_missing",
+                    "required review coverage is missing",
                 )
             }
             DbError::NotFound => Self {
