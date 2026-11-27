@@ -2696,7 +2696,8 @@ pub enum ProposalTargetKind {
     WorkUnit,
     /// A `human_approval` PR external action (V177; plan node P3).
     PrExternalAction,
-    /// A range review finding waived by an owner/admin Decision (V185).
+    /// A range review finding waived by an active Task member or Project
+    /// owner/admin Decision (V185).
     ReviewFinding,
     /// A Human re-baseline of one Task repository (V185).
     ReviewBase,

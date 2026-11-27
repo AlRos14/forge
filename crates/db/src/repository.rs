@@ -3783,6 +3783,14 @@ pub trait ReviewLedgerRepo: Send + Sync {
         resolution: ReviewFindingResolution,
         events: Vec<CreateDomainEvent>,
     ) -> Result<ReviewFindingResolution>;
+    /// Pins the Task's first base for one writable repository. Only revision 1
+    /// from a first integration or workspace preparation is accepted; an exact
+    /// replay returns the existing base.
+    async fn pin_review_base(
+        &self,
+        base: TaskReviewBase,
+        events: Vec<CreateDomainEvent>,
+    ) -> Result<TaskReviewBase>;
     async fn rebaseline_review(
         &self,
         expected_coverage_revision: i64,

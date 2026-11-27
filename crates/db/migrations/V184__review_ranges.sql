@@ -472,7 +472,8 @@ CREATE TABLE review_finding_resolution (
     report_artifact_id  TEXT REFERENCES review_range_report(report_artifact_id) ON DELETE RESTRICT,
     decision_id         TEXT REFERENCES decision(id) ON DELETE RESTRICT,
     waiver_reference    TEXT CHECK (waiver_reference IS NULL
-                            OR length(CAST(waiver_reference AS BLOB)) BETWEEN 1 AND 512),
+                            OR (length(CAST(waiver_reference AS BLOB)) BETWEEN 1 AND 512
+                                AND length(trim(waiver_reference)) > 0)),
     evidence            TEXT NOT NULL CHECK (length(CAST(evidence AS BLOB)) BETWEEN 1 AND 4096),
     actor_kind          TEXT NOT NULL CHECK (actor_kind IN ('human', 'agent')),
     actor_id            TEXT NOT NULL,
@@ -509,11 +510,21 @@ WHEN NOT EXISTS (SELECT 1 FROM review_finding f
         JOIN decision_actor a ON a.decision_id = d.id AND a.actor_kind = 'human'
           AND a.actor_id = NEW.actor_id
         JOIN task t ON t.id = f.task_id
-        JOIN project_member pm ON pm.project_id = t.project_id AND pm.user_id = a.actor_id
-          AND pm.role IN ('owner', 'admin')
         WHERE f.id = NEW.finding_id AND f.severity != 'P0'
           AND p.target_kind = 'review_finding' AND p.target_id = f.id
-          AND p.target_digest = f.digest))
+          AND p.target_digest = f.digest
+          AND length(trim(NEW.waiver_reference)) > 0
+          AND (
+              EXISTS (SELECT 1 FROM project_member pm
+                      WHERE pm.project_id = t.project_id AND pm.user_id = a.actor_id
+                        AND pm.role IN ('owner', 'admin'))
+              OR EXISTS (
+                  SELECT 1 FROM task_role tr
+                  JOIN role_membership rm ON rm.task_role_id = tr.id
+                  WHERE tr.task_id = f.task_id AND rm.actor_kind = 'human'
+                    AND rm.actor_id = a.actor_id AND rm.status = 'active'
+              )
+          )))
 BEGIN SELECT RAISE(ABORT, 'FORGE_REVIEW_FINDING_RESOLUTION_NOT_AUTHORIZED'); END;
 
 CREATE TABLE review_finding_triage (

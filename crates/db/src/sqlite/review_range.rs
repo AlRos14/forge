@@ -116,6 +116,35 @@ async fn require_project_admin(tx: &mut Tx<'_>, project_id: &str, user_id: &str)
     }
 }
 
+async fn require_review_waiver_authority(
+    tx: &mut Tx<'_>,
+    task_id: &str,
+    user_id: &str,
+) -> Result<()> {
+    let authorized: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM task t
+             JOIN project_member pm ON pm.project_id = t.project_id
+             WHERE t.id = ? AND pm.user_id = ? AND pm.role IN ('owner', 'admin')
+         ) OR EXISTS (
+             SELECT 1 FROM task_role tr
+             JOIN role_membership rm ON rm.task_role_id = tr.id
+             WHERE tr.task_id = ? AND rm.actor_kind = 'human' AND rm.actor_id = ?
+               AND rm.status = 'active'
+         )",
+    )
+    .bind(task_id)
+    .bind(user_id)
+    .bind(task_id)
+    .bind(user_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    ensure(
+        authorized,
+        "review waiver requires an active Task member or Project owner/admin",
+    )
+}
+
 async fn coverage_revision(
     conn: &mut SqliteConnection,
     task_id: &str,
@@ -1830,8 +1859,9 @@ impl ReviewRangeReportRepo for SqliteDb {
 // Ledger
 // ---------------------------------------------------------------------------
 
-/// Inserts an approved Human Proposal and Decision after revalidating that every
-/// decider is a current Project owner/admin.
+/// Inserts an approved Human Proposal and Decision after revalidating current
+/// authority. Waivers allow active Task members; re-baselines and attributions
+/// remain restricted to Project owners/admins.
 async fn insert_human_decision(
     tx: &mut Tx<'_>,
     task_id: &str,
@@ -1858,7 +1888,11 @@ async fn insert_human_decision(
     )?;
     let project_id = task_project_id(tx, task_id).await?;
     for actor in &decision.actors {
-        require_project_admin(tx, &project_id, actor.id()).await?;
+        if target_kind == ProposalTargetKind::ReviewFinding {
+            require_review_waiver_authority(tx, task_id, actor.id()).await?;
+        } else {
+            require_project_admin(tx, &project_id, actor.id()).await?;
+        }
     }
     for artifact_id in &proposal.artifact_ids {
         sqlx::query(
@@ -2375,7 +2409,11 @@ impl ReviewLedgerRepo for SqliteDb {
                 && resolution.report_artifact_id.is_none()
                 && resolution.decision_id.as_deref() == Some(decision.decision.id.as_str())
                 && decision.decision.actors.contains(&resolution.actor)
-                && decision.proposal.target_digest.as_deref() == Some(finding.digest.as_str()),
+                && decision.proposal.target_digest.as_deref() == Some(finding.digest.as_str())
+                && resolution
+                    .waiver_reference
+                    .as_deref()
+                    .is_some_and(|reference| !reference.trim().is_empty()),
             "waiver must bind its exact finding and Human Decision",
         )?;
         if coverage_revision(&mut tx, &finding.task_id, &finding.repo_id).await?
@@ -2395,6 +2433,45 @@ impl ReviewLedgerRepo for SqliteDb {
         append_events(self, &mut tx, &events).await?;
         tx.commit().await?;
         Ok(resolution)
+    }
+
+    async fn pin_review_base(
+        &self,
+        base: TaskReviewBase,
+        events: Vec<CreateDomainEvent>,
+    ) -> Result<TaskReviewBase> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        ensure(
+            base.revision == 1
+                && base.decision_id.is_none()
+                && matches!(
+                    base.source,
+                    crate::ReviewBaseSource::FirstIntegration
+                        | crate::ReviewBaseSource::WorkspacePrepare
+                ),
+            "initial review base must be revision 1 from first integration or workspace preparation",
+        )?;
+        if let Some(existing) = sqlx::query(
+            "SELECT * FROM task_review_base WHERE task_id = ? AND repo_id = ?
+             ORDER BY revision LIMIT 1",
+        )
+        .bind(&base.task_id)
+        .bind(&base.repo_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(map_base)
+        .transpose()?
+        {
+            return if existing == base {
+                Ok(existing)
+            } else {
+                Err(DbError::VersionConflict)
+            };
+        }
+        insert_base(&mut tx, &base).await?;
+        append_events(self, &mut tx, &events).await?;
+        tx.commit().await?;
+        Ok(base)
     }
 
     async fn rebaseline_review(

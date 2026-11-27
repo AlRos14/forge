@@ -7,7 +7,8 @@
 
 use super::{
     copy_migrations_through, ensure_task_role, insert_test_work_unit, multirepo_seed_repo,
-    multirepo_seed_task, seed_agent, seed_project, seed_user, sqlite_db,
+    multirepo_seed_task, seed_agent, seed_agent_task_role_member, seed_project, seed_user,
+    sqlite_db,
 };
 use crate::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, run_migrations_from,
@@ -15,16 +16,16 @@ use crate::{
     ArtifactStorageKind, CollaborationRepo, CreateArtifact, CreateDecision, CreateDomainEvent,
     CreateProposal, CreateRoleMembership, CreateWorkUnit, CreateWorkspace, DbError,
     DecisionOutcome, IngestRangeReport, PageRequest, ProjectRepo, ProposalTarget,
-    ProposalTargetKind, ReviewAttributionKind, ReviewCheckpoint, ReviewCheckpointReason,
-    ReviewCheckpointRepo, ReviewCheckpointState, ReviewCorrectionLink, ReviewFinding,
-    ReviewFindingFilter, ReviewFindingLocation, ReviewFindingResolution, ReviewFindingSeverity,
-    ReviewHumanDecision, ReviewLedgerRepo, ReviewLocationAttribution, ReviewPolicyDocument,
-    ReviewPolicyRepo, ReviewPolicySource, ReviewRange, ReviewRangeContributor, ReviewRangeReport,
-    ReviewRangeReportRepo, ReviewResolutionOutcome, ReviewReworkRound, ReviewRiskClass,
-    ReviewSizeThreshold, ReviewTriggerMode, ReviewVerdict, RoleMembershipRepo,
-    RoleMembershipStatus, SortBy, SortOrder, SqliteDb, TaskRepositoryRole, TaskRepositorySetRepo,
-    TaskRepositoryWrite, UpsertQueuedReviewCheckpoint, WorkUnitReviewRange, WorkspaceRepo,
-    WorkspaceStatus, WriteProjectReviewPolicy, WriteTaskReviewPolicy,
+    ProposalTargetKind, ReviewAttributionKind, ReviewBaseSource, ReviewCheckpoint,
+    ReviewCheckpointReason, ReviewCheckpointRepo, ReviewCheckpointState, ReviewCorrectionLink,
+    ReviewFinding, ReviewFindingFilter, ReviewFindingLocation, ReviewFindingResolution,
+    ReviewFindingSeverity, ReviewHumanDecision, ReviewLedgerRepo, ReviewLocationAttribution,
+    ReviewPolicyDocument, ReviewPolicyRepo, ReviewPolicySource, ReviewRange,
+    ReviewRangeContributor, ReviewRangeReport, ReviewRangeReportRepo, ReviewResolutionOutcome,
+    ReviewReworkRound, ReviewRiskClass, ReviewSizeThreshold, ReviewTriggerMode, ReviewVerdict,
+    RoleMembershipRepo, RoleMembershipStatus, SortBy, SortOrder, SqliteDb, TaskRepositoryRole,
+    TaskRepositorySetRepo, TaskRepositoryWrite, UpsertQueuedReviewCheckpoint, WorkUnitReviewRange,
+    WorkspaceRepo, WorkspaceStatus, WriteProjectReviewPolicy, WriteTaskReviewPolicy,
 };
 use sqlx::SqlitePool;
 
@@ -173,6 +174,7 @@ async fn world_keeping(execution_guards: &[&str]) -> World {
         .expect("Task exists");
     let producer = seed_agent(&db, "range producer", "global", None).await;
     let reviewer = seed_agent(&db, "range reviewer", "global", None).await;
+    seed_agent_task_role_member(&db, &task, "implementer", &producer).await;
     let producer_unit =
         insert_test_work_unit(&db, &task, &producer, "implementer", true, Some(&producer)).await;
     ensure_task_role(&db, &task, "reviewer").await;
@@ -748,11 +750,15 @@ async fn reported(w: &World, active: &Activated) -> Reported {
     }
 }
 
-fn waiver(w: &World, finding: &ReviewFinding) -> (ReviewHumanDecision, ReviewFindingResolution) {
+fn waiver_for(
+    w: &World,
+    finding: &ReviewFinding,
+    actor_id: &str,
+) -> (ReviewHumanDecision, ReviewFindingResolution) {
     let now = now_rfc3339();
     let proposal_id = new_uuid_v4();
     let decision_id = new_uuid_v4();
-    let actor = ActorRef::Human(w.owner.clone());
+    let actor = ActorRef::Human(actor_id.to_owned());
     (
         ReviewHumanDecision {
             proposal: CreateProposal {
@@ -803,6 +809,10 @@ fn waiver(w: &World, finding: &ReviewFinding) -> (ReviewHumanDecision, ReviewFin
             created_at: now,
         },
     )
+}
+
+fn waiver(w: &World, finding: &ReviewFinding) -> (ReviewHumanDecision, ReviewFindingResolution) {
+    waiver_for(w, finding, &w.owner)
 }
 
 #[tokio::test]
@@ -1084,6 +1094,58 @@ async fn review_range_policy_writes_are_versioned_authorized_and_copied() {
         .expect("default is copied at creation");
     assert_eq!(copied.source, ReviewPolicySource::ProjectDefault);
     assert_eq!(copied.digest, digest('d'));
+}
+
+#[tokio::test]
+async fn review_range_initial_base_writer_pins_once_and_replays_exactly() {
+    let w = world().await;
+    ReviewPolicyRepo::write_task_review_policy(&w.db, policy_write(&w, None, 'a'))
+        .await
+        .expect("policy");
+    let initial_revision = coverage_revision(&w).await;
+    let base = crate::TaskReviewBase {
+        task_id: w.task.clone(),
+        repo_id: w.repo.clone(),
+        revision: 1,
+        base_commit: "base-sha".to_owned(),
+        base_tree: "base-tree".to_owned(),
+        source: ReviewBaseSource::WorkspacePrepare,
+        decision_id: None,
+        pinned_at: now_rfc3339(),
+    };
+    let pinned = ReviewLedgerRepo::pin_review_base(&w.db, base.clone(), Vec::new())
+        .await
+        .expect("initial base pins");
+    assert_eq!(pinned, base);
+    assert_eq!(coverage_revision(&w).await, initial_revision + 1);
+    assert_eq!(
+        ReviewLedgerRepo::pin_review_base(&w.db, base.clone(), Vec::new())
+            .await
+            .expect("exact retry replays"),
+        base
+    );
+    assert_eq!(coverage_revision(&w).await, initial_revision + 1);
+
+    let mut conflicting = base.clone();
+    conflicting.base_commit = "different-base".to_owned();
+    let conflict = ReviewLedgerRepo::pin_review_base(&w.db, conflicting, Vec::new())
+        .await
+        .expect_err("a repository's first base is immutable");
+    assert!(matches!(conflict, DbError::VersionConflict));
+
+    let outside_repo = multirepo_seed_repo(&w.db, &w.project, "review-outside-task").await;
+    let outside_task_repo = crate::TaskReviewBase {
+        repo_id: outside_repo,
+        ..base
+    };
+    let outside = ReviewLedgerRepo::pin_review_base(&w.db, outside_task_repo, Vec::new())
+        .await
+        .expect_err("a base cannot pin a repository outside the current Task set");
+    assert!(matches!(
+        outside,
+        DbError::Check(message)
+            if message == "Review base must be sequential, writable and Human-authorized after revision 1"
+    ));
 }
 
 #[tokio::test]
@@ -1450,6 +1512,108 @@ async fn review_range_report_ledger_is_atomic_and_p0_is_never_waivable() {
         )
         .await,
         "review_finding is immutable",
+    );
+}
+
+#[tokio::test]
+async fn review_range_waiver_accepts_active_task_member_and_rejects_nonmember() {
+    let w = world().await;
+    let active = activated(&w).await;
+    let report = reported(&w, &active).await;
+    let coverage = coverage_revision(&w).await;
+
+    let nonmember = seed_user(&w.db).await;
+    let (decision, resolution) = waiver_for(&w, &report.p1, &nonmember);
+    let refused =
+        ReviewLedgerRepo::waive_review_finding(&w.db, coverage, decision, resolution, Vec::new())
+            .await
+            .expect_err("a Human without Task membership cannot waive");
+    assert!(matches!(
+        refused,
+        DbError::Check(message)
+            if message == "review waiver requires an active Task member or Project owner/admin"
+    ));
+
+    // Seed an otherwise exact approved Decision directly to exercise the SQL
+    // resolution guard independently of the repository authority check.
+    let (decision, resolution) = waiver_for(&w, &report.p1, &nonmember);
+    let decision_id = decision.decision.id.clone();
+    CollaborationRepo::create_proposal(
+        &w.db,
+        decision.proposal,
+        event(&w.task, &w.owner, &report.p1.id),
+    )
+    .await
+    .expect("proposal fixture");
+    CollaborationRepo::create_decision(
+        &w.db,
+        decision.decision,
+        event(&w.task, &w.owner, &decision_id),
+    )
+    .await
+    .expect("decision fixture");
+    let unauthorized_resolution = execute(
+        w.db.pool(),
+        "INSERT INTO review_finding_resolution (
+            id, finding_id, task_id, repo_id, outcome, anchor_commit, report_artifact_id,
+            decision_id, waiver_reference, evidence, actor_kind, actor_id, created_at
+         ) VALUES (?, ?, ?, ?, 'waived', ?, NULL, ?, 'RISK-1', 'accepted', 'human', ?, ?)",
+        &[
+            &resolution.id,
+            &resolution.finding_id,
+            &resolution.task_id,
+            &resolution.repo_id,
+            &resolution.anchor_commit,
+            &decision_id,
+            &nonmember,
+            &resolution.created_at,
+        ],
+    )
+    .await;
+    assert_rejected(
+        unauthorized_resolution,
+        "FORGE_REVIEW_FINDING_RESOLUTION_NOT_AUTHORIZED",
+    );
+
+    let member = seed_user(&w.db).await;
+    ensure_task_role(&w.db, &w.task, "waiver_approver").await;
+    let role_id: String = sqlx::query_scalar(
+        "SELECT id FROM task_role WHERE task_id = ? AND role = 'waiver_approver'",
+    )
+    .bind(&w.task)
+    .fetch_one(w.db.pool())
+    .await
+    .expect("waiver TaskRole");
+    let now = now_rfc3339();
+    RoleMembershipRepo::add(
+        &w.db,
+        CreateRoleMembership {
+            id: new_uuid_v4(),
+            task_role_id: role_id,
+            actor_kind: ActorKind::Human,
+            actor_id: member.clone(),
+            status: RoleMembershipStatus::Active,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("active Human Task membership");
+    let (decision, resolution) = waiver_for(&w, &report.p1, &member);
+    ReviewLedgerRepo::waive_review_finding(
+        &w.db,
+        coverage_revision(&w).await,
+        decision,
+        resolution.clone(),
+        Vec::new(),
+    )
+    .await
+    .expect("active Task member can waive P1");
+    assert_eq!(
+        ReviewLedgerRepo::list_review_finding_resolutions(&w.db, &report.p1.id)
+            .await
+            .expect("resolutions"),
+        vec![resolution]
     );
 }
 
