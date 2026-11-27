@@ -222,6 +222,9 @@ async fn apply_project_scope(
         if task_mutation_tool(tool_name) {
             require_project_write_access(state, &task.project_id, user_id).await?;
         }
+        if tool_name == "forge_set_task_review_policy" {
+            require_project_admin_access(state, &task.project_id, user_id).await?;
+        }
         if matches!(
             tool_name,
             "forge_add_task_dependency" | "forge_remove_task_dependency"
@@ -371,6 +374,10 @@ fn task_mutation_tool(tool_name: &str) -> bool {
             | "forge_add_task_role_member"
             | "forge_create_task_gate"
             | "forge_create_work_unit"
+            | "forge_request_range_review"
+            | "forge_retry_review_checkpoint"
+            | "forge_attribute_review_commits"
+            | "forge_rebaseline_review"
     )
 }
 
@@ -408,6 +415,16 @@ fn task_scope_field(tool_name: &str) -> Option<&'static str> {
         "forge_create_sub_tasks" => Some("parent_task_id"),
         "forge_create_work_unit" | "forge_list_work_units" => Some("task_id"),
         "forge_get_task"
+        | "forge_get_review_coverage"
+        | "forge_get_task_review_policy"
+        | "forge_set_task_review_policy"
+        | "forge_request_range_review"
+        | "forge_waive_review_finding"
+        | "forge_list_review_checkpoints"
+        | "forge_retry_review_checkpoint"
+        | "forge_attribute_review_commits"
+        | "forge_rebaseline_review"
+        | "forge_list_review_findings"
         | "forge_update_task"
         | "forge_get_task_diff"
         | "forge_list_executions"

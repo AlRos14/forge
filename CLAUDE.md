@@ -23,6 +23,13 @@ PR0–PR15 are merged. The current implementation uses the Actor and harness orc
 
 Current delivery capabilities include a coordinator verification lane with deterministic validation and Gate required checks, plus structured Human decision requests. The PR feedback and rework loop uses GitHub SCM credentials encrypted by CredentialService. PR external actions require Human approval by default; automatic push or summary actions require an owner/admin repository policy, and merge always remains a Human decision. Coordination envelope v2 supports preauthorized fallback Agents, bounded micro-fixes, and coordinator replans; Rust classifies scope and authority changes, and a change requires the exact Human decision before materialization.
 
+Optional versioned Project-default and Task review policies schedule exact
+per-repository commit-range reviews and expose derived coverage. A Task with a
+review policy requires matching Gate v4 coverage evidence for merge readiness;
+Tasks without a policy retain the current behavior. Human review findings,
+commit attribution, waivers, and re-baselines remain subject to exact
+Task/Project authority and durable evidence.
+
 Project Copilot is a separate, explicit Project-to-Agent assignment with durable
 Project management runs and conversation. It uses the selected installed
 harness and a live Project-scoped MCP delegation. It creates no placeholder
@@ -113,8 +120,8 @@ web/ → REST API and authenticated SSE
 - Concurrent repository WorkUnits use separate workspaces and explicit leases. Integration is a separate serialized operation.
 - SQLite and numbered migrations are current persistence.
 - TaskLifecycleService owns aggregate Task state. task.status was removed in V129.
-- Formal Review uses a reviewer WorkUnit with an exact result subject and a ReviewReport Artifact. Its technical attempt records provenance. ValidationRun is deterministic evidence; Agent validation-related work remains ordinary cognitive work.
-- Gate evaluates exact immutable inputs; it does not run tests, review code, integrate, or merge.
+- Formal Review uses a reviewer WorkUnit with an exact result or frozen commit-range subject and a ReviewReport Artifact. Its technical attempt records provenance. ValidationRun is deterministic evidence; Agent validation-related work remains ordinary cognitive work.
+- Gate evaluates exact immutable inputs, including opted-in commit-range coverage; it does not run tests, review code, integrate, or merge.
 - The current Orchestrator is event-driven and has a bounded typed output set. Do not claim unsupported autonomous steering, assignment, or merge actions.
 
 Public API response changes touch the route in crates/api/src/routes/, DTOs in crates/api-types/, generated TypeScript types in web/src/types/generated/, and docs/api.md.

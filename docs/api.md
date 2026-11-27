@@ -5,8 +5,12 @@
 `POST /api/v1/work-units/{id}/review-report` accepts
 `{ "expected_version": number, "report": SubmitReviewReportRequest }` and
 returns `SubmitReviewReportResponse`. It requires the exact assigned Human
-reviewer and an available, independent, same-Task result subject. Forge derives
-the technical attempt and frozen subject; request fields cannot replace them.
+reviewer and an available, independent, same-Task subject. Result reviews use
+the legacy `findings: string[]`; range reviews must name the review range frozen
+on the reviewer WorkUnit, set `structured_findings` and `resolutions` (empty
+arrays are allowed), and leave legacy `findings` empty. Forge derives the
+technical attempt and verifies the exact frozen subject; request fields cannot
+replace it.
 For repository subjects, submission freezes each repository result and prepares
 the exact read-only WorkspaceGroup before admitting the Human review attempt.
 The Human attempt remains workspace-free.
@@ -22,7 +26,7 @@ own workspace. Gate evaluation verifies the report against the durable
 review-subject relation and source attempt. A WorkUnit-scoped review Gate
 targets the reviewed WorkUnit, rather than its separate reviewer WorkUnit.
 
-Forge exposes the versioned REST API at `/api/v1`. This reference describes the 0.9.1 public contract through migration V183 for Project, Task, Actor, TaskRole, RoleMembership, Execution, HarnessSession, WorkUnit, Workspace, collaboration, Artifact, Review, Validation, Evidence, Gate, and TaskLifecycle records. M1 adds Task and WorkUnit repository associations from V181; M2 adds grouped WorkUnit workspaces, exact per-repository Execution results, and repository-scoped review and validation projections from V182; M3 adds per-repository integration/PR batches, repository-aware dependency handoffs, and repository-set replan projections from V183.
+Forge exposes the versioned REST API at `/api/v1`. This reference describes the 0.9.1 public contract through migration V185 for Project, Task, Actor, TaskRole, RoleMembership, Execution, HarnessSession, WorkUnit, Workspace, collaboration, Artifact, Review, Validation, Evidence, Gate, and TaskLifecycle records. M1 adds Task and WorkUnit repository associations from V181; M2 adds grouped WorkUnit workspaces, exact per-repository Execution results, and repository-scoped review and validation projections from V182; M3 adds per-repository integration/PR batches, repository-aware dependency handoffs, and repository-set replan projections from V183; review ranges, coverage, policy and finding authority are recorded from V184–V185.
 
 > The orchestrator owns work. The harness owns cognition.
 
@@ -107,7 +111,7 @@ the maximum is 100.
 | `POST /projects` | Create an ordinary Project from `{ name }`. It does not create a Charter, Genesis session, baseline, Agent binding, or Task. |
 | `GET /projects` | List Projects visible to the authenticated user. |
 | `GET /projects/{id}` | Read a Project and its generic Project hook configuration. |
-| `PATCH /projects/{id}` | Update Project identity, pause state, supported generic hooks, or nullable `primary_repo_id`; include the expected `version`. The selected repository must belong to the Project. A primary change affects future Tasks only. |
+| `PATCH /projects/{id}` | Update Project identity, pause state, supported generic hooks, nullable `primary_repo_id`, or nullable `default_review_policy`; include the expected `version`. The selected repository must belong to the Project. A primary or review-policy default change affects future Tasks only. A configured review policy is copied into each new Task, not inherited live. |
 | `GET /projects/{id}/task-role-defaults`, `PUT /projects/{id}/task-role-defaults` | Read or replace the role-to-worker template copied into new ordinary Tasks. Reads require Project visibility; updates require owner/admin membership and `expected_version`. Humans must be current Project members. Agents must be owned by the canonical Project owner; global visibility alone is not consent to run an Agent from another account. |
 | `GET /projects/{id}/copilot`, `PUT /projects/{id}/copilot` | Read or assign the Project Copilot. Assignment accepts `expected_version` and nullable `agent_id`, requires current Project owner/admin authority and same-account Agent ownership. |
 | `GET /projects/{id}/copilot/messages`, `POST /projects/{id}/copilot/messages` | Read the durable Project conversation using an opaque cursor, or send `{content, idempotency_key, task_id?}`. Sending requires Project write authority and enabled MCP, returns HTTP 202 with the durable run and user message. An optional Task must belong to the same Project. |
@@ -220,6 +224,14 @@ provenance and active defaults use an exact `default_implementer` ActorRef.
 | `GET /tasks/{id}` and Task list responses | Include the active `repository_set_revision` and `repository_set_digest`, repository rows with `change_state` (`pending`, `changed`, or `unchanged`) and exact integration/merge/PR identity, plus the full `repository_merge_batches` history. Context repositories remain read-only. |
 | `GET /projects/{project_id}/tasks` | List Tasks. Filter with `lifecycle_state`, `priority`, and `q`; order with the supported Task sort fields. Task classification is not a filter. `status`, `include_cancelled`, and `include_archived` are rejected. |
 | `GET /tasks/{id}`, `PATCH /tasks/{id}`, `DELETE /tasks/{id}` | Read, update, or delete a Task. Updates require the Task `version`. |
+| `GET /tasks/{id}/review-policy`, `PUT /tasks/{id}/review-policy` | Read or set the versioned Task review policy. PUT accepts `{expected_revision?, policy}` and requires Project owner/admin authority. The Task policy is authoritative; changing a Project default does not alter existing Tasks. |
+| `GET /tasks/{id}/review-coverage` | Read per-writable-repository coverage: policy revision, base/candidate/frontier, reviewed ranges and reports, unreviewed commit count, open findings by severity, active checkpoint, status, and snapshot digest. A range is covered only when an acceptable report satisfies the policy quorum over that exact integrated range. |
+| `GET /tasks/{id}/review-checkpoints`, `POST /tasks/{id}/review-checkpoints` | List checkpoints or request a range review with `{repo_id, reason, idempotency_key}`. Forge resolves commits from durable Task/repository facts; callers cannot supply SHAs. Requests require a current review policy and a successful integrated head. |
+| `POST /tasks/{task_id}/review-checkpoints/{checkpoint_id}/retry` | Retry a blocked checkpoint with `{expected_version}`. Project owner/admin only; the service checks the current integrated head and checkpoint version. |
+| `POST /tasks/{task_id}/review-checkpoints/{checkpoint_id}/attributions` | Record `{expected_version, attributions, rationale}` for unrecorded commits. Each attribution binds a commit SHA to an ActorRef; Project owner/admin authority and an exact Human Decision are required. |
+| `GET /tasks/{id}/review-findings` | List findings with optional `repo_id`, `severity`, `open`, `cursor`, and `limit` filters. Responses include current openness, locations and attribution, triage, correction links, and resolutions. |
+| `POST /tasks/{task_id}/review-findings/{finding_id}/waiver` | Record `{expected_coverage_revision, rationale, reference}`. Requires an active Human Task-team membership or Project owner/admin authority and a non-empty reference. P0 findings cannot be waived. |
+| `POST /tasks/{id}/review-base` | Re-baseline one writable repository with `{repo_id, expected_coverage_revision, rationale}`. Project owner/admin only; Forge records a Human Decision and derives the base from repository facts. |
 | `POST /tasks/{id}/subtasks/reorder` | Reorder exact child Task IDs. |
 | `GET /tasks/{id}/dependencies`, `GET /tasks/{id}/dependents` | Read same-Project Task dependencies. |
 | `POST /tasks/{id}/dependencies` | Add a same-Project dependency using `{ depends_on_id, expected_graph_version, idempotency_key }`. Writes pass through the Project DAG service. |
@@ -553,6 +565,7 @@ table does not authorize a decision or satisfy a Gate.
 | `GET /tasks/{id}/review-executions` | List exact Executions admitted with `formal_review`, their per-repository results, and ReviewReport Artifact outputs. |
 | `GET /review-executions/{id}` | Read one exact formal Review Execution, its per-repository results, and report. |
 | `POST /review-executions/{id}` | Submit a ReviewReport to that exact reviewer Execution. Optional `reviewed_work_unit_id` and `reviewed_work_unit_version` pin the exact WorkUnit subject; both must be supplied together. |
+| `GET /work-units/{id}` and WorkUnit list responses | Include `review_range` for checkpoint reviewers, with the exact checkpoint, immutable range, digest, and frozen input finding IDs. |
 | `GET /tasks/{id}/validation-runs`, `GET /validation-runs/{id}` | List or read exact ValidationRuns. Each response includes `repo_id` resolved from its exact Workspace. |
 | `GET /evidence/{id}` | Read exact Evidence and its producer ValidationRun identity. |
 | `GET /tasks/{task_id}/artifacts`, `POST /tasks/{task_id}/artifacts` | List or create generic Artifacts with exact provenance. |
@@ -739,6 +752,12 @@ Public durable event types are:
   PR state. An individual event never advances TaskLifecycle;
 - `validation_run.started`, `validation_run.completed`, `evidence.created`,
   and `artifact.created`;
+- `task.review_policy_updated` and `review.checkpoint_created`,
+  `review.checkpoint_state_changed`, `review.range_reported`,
+  `review.findings_triaged`, `review.finding_resolved`, and
+  `review.coverage_changed`. Payloads contain only allowlisted Task/repository,
+  checkpoint/range/report/finding IDs, revisions, states, verdicts, severity
+  counts, and disposition counts; clients refetch detailed review data;
 - `project.plan_changed` for plan proposals, applies, dependency mutations, and
   batch changes. It contains only a Project ID so clients refetch the authorized
   graph rather than receiving source excerpts or instructions over SSE.
@@ -846,6 +865,15 @@ The MCP server advertises only registered tools. The current tool names are:
   updates. Reusing the key with changed request content conflicts. Mutations
   require exact expected versions where applicable and use the same domain
   services as REST.
+- Review ranges: `forge_get_review_coverage`, `forge_get_task_review_policy`,
+  `forge_set_task_review_policy`, `forge_request_range_review`,
+  `forge_list_review_checkpoints`,
+  `forge_retry_review_checkpoint`, `forge_attribute_review_commits`,
+  `forge_rebaseline_review`, `forge_list_review_findings`, and
+  `forge_waive_review_finding`. `forge_update_project` accepts
+  `default_review_policy`; `forge_submit_work_unit_review` accepts structured
+  findings and resolutions for an exact range WorkUnit. Mutations retain the
+  same Human, Project, Task-team and expected-version checks as REST.
 - Gates and evidence: `forge_create_task_gate`, `forge_get_gate`,
   `forge_revise_gate_policy`, `forge_evaluate_gate`,
   `forge_get_gate_evaluation`, `forge_list_task_review_executions`,

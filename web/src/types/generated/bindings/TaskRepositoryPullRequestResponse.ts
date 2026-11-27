@@ -10,4 +10,7 @@ export type TaskRepositoryPullRequestResponse = {
   pr_state: string
   merge_status: string
   admission_status: string
+  admitted_source_sha: string | null
+  observed_head_sha: string | null
+  result_classification: string | null
 }

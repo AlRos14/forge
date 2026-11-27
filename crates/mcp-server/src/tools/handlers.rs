@@ -1105,7 +1105,7 @@ pub(super) async fn forge_create_project(
         &new_uuid_v4(),
     )
     .await?;
-    project_value(project)
+    super::review_ranges::project_response_value(state, project).await
 }
 
 pub(super) async fn forge_get_project(
@@ -1116,7 +1116,7 @@ pub(super) async fn forge_get_project(
     let project = ProjectRepo::get_by_id(&*state.db, &params.project_id)
         .await?
         .ok_or_else(|| McpToolError::not_found("project", params.project_id))?;
-    project_value(project)
+    super::review_ranges::project_response_value(state, project).await
 }
 
 pub(super) async fn forge_update_project(
@@ -1135,6 +1135,11 @@ pub(super) async fn forge_update_project(
         return Err(McpToolError::new(-32602, "name must not be empty"));
     }
 
+    if let Some(Some(policy)) = params.default_review_policy.as_ref() {
+        services::review_range::ReviewPolicyService::validate(
+            &super::review_ranges::policy_to_db(policy.clone()),
+        )?;
+    }
     let project = services::ProjectRepositoryService::new(Arc::clone(&state.db))
         .update_project_at_version(
             UpdateProject {
@@ -1150,7 +1155,22 @@ pub(super) async fn forge_update_project(
             user_id,
         )
         .await?;
-    project_value(project)
+    if let Some(policy) = params.default_review_policy {
+        let current =
+            db::ReviewPolicyRepo::get_project_review_policy(&*state.db, &project.id).await?;
+        services::review_range::ReviewPolicyService::new(
+            Arc::clone(&state.db),
+            super::review_ranges::workspace_root(),
+        )
+        .set_project_default(
+            user_id,
+            &project.id,
+            current.as_ref().map(|row| row.version),
+            policy.map(super::review_ranges::policy_to_db),
+        )
+        .await?;
+    }
+    super::review_ranges::project_response_value(state, project).await
 }
 
 pub(super) async fn forge_update_task_repositories(

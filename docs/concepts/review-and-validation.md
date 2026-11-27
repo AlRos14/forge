@@ -121,6 +121,45 @@ valid result, but it does not accept the reviewed implementation and does not
 satisfy an approval Gate. A technical reviewer failure produces no valid
 negative report.
 
+## Commit-range review and coverage
+
+An optional, versioned Task review policy adds a repository-level review
+cursor. A Project may store a default policy; Forge copies that value when it
+creates a Task, so later Project changes do not change existing Tasks. The
+Task policy is the authority for its coverage requirement, trigger mode,
+reviewer role, quorum and checkpoint limit. No policy preserves the existing
+review behavior. R0 does not require coverage; R1 and R2 do.
+
+The first successful Task integration pins the repository review base from its
+`target_before_sha`. A checkpoint freezes a range from that base or the covered
+frontier to an exact successful integration head. A caller may request a
+checkpoint by repository and reason, but cannot choose either commit. Each
+checkpoint creates reviewer WorkUnits with a single-repository read-only
+range, its digest, and frozen input findings. Result-review WorkUnits remain
+available for non-repository deliverables; repository-backed range review does
+not review a sequence of implementation WorkUnits one by one.
+
+Coverage is derived per writable repository from the exact base, candidate,
+integrated range graph, acceptable report quorum and open findings. The API
+reports reviewed ranges and reports, the covered frontier, unreviewed commit
+count, P0–P3 counts, active checkpoint, status and snapshot digest. A changed
+repository is covered when valid reviewed ranges connect its pinned base to its
+current integrated candidate and no P0/P1 finding remains open. History
+rewrites, unknown bases and unrecorded commits fail closed. ValidationRun
+evidence stays separate and does not substitute for review coverage.
+
+Range reports use `structured_findings` and `resolutions`; both can be empty,
+and the legacy string `findings` must be empty for this report kind. Finding
+locations are checked against the frozen range. A finding remains open until a
+valid later range resolves it or a Human waiver is recorded. Waiver requires an
+active Human Task member or Project owner/admin, a rationale and a non-empty
+reference. P0 is never waivable. Commit attribution and re-baselining are
+owner/admin Human decisions with exact version or coverage-revision checks.
+
+The Task review panel shows the policy and per-repository coverage summary.
+SSE review events are invalidation hints; clients fetch the authoritative
+policy, checkpoint, finding and coverage records over REST.
+
 A typed approval requirement follows a durable review line from its source
 result through exact correction and review rounds. It is satisfied only by a
 favorable report over the latest result on that line. A pass over an earlier

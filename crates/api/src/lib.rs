@@ -352,6 +352,40 @@ pub fn api_router(state: AppState) -> Router {
                 .delete(routes::tasks::delete_task),
         )
         .route(
+            "/api/v1/tasks/{id}/review-policy",
+            get(routes::review_ranges::get_task_review_policy)
+                .put(routes::review_ranges::set_task_review_policy),
+        )
+        .route(
+            "/api/v1/tasks/{id}/review-coverage",
+            get(routes::review_ranges::get_task_review_coverage),
+        )
+        .route(
+            "/api/v1/tasks/{id}/review-checkpoints",
+            get(routes::review_ranges::list_task_review_checkpoints)
+                .post(routes::review_ranges::create_task_review_checkpoint),
+        )
+        .route(
+            "/api/v1/tasks/{task_id}/review-checkpoints/{checkpoint_id}/retry",
+            post(routes::review_ranges::retry_task_review_checkpoint),
+        )
+        .route(
+            "/api/v1/tasks/{task_id}/review-checkpoints/{checkpoint_id}/attributions",
+            post(routes::review_ranges::attribute_task_review_commits),
+        )
+        .route(
+            "/api/v1/tasks/{id}/review-findings",
+            get(routes::review_ranges::list_task_review_findings),
+        )
+        .route(
+            "/api/v1/tasks/{task_id}/review-findings/{finding_id}/waiver",
+            post(routes::review_ranges::waive_task_review_finding),
+        )
+        .route(
+            "/api/v1/tasks/{id}/review-base",
+            post(routes::review_ranges::rebaseline_task_review),
+        )
+        .route(
             "/api/v1/tasks/{id}/repositories",
             patch(routes::tasks::update_task_repositories),
         )

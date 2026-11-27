@@ -8,9 +8,10 @@ use api_types::{
 use db::{
     ActorKind, Agent, CoordinationMode as DbCoordinationMode, Daemon, Execution, ExecutionRepo,
     Page, PageRequest, PrMetadataRepo, Project, Repo, RoleMembership, RoleMembershipRepo, SortBy,
-    SortOrder, Task, TaskLifecycleRepo, TaskLifecycleState as DbTaskLifecycleState,
-    TaskRepositoryMergeBatchRepo, TaskRepositorySetRepo, TaskRoleRepo, WorkUnitRepo,
-    WorkUnitRepositoryIntegrationRepo, Workspace, WorkspaceRepo,
+    SortOrder, Task, TaskIntegrationOperationRepo, TaskLifecycleRepo,
+    TaskLifecycleState as DbTaskLifecycleState, TaskRepositoryMergeBatchRepo,
+    TaskRepositorySetRepo, TaskRoleRepo, WorkUnitRepo, WorkUnitRepositoryIntegrationRepo,
+    Workspace, WorkspaceRepo,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -49,6 +50,7 @@ pub mod projects;
 pub mod provider_authorizations;
 pub mod providers;
 pub mod repos;
+pub mod review_ranges;
 pub mod reviews;
 pub mod settings;
 pub mod task_coordination;
@@ -119,13 +121,16 @@ pub fn paginated<T, U>(page: Page<T>, map: impl Fn(T) -> U) -> PaginatedResponse
     }
 }
 
-pub fn project_response(project: Project) -> ApiResult<ProjectResponse> {
+pub async fn project_response(db: &db::SqliteDb, project: Project) -> ApiResult<ProjectResponse> {
     let project_hooks = parse_project_hooks_json(&project.project_hooks_json).map_err(|error| {
         ApiError::internal(format!(
             "invalid persisted project hooks for project {}: {error}",
             project.id
         ))
     })?;
+    let default_review_policy = db::ReviewPolicyRepo::get_project_review_policy(db, &project.id)
+        .await?
+        .map(review_ranges::project_policy_response);
     Ok(ProjectResponse {
         id: project.id,
         name: project.name,
@@ -137,7 +142,7 @@ pub fn project_response(project: Project) -> ApiResult<ProjectResponse> {
         paused_at: project.paused_at.clone(),
         paused: project.paused_at.is_some(),
         version: project.version,
-        default_review_policy: None,
+        default_review_policy,
     })
 }
 
@@ -237,6 +242,12 @@ async fn task_response_inner(db: &db::SqliteDb, task: Task) -> ApiResult<TaskRes
     let mut pull_requests_by_id = BTreeMap::new();
     for pr in prs {
         if let Some(repo_id) = pr.repo_id.clone() {
+            let admission = match pr.task_merge_operation_id.as_deref() {
+                Some(operation_id) => {
+                    TaskIntegrationOperationRepo::get_remote_pr_admission(db, operation_id).await?
+                }
+                None => None,
+            };
             pull_requests_by_id.insert(
                 pr.id.clone(),
                 api_types::TaskRepositoryPullRequestResponse {
@@ -249,6 +260,15 @@ async fn task_response_inner(db: &db::SqliteDb, task: Task) -> ApiResult<TaskRes
                     pr_state: pr.pr_state,
                     merge_status: pr.merge_status,
                     admission_status: pr.admission_status,
+                    admitted_source_sha: admission
+                        .as_ref()
+                        .map(|value| value.admitted_source_sha.clone()),
+                    observed_head_sha: admission
+                        .as_ref()
+                        .and_then(|value| value.observed_head_sha.clone()),
+                    result_classification: admission
+                        .as_ref()
+                        .and_then(|value| value.result_classification.clone()),
                 },
             );
         }

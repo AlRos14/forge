@@ -173,9 +173,80 @@ fn project_domain_event(event: &DomainEvent) -> Option<PublicEventEnvelope> {
                 "state",
                 "admission_status",
                 "pr_state",
+                "admitted_source_sha",
+                "observed_head_sha",
+                "result_classification",
                 "version",
             ],
         ),
+        "task.review_policy_updated" => project_fields(
+            &source,
+            &["task_id", "revision", "risk_class", "coverage_required"],
+        ),
+        "review.checkpoint_created" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "repo_id",
+                "checkpoint_id",
+                "state",
+                "reasons",
+                "attempt",
+            ],
+        ),
+        "review.checkpoint_state_changed" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "repo_id",
+                "checkpoint_id",
+                "from_state",
+                "state",
+                "version",
+                "blocked_code",
+            ],
+        ),
+        "review.range_reported" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "repo_id",
+                "checkpoint_id",
+                "range_id",
+                "report_artifact_id",
+                "verdict",
+                "p0",
+                "p1",
+                "p2",
+                "p3",
+            ],
+        ),
+        "review.findings_triaged" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "report_artifact_id",
+                "request_id",
+                "correct",
+                "recheck",
+                "human",
+                "defer",
+            ],
+        ),
+        "review.finding_resolved" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "repo_id",
+                "finding_id",
+                "severity",
+                "outcome",
+                "resolution_id",
+            ],
+        ),
+        "review.coverage_changed" => {
+            project_fields(&source, &["task_id", "repo_id", "revision", "status"])
+        }
         "project.plan_proposed"
         | "project.plan_applied"
         | "project.plan_dependencies_changed"
@@ -561,6 +632,13 @@ fn public_domain_event_type(event_type: &str) -> Option<PublicEventType> {
         }
         "task.repository_merge_batch_changed" => PublicEventType::TaskRepositoryMergeBatchChanged,
         "task.repository_pr_status_changed" => PublicEventType::TaskRepositoryPrStatusChanged,
+        "task.review_policy_updated" => PublicEventType::TaskReviewPolicyUpdated,
+        "review.checkpoint_created" => PublicEventType::ReviewCheckpointCreated,
+        "review.checkpoint_state_changed" => PublicEventType::ReviewCheckpointStateChanged,
+        "review.range_reported" => PublicEventType::ReviewRangeReported,
+        "review.findings_triaged" => PublicEventType::ReviewFindingsTriaged,
+        "review.finding_resolved" => PublicEventType::ReviewFindingResolved,
+        "review.coverage_changed" => PublicEventType::ReviewCoverageChanged,
         "gate.created" => PublicEventType::GateCreated,
         "gate.policy_revised" => PublicEventType::GatePolicyRevised,
         "gate.evaluated" => PublicEventType::GateEvaluated,

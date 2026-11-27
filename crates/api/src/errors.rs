@@ -267,6 +267,7 @@ impl From<ServiceError> for ApiError {
                     || code == "validation.catalog_forbidden"
                     || code == "human_decision.authority_required"
                     || code == "pr_feedback.policy_forbidden"
+                    || code == "review.range.not_permitted"
                 {
                     StatusCode::FORBIDDEN
                 } else if code.ends_with("host_unavailable") {
@@ -284,11 +285,34 @@ impl From<ServiceError> for ApiError {
                             | "pr_feedback.extend_out_of_scope"
                             | "pr_feedback.plan_without_extend"
                             | "review.report.invalid_findings"
+                            | "review.policy.invalid"
+                            | "review.finding.not_waivable"
+                            | "review.finding.rework_requires_human"
+                            | "review.range.repo_not_writable"
                     )
                 {
                     StatusCode::UNPROCESSABLE_ENTITY
-                } else if code.ends_with("budget_exhausted") {
+                } else if code.ends_with("budget_exhausted")
+                    || code == "review.checkpoint.limit_reached"
+                {
                     StatusCode::TOO_MANY_REQUESTS
+                } else if matches!(
+                    code,
+                    "review.policy.version_conflict"
+                        | "review.checkpoint.version_conflict"
+                        | "review.coverage.version_conflict"
+                        | "review.coverage.base_unknown"
+                        | "review.coverage.base_not_ancestor"
+                        | "review.coverage.facts_stale"
+                        | "review.range.nothing_to_review"
+                        | "review.range.checkpoint_active"
+                        | "review.range.unrecorded_commits"
+                        | "review.range.head_not_integrated"
+                        | "review.checkpoint.reviewer_unavailable"
+                        | "review.report.subject_mismatch"
+                        | "review.report.questions"
+                ) {
+                    StatusCode::CONFLICT
                 } else {
                     StatusCode::CONFLICT
                 };

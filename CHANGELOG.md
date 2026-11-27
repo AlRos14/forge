@@ -44,6 +44,11 @@ source version is 0.9.1.
   wire representation and select all writable Task repositories; selections are
   validated against the effective Task set, shown in REST/MCP plan reads, and
   persisted with the WorkUnit's immutable repository-set pin.
+- Add optional versioned Project-default and Task review policies, immutable
+  per-repository commit-range checkpoints, structured findings and resolutions,
+  review coverage projections, waiver/attribution/re-baseline decisions, and
+  coverage-aware merge-readiness Gates. REST, MCP, SSE and the Task review panel
+  expose the new review surfaces.
 
 ### Fixed
 
@@ -66,6 +71,11 @@ source version is 0.9.1.
 
 ### Changed
 
+- For Tasks with an opted-in review policy, merge-readiness now requires Gate
+  schema v4 coverage evidence for each changed writable repository. Existing
+  Tasks without a policy keep their current behavior. `TaskReviewDisposition`
+  adds `defer` for non-blocking P2/P3 range findings; exhaustive clients must
+  handle the new enum value. P0/P1 findings cannot be deferred or waived.
 - Suspending or ending a Task RoleMembership no longer makes a current
   coordination authorization stale. When the change only removes an active
   member and the coordinator stays active, Forge refreshes the authorization in

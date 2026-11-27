@@ -102,6 +102,9 @@ import type {
   GateResponse,
   GateEvaluationResponse,
   ReviewLineResponse,
+  TaskReviewPolicyResponse,
+  TaskReviewCoverageResponse,
+  ListReviewCheckpointsResponse,
   UpdateAgentRequest,
   UpdateProjectRequest,
   UpdateProjectTaskRoleDefaultsRequest,
@@ -643,6 +646,31 @@ export function useTaskReviewLinesQuery(taskId: string) {
     queryFn: () => apiFetch<ReviewLineResponse[]>(`/tasks/${taskId}/review-lines`),
     enabled: Boolean(taskId),
     refetchInterval: 5_000,
+  })
+}
+
+export function useTaskReviewPolicyQuery(taskId: string) {
+  return useQuery({
+    queryKey: qk.reviewPolicy(taskId),
+    queryFn: () => apiFetch<TaskReviewPolicyResponse>(`/tasks/${taskId}/review-policy`),
+    enabled: Boolean(taskId),
+  })
+}
+
+export function useTaskReviewCoverageQuery(taskId: string) {
+  return useQuery({
+    queryKey: qk.reviewCoverage(taskId),
+    queryFn: () => apiFetch<TaskReviewCoverageResponse>(`/tasks/${taskId}/review-coverage`),
+    enabled: Boolean(taskId),
+  })
+}
+
+export function useTaskReviewCheckpointsQuery(taskId: string) {
+  return useQuery({
+    queryKey: qk.reviewCheckpoints(taskId),
+    queryFn: () =>
+      apiFetch<ListReviewCheckpointsResponse>(`/tasks/${taskId}/review-checkpoints?limit=50`),
+    enabled: Boolean(taskId),
   })
 }
 

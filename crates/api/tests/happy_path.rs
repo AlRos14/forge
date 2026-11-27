@@ -11,10 +11,11 @@ use api::{build_router, AppState};
 use api_types::{
     ActorRef, AgentResponse, CreateTerminalSessionResponse, DaemonRegisterResponse, DaemonResponse,
     ExecutionResponse, ExecutionStatus, GateEvaluationResponse, GateResponse,
-    MergeAfterGateResponse, PaginatedResponse, ProjectResponse, RepoResponse, ReviewReportVerdict,
-    SubmitReviewReportResponse, TaskLifecycleResponse, TaskLifecycleState, TaskResponse,
-    TerminalAttachTokenResponse, TerminalServerFrame, TerminalSessionResponse,
-    TerminalSessionStatus, WorkUnitIntegrationResponse, WorkUnitResponse,
+    MergeAfterGateResponse, PaginatedResponse, ProjectResponse, RepoResponse,
+    ReviewCheckpointResponse, ReviewReportVerdict, SubmitReviewReportResponse,
+    TaskLifecycleResponse, TaskLifecycleState, TaskResponse, TaskReviewCoverageResponse,
+    TaskReviewPolicyResponse, TerminalAttachTokenResponse, TerminalServerFrame,
+    TerminalSessionResponse, TerminalSessionStatus, WorkUnitIntegrationResponse, WorkUnitResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -523,6 +524,251 @@ async fn forge_happy_path_end_to_end() {
             .all(|event| event.event_type != PROJECT_HOOK_RUN_CHANGED_EVENT),
         "no project_hook.run_changed events are emitted when no hooks are configured"
     );
+}
+
+#[tokio::test]
+async fn review_range_policy_set_integration_coverage_gap_report_ok() {
+    let repo_dir = TestDir::new("forge-review-range-repo");
+    let repo_path = setup_git_repo(repo_dir.path()).await;
+    let default_branch = run_git(&repo_path, &["symbolic-ref", "--short", "HEAD"]);
+    let workspaces_root = TestDir::new("forge-review-range-workspaces");
+    let harness = test_app(workspaces_root.path()).await;
+
+    let project: ProjectResponse = json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        json!({ "name": "Review Range" }),
+        StatusCode::OK,
+    )
+    .await;
+    let repo: RepoResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/repos", project.id),
+        json!({
+            "name": "repo",
+            "local_path": repo_path.to_string_lossy(),
+            "remote_url": repo_path.to_string_lossy(),
+            "default_branch": default_branch
+        }),
+        StatusCode::OK,
+    )
+    .await;
+
+    let daemon_id = register_daemon_and_report_shell(&harness.app, workspaces_root.path()).await;
+    let agent: AgentResponse = json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/agents",
+        json!({
+            "name": "review-range-shell-agent",
+            "executor_type": "shell",
+            "daemon_id": daemon_id,
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let task: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/tasks", project.id),
+        json!({
+            "title": "Review an integrated range",
+            "description": "write and commit review-range.txt"
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    assign_test_user_as_reviewer(&harness.state, &task.id).await;
+    assign_agent_as_implementer(&harness.state, &task.id, &agent.id).await;
+
+    let _: TaskReviewPolicyResponse = json_request(
+        &harness.app,
+        Method::PUT,
+        &format!("/api/v1/tasks/{}/review-policy", task.id),
+        json!({
+            "expected_revision": null,
+            "policy": {
+                "schema_version": 1,
+                "risk_class": "r1",
+                "coverage_required": true,
+                "trigger_mode": "manual",
+                "reviewer_role": "reviewer",
+                "required_reviewers": 1,
+                "require_human": true,
+                "size_threshold": {"changed_lines": 800, "changed_files": 25},
+                "coordinator_may_request": false,
+                "max_checkpoints_per_repo": 8
+            }
+        }),
+        StatusCode::OK,
+    )
+    .await;
+
+    let work_unit = common::create_allocated_work_unit(
+        &harness.app,
+        &task.id,
+        "implementer",
+        &agent.id,
+        "Write the review range change",
+        "Create and commit review-range.txt",
+        true,
+    )
+    .await;
+    let execution = common::launch_work_unit_execution(
+        &harness.app,
+        &task.id,
+        &work_unit,
+        Some("printf 'covered by a commit range\\n' > review-range.txt && git add review-range.txt && git commit -m review-range"),
+    )
+    .await;
+    poll_until_execution_completed(&harness.state.db, &execution.id).await;
+    let current: WorkUnitResponse = empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/work-units/{}", work_unit.id),
+        StatusCode::OK,
+    )
+    .await;
+    let _: WorkUnitResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/work-units/{}/status", work_unit.id),
+        json!({ "expected_version": current.version, "status": "completed" }),
+        StatusCode::OK,
+    )
+    .await;
+    let integration: WorkUnitIntegrationResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/work-units/{}/integrations", work_unit.id),
+        json!({
+            "execution_id": execution.id,
+            "idempotency_key": "review-range-integration"
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        integration.outcome,
+        api_types::WorkUnitIntegrationOutcome::Success
+    );
+
+    services::review_range::ReviewPolicyService::new(
+        Arc::clone(&harness.state.db),
+        workspaces_root.path().to_path_buf(),
+    )
+    .pin_base(&task.id, &repo.id)
+    .await
+    .expect("first successful integration pins the review base")
+    .expect("the successful integration has a resolvable base");
+
+    let gap: TaskReviewCoverageResponse = empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}/review-coverage", task.id),
+        StatusCode::OK,
+    )
+    .await;
+    let repo_gap = gap
+        .repositories
+        .iter()
+        .find(|coverage| coverage.repo_id == repo.id)
+        .expect("Task coverage includes its writable repository");
+    assert_eq!(repo_gap.status, api_types::ReviewCoverageStatus::Uncovered);
+    assert!(repo_gap.unreviewed_commits > 0);
+
+    let checkpoint: ReviewCheckpointResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/review-checkpoints", task.id),
+        json!({
+            "repo_id": repo.id,
+            "reason": "Exercise the integrated range review path",
+            "idempotency_key": "review-range-checkpoint"
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(checkpoint.state, api_types::ReviewCheckpointState::Pending);
+    let review_work_unit_id = checkpoint
+        .review_work_unit_ids
+        .first()
+        .expect("checkpoint creates its reviewer WorkUnit")
+        .clone();
+    let review_work_unit: WorkUnitResponse = json_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/work-units/{review_work_unit_id}"),
+        json!(null),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        review_work_unit
+            .review_range
+            .as_ref()
+            .map(|review| review.checkpoint_id.as_str()),
+        Some(checkpoint.id.as_str())
+    );
+
+    let allocated_review: WorkUnitResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/work-units/{review_work_unit_id}/allocation"),
+        json!({
+            "expected_version": review_work_unit.version,
+            "role": "reviewer",
+            "assigned_actor": {"kind": "human", "id": "test-user-id"}
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let review: SubmitReviewReportResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/work-units/{review_work_unit_id}/review-report"),
+        json!({
+            "expected_version": allocated_review.version,
+            "report": {
+                "verdict": "pass",
+                "summary": "The integrated commit range satisfies the requested change.",
+                "criteria": ["review-range.txt is committed"],
+                "findings": [],
+                "questions": [],
+                "evidence_ids": [],
+                "artifact_ids": [],
+                "structured_findings": [],
+                "resolutions": []
+            }
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(review.report.kind, api_types::ArtifactKind::ReviewReport);
+
+    let covered: TaskReviewCoverageResponse = empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}/review-coverage", task.id),
+        StatusCode::OK,
+    )
+    .await;
+    let repo_coverage = covered
+        .repositories
+        .iter()
+        .find(|coverage| coverage.repo_id == repo.id)
+        .expect("Task coverage still includes its writable repository");
+    assert_eq!(
+        repo_coverage.status,
+        api_types::ReviewCoverageStatus::Satisfied
+    );
+    assert_eq!(repo_coverage.unreviewed_commits, 0);
+    assert!(repo_coverage.ranges.iter().any(|range| range
+        .reports
+        .iter()
+        .any(|report| report.report_artifact_id == review.report.id)));
 }
 
 #[tokio::test]

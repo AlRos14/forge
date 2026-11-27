@@ -1598,7 +1598,9 @@ export function TaskCoordinationPanel({
                   ? 'Findings confirmed for correction'
                   : triage.disposition === 'recheck'
                     ? 'Fresh review WorkUnit recorded'
-                    : 'Human decision requested'}
+                    : triage.disposition === 'defer'
+                      ? 'Findings deferred for follow-up'
+                      : 'Human decision requested'}
               </p>
               <p className="mt-2 whitespace-pre-wrap">{triage.rationale}</p>
               <p className="mt-2 whitespace-pre-wrap text-muted-foreground">

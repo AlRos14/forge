@@ -38,6 +38,16 @@ completion is not integration.
 
 Gate policy schema version 2 may include required_checks. Each entry pins an exact check_key and definition_digest with required_outcome=passed. Evaluation resolves the run against the exact candidate Workspace, commit, and snapshot. Missing, stale, failed, ambiguous, or differently pinned runs do not satisfy the requirement; Gate never substitutes a latest run. Schema version 1 keeps its existing behavior and does not accept required_checks.
 
+For a Task with a review policy, merge-readiness uses Gate schema v4 and pins
+`review_coverage: { review_policy_revision, review_policy_digest }`. Forge
+captures exact per-repository coverage revisions and snapshot digests for
+changed writable repositories. Coverage must be `satisfied` or `unchanged`;
+missing, stale or incomplete coverage fails closed with
+`gate.review_coverage_missing` or a typed coverage issue. Changing the Task
+review policy creates a new policy revision and updates active merge-readiness
+Gate policies to reference that exact revision and digest. Tasks without a
+review policy retain their existing Gate behavior.
+
 For M3, repository-scoped required checks bind `(repo_id, check_key,
 definition_digest, workspace_id, commit_sha)` for every changed repository.
 Unchanged and context-only repositories do not create merge checks. Merge

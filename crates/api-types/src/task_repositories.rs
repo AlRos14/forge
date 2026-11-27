@@ -97,6 +97,12 @@ pub struct TaskRepositoryPullRequestResponse {
     pub pr_state: String,
     pub merge_status: String,
     pub admission_status: String,
+    #[serde(default)]
+    pub admitted_source_sha: Option<String>,
+    #[serde(default)]
+    pub observed_head_sha: Option<String>,
+    #[serde(default)]
+    pub result_classification: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]

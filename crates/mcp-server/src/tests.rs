@@ -1262,6 +1262,50 @@ fn revised_public_surface_does_not_advertise_retired_collaboration_tools() {
 }
 
 #[test]
+fn review_range_tools_are_advertised_with_structured_report_schema() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let result = dispatch(&state, "tools/list", json!({}))
+            .await
+            .expect("tools/list succeeds");
+        let tools = result["tools"]
+            .as_array()
+            .expect("tools/list returns {tools:[...]}");
+        let find_tool = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("tool {name} is advertised"))
+        };
+
+        for name in [
+            "forge_get_review_coverage",
+            "forge_get_task_review_policy",
+            "forge_set_task_review_policy",
+            "forge_request_range_review",
+            "forge_list_review_checkpoints",
+            "forge_retry_review_checkpoint",
+            "forge_attribute_review_commits",
+            "forge_rebaseline_review",
+            "forge_list_review_findings",
+            "forge_waive_review_finding",
+        ] {
+            find_tool(name);
+        }
+
+        let project_policy = find_tool("forge_update_project");
+        assert!(project_policy["inputSchema"]["properties"]
+            .get("default_review_policy")
+            .is_some());
+
+        let submit_review = find_tool("forge_submit_work_unit_review");
+        let report_properties = &submit_review["inputSchema"]["properties"]["report"]["properties"];
+        assert!(report_properties.get("structured_findings").is_some());
+        assert!(report_properties.get("resolutions").is_some());
+    });
+}
+
+#[test]
 fn tool_call_accepts_mcp_meta() {
     run_async(async {
         let state = sqlite_state().await;
