@@ -2,7 +2,7 @@
 
 This checklist describes the release workflow in this repository. Verify live repository settings and release artifacts again before each tagged release.
 
-The workspace source version is `0.9.1`. Releases are published on GitHub Releases of `AlRos14/forge` from `v*` tags; v0.9.0 (2026-11-17) was the first. A source version alone is not evidence that an artifact was published; check the release page.
+The workspace source version is `0.9.2`. Releases are published on GitHub Releases of `AlRos14/forge` from `v*` tags; v0.9.0 (2026-11-17) was the first. A source version alone is not evidence that an artifact was published; check the release page.
 
 ## Checks before tagging
 

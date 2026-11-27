@@ -22,7 +22,7 @@ own workspace. Gate evaluation verifies the report against the durable
 review-subject relation and source attempt. A WorkUnit-scoped review Gate
 targets the reviewed WorkUnit, rather than its separate reviewer WorkUnit.
 
-Forge exposes the versioned REST API at `/api/v1`. This reference describes the 0.9.1 public contract through migration V183 for Project, Task, Actor, TaskRole, RoleMembership, Execution, HarnessSession, WorkUnit, Workspace, collaboration, Artifact, Review, Validation, Evidence, Gate, and TaskLifecycle records. M1 adds Task and WorkUnit repository associations from V181; M2 adds grouped WorkUnit workspaces, exact per-repository Execution results, and repository-scoped review and validation projections from V182; M3 adds per-repository integration/PR batches, repository-aware dependency handoffs, and repository-set replan projections from V183.
+Forge exposes the versioned REST API at `/api/v1`. This reference describes the 0.9.2 public contract through migration V183 for Project, Task, Actor, TaskRole, RoleMembership, Execution, HarnessSession, WorkUnit, Workspace, collaboration, Artifact, Review, Validation, Evidence, Gate, and TaskLifecycle records. M1 adds Task and WorkUnit repository associations from V181; M2 adds grouped WorkUnit workspaces, exact per-repository Execution results, and repository-scoped review and validation projections from V182; M3 adds per-repository integration/PR batches, repository-aware dependency handoffs, and repository-set replan projections from V183.
 
 > The orchestrator owns work. The harness owns cognition.
 
