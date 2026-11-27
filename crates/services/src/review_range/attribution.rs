@@ -5,11 +5,11 @@
 use crate::{task_service::workspace::resolve_repo_source, Result, ServiceError};
 use db::{
     new_uuid_v4, ActorKind, ActorRef, RepoRepo, ReviewAttributionKind, ReviewCoverageRows,
-    ReviewLocationAttribution, ReviewRange, ReviewRangeContributor, SqliteDb,
+    ReviewLedgerRepo, ReviewLocationAttribution, ReviewRange, ReviewRangeContributor, SqliteDb,
     WorkUnitRepositoryIntegration, WorkUnitRepositoryIntegrationOutcome,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -448,7 +448,7 @@ fn actor_from_execution(
     actor_kind: &Option<ActorKind>,
     actor_id: Option<&str>,
 ) -> Option<ActorRef> {
-    match (actor_kind?, actor_id?) {
+    match (*actor_kind.as_ref()?, actor_id?) {
         (ActorKind::Human, id) => Some(ActorRef::Human(id.to_owned())),
         (ActorKind::Agent, id) => Some(ActorRef::Agent(id.to_owned())),
     }

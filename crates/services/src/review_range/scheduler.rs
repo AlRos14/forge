@@ -1122,7 +1122,7 @@ impl ReviewScheduler {
             id: reviewer_wu_id.clone(),
             task_id: task_id.to_owned(),
             parent_work_unit_id: None,
-            title: format!("Review {}..{}", short_sha(base_commit), short_sha(head)),
+            title: format!("Review {}..{}", short_sha(&base_commit), short_sha(head)),
             scope: "Review this exact integrated repository range for findings and resolutions."
                 .to_owned(),
             execution_instructions: None,

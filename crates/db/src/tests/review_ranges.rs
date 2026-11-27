@@ -1732,7 +1732,13 @@ async fn review_range_merge_readiness_fails_closed_without_exact_coverage() {
             "INSERT INTO gate_policy_revision (
                 gate_id, revision, schema_version, policy_json, policy_digest, created_at
              ) VALUES ('gate-merge', CAST(? AS INTEGER), CAST(? AS INTEGER), ?, ?, ?)",
-            &[revision, schema, policy, &digest('b'), &now],
+            &[
+                revision,
+                schema,
+                policy,
+                &digest(if revision == "1" { 'b' } else { 'd' }),
+                &now,
+            ],
         )
         .await;
         ok(

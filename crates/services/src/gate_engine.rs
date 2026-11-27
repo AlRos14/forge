@@ -719,6 +719,20 @@ impl GateEngine {
     }
 
     async fn current_review_policy(&self, task_id: &str) -> Result<Option<db::ReviewPolicyRef>> {
+        // Historical integration fixtures can stop before V184. Treat that
+        // schema as having no review policy, while schema-v4 Gate evaluation
+        // still fails closed because its pinned requirement cannot match one.
+        let policy_table_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'task_review_policy_revision'
+            )",
+        )
+        .fetch_one(self.db.pool())
+        .await?;
+        if !policy_table_exists {
+            return Ok(None);
+        }
         Ok(
             ReviewPolicyRepo::get_current_task_review_policy(&*self.db, task_id)
                 .await?

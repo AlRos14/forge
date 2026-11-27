@@ -43,6 +43,7 @@ const CONSUMER_NAME: &str = "task-orchestrator-wakes";
 const EVENT_LEASE_SECONDS: i64 = 60;
 const WAKE_LEASE_SECONDS: i64 = 60;
 const FALLBACK_POLL: StdDuration = StdDuration::from_secs(5);
+const REVIEW_RECOVERY_INTERVAL: StdDuration = StdDuration::from_secs(30);
 const RETRY_DELAY: Duration = Duration::seconds(15);
 const MAX_AUTOMATIC_ATTEMPTS: i64 = 3;
 const MAX_CONTEXT_ROWS: i64 = 30;
@@ -74,6 +75,7 @@ pub struct OrchestratorRuntime {
     task_service: Arc<TaskService>,
     gate_engine: crate::gate_engine::GateEngine,
     review_scheduler: Arc<crate::review_range::ReviewScheduler>,
+    last_review_recovery: Arc<tokio::sync::Mutex<Option<tokio::time::Instant>>>,
     consumer_name: String,
     lease_owner: String,
     #[cfg(test)]
@@ -338,6 +340,7 @@ impl OrchestratorRuntime {
                 )
                 .with_event_bus(Arc::clone(&event_bus)),
             ),
+            last_review_recovery: Arc::new(tokio::sync::Mutex::new(None)),
             db,
             event_bus,
             task_service,
@@ -381,9 +384,18 @@ impl OrchestratorRuntime {
     }
 
     pub async fn run_once(&self, limit: i64) -> Result<OrchestratorRun> {
-        // Range review recovery is a durable scan, not an EventBus-dependent
-        // side effect. The event hook below keeps normal operation prompt.
-        self.review_scheduler.recover(100).await?;
+        // Range review recovery is a bounded durable scan. Event-triggered
+        // runs can be frequent, so throttle the fallback scan independently;
+        // matching events still reconcile promptly below.
+        {
+            let mut last_recovery = self.last_review_recovery.lock().await;
+            let now = tokio::time::Instant::now();
+            if last_recovery.is_none_or(|last| now.duration_since(last) >= REVIEW_RECOVERY_INTERVAL)
+            {
+                self.review_scheduler.recover(100).await?;
+                *last_recovery = Some(now);
+            }
+        }
         // Pending automatic rework is durable and remains pending across a
         // Task pause. The periodic run rechecks it after resume, even though
         // Task dispatch transitions are not EventBus-delivered.

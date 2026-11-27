@@ -439,7 +439,7 @@ mod tests {
         assert_eq!(result.classification, ReplanClassification::WithinEnvelope);
         assert_eq!(
             result.classification_facts_json(),
-            r#"{"objective_digest_unchanged":true,"roles_within_team":true,"actors_within_team":true,"work_units_within_limit":true,"work_units_total":2,"max_work_units":2,"repository_set_unchanged":true,"repositories_within_original":true,"work_unit_repository_scopes_unchanged":true,"paths_within_original":true,"no_new_envelope_flags":true,"plan_items":1}"#
+            r#"{"objective_digest_unchanged":true,"roles_within_team":true,"actors_within_team":true,"work_units_within_limit":true,"work_units_total":2,"max_work_units":2,"repository_set_unchanged":true,"repositories_within_original":true,"work_unit_repository_scopes_unchanged":true,"review_checkpoints_unchanged":true,"paths_within_original":true,"no_new_envelope_flags":true,"plan_items":1}"#
         );
     }
 

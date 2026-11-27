@@ -4,8 +4,8 @@ use crate::human_decision_service::{HumanDecisionService, RaiseHumanDecisionInpu
 use db::{
     AddWorkUnitDependency, ApplyReviewCorrections, ApplyReviewTriage, CreateTaskReviewTriage,
     CreateWorkUnit, HumanDecisionRequest, HumanDecisionSourceKind, HumanDecisionState,
-    ReviewCheckpointRepo, ReviewCorrectionLink, ReviewFindingDisposition, ReviewFindingTriage,
-    ReviewLedgerRepo, ReviewRangeReportRepo, ReviewReworkRound, TaskCoordinationRequestKind,
+    ReviewCorrectionLink, ReviewFindingDisposition, ReviewFindingTriage, ReviewLedgerRepo,
+    ReviewRangeReportRepo, ReviewReworkRound, TaskCoordinationRequestKind,
     TaskCoordinationRequestState, UpdateTaskCoordinationRequestState,
     WorkUnitRepositoryIntegrationOutcome,
 };
@@ -61,6 +61,7 @@ fn disposition_rank(disposition: api_types::TaskReviewDisposition) -> u8 {
 }
 
 impl TaskCoordinationService {
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn complete_range_human_decision_resume(
         &self,
         request: &TaskCoordinationRequest,

@@ -3971,7 +3971,7 @@ pub(crate) mod tests {
                 .await
                 .expect("PR publication admission");
         let merge_id = merge.id().to_owned();
-        let metadata = create_test_pr_metadata(&fixture, &merge, &publish, "closed").await;
+        let _metadata = create_test_pr_metadata(&fixture, &merge, &publish, "closed").await;
         publish
             .finish(TaskIntegrationOperationStatus::Succeeded)
             .await

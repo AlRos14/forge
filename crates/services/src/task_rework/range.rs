@@ -31,13 +31,10 @@ impl TaskReworkService {
         input: RequestReworkInput,
         requested_finding_ids: Option<BTreeSet<String>>,
     ) -> Result<RangeReworkResult> {
-        match &source {
-            CollaborationActorSource::Human(_) => {}
-            _ => {
-                return Err(ServiceError::invalid_operation(
-                    "manual range rework requires a Human request",
-                ));
-            }
+        if !matches!(&source, CollaborationActorSource::Human(_)) {
+            return Err(ServiceError::invalid_operation(
+                "manual range rework requires a Human request",
+            ));
         }
         for (field, value) in [
             ("task_id", input.task_id.as_str()),
