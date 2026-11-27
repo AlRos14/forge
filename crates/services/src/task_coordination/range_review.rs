@@ -180,7 +180,7 @@ impl TaskCoordinationService {
             let rationale: String = row.try_get("rationale")?;
             match disposition.as_str() {
                 "human" => {
-                    actual_human.insert(finding_id);
+                    actual_human.insert(finding_id.clone());
                     all_instructions.insert(
                         finding_id,
                         if instructions.trim().is_empty() {
@@ -710,7 +710,8 @@ impl TaskCoordinationService {
         let write_result = async {
             self.apply_request_range_review_outputs(request, execution, &outputs)
                 .await?;
-            ReviewLedgerRepo::apply_review_triage(&*self.db, write).await
+            ReviewLedgerRepo::apply_review_triage(&*self.db, write).await?;
+            Ok::<(), ServiceError>(())
         }
         .await;
         if let (Err(error), Some(raised)) = (&write_result, raised.as_ref()) {

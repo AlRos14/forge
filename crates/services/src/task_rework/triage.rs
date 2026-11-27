@@ -1,6 +1,8 @@
 use super::*;
 use crate::coordinator_outputs::MicroFixOutput;
-use db::{ReviewCheckpointRepo, ReviewLedgerRepo, ReviewRangeReportRepo};
+use db::{
+    ReviewCheckpointRepo, ReviewLedgerRepo, ReviewRangeReportRepo, TaskCoordinationRequestState,
+};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
