@@ -354,7 +354,7 @@ fn review_range_unchanged_tree_with_open_p0_or_p1_finding_blocks_gate_coverage()
             let coverage = evaluate_coverage(&rows, &unchanged);
             assert_eq!(coverage.status, ReviewCoverageStatus::FindingsOpen);
             assert_eq!(
-                coverage.gate_status(),
+                coverage.status.gate_status(),
                 api_types::ReviewCoverageStatus::FindingsOpen
             );
         }

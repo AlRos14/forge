@@ -3678,6 +3678,11 @@ pub trait ReviewCheckpointRepo: Send + Sync {
         &self,
         range_id: &str,
     ) -> Result<Vec<ReviewRangeContributor>>;
+    /// Reviewer WorkUnit ids bound to a checkpoint, ordered by id.
+    async fn list_checkpoint_review_work_unit_ids(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<Vec<String>>;
     async fn list_tasks_with_review_policy(
         &self,
         after_task_id: Option<&str>,

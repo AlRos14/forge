@@ -1480,6 +1480,19 @@ impl ReviewCheckpointRepo for SqliteDb {
         review_range_of_work_unit(&mut conn, work_unit_id).await
     }
 
+    async fn list_checkpoint_review_work_unit_ids(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT review_work_unit_id FROM work_unit_review_range
+             WHERE checkpoint_id = ? ORDER BY review_work_unit_id",
+        )
+        .bind(checkpoint_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     async fn list_review_range_contributors(
         &self,
         range_id: &str,

@@ -181,13 +181,9 @@ async fn checkpoint_value(
     state: &AppState,
     checkpoint: ReviewCheckpoint,
 ) -> Result<Value, McpToolError> {
-    let review_work_unit_ids = sqlx::query_scalar::<_, String>(
-        "SELECT review_work_unit_id FROM work_unit_review_range WHERE checkpoint_id = ? ORDER BY review_work_unit_id",
-    )
-    .bind(&checkpoint.id)
-    .fetch_all(state.db.pool())
-    .await
-    .map_err(db::DbError::from)?;
+    let review_work_unit_ids =
+        ReviewCheckpointRepo::list_checkpoint_review_work_unit_ids(&*state.db, &checkpoint.id)
+            .await?;
     let blocked_commits = checkpoint
         .blocked_detail_json
         .as_deref()
@@ -770,7 +766,7 @@ pub(crate) async fn waive_review_finding(
     )
 }
 
-fn policy_to_db(policy: ReviewPolicyDocument) -> db::ReviewPolicyDocument {
+pub(super) fn policy_to_db(policy: ReviewPolicyDocument) -> db::ReviewPolicyDocument {
     db::ReviewPolicyDocument {
         schema_version: policy.schema_version,
         risk_class: match policy.risk_class {

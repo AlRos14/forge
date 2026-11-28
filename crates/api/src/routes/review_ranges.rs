@@ -164,12 +164,9 @@ async fn checkpoint_response(
     state: &AppState,
     checkpoint: ReviewCheckpoint,
 ) -> ApiResult<ReviewCheckpointResponse> {
-    let review_work_unit_ids = sqlx::query_scalar::<_, String>(
-        "SELECT review_work_unit_id FROM work_unit_review_range WHERE checkpoint_id = ? ORDER BY review_work_unit_id",
-    )
-    .bind(&checkpoint.id)
-    .fetch_all(state.db.pool())
-    .await?;
+    let review_work_unit_ids =
+        ReviewCheckpointRepo::list_checkpoint_review_work_unit_ids(&*state.db, &checkpoint.id)
+            .await?;
     let blocked_commits = checkpoint
         .blocked_detail_json
         .as_deref()
