@@ -1560,13 +1560,13 @@ impl WorkUnitExecutionRepo for SqliteDb {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let review_work_unit_id = input.work_unit_id.clone();
         let started_at = input.execution.created_at.clone();
-        let (execution, event) = insert_work_unit_execution_in_tx(
+        let (execution, event) = Box::pin(insert_work_unit_execution_in_tx(
             self,
             &mut tx,
             input,
             artifact_input_ids,
             &event_input,
-        )
+        ))
         .await?;
         Box::pin(super::review_range::mark_range_review_started_in_tx(
             self,
@@ -2126,13 +2126,13 @@ impl WorkUnitExecutionRepo for SqliteDb {
 
         let review_work_unit_id = admission.work_unit_id.clone();
         let started_at = admission.execution.created_at.clone();
-        let (execution, execution_event) = insert_work_unit_execution_in_tx(
+        let (execution, execution_event) = Box::pin(insert_work_unit_execution_in_tx(
             self,
             &mut tx,
             admission,
             artifact_input_ids,
             &execution_event_input,
-        )
+        ))
         .await?;
         Box::pin(super::review_range::mark_range_review_started_in_tx(
             self,
@@ -2685,13 +2685,13 @@ impl WorkUnitExecutionRepo for SqliteDb {
 
         let review_work_unit_id = admission.work_unit_id.clone();
         let started_at = admission.execution.created_at.clone();
-        let (execution, execution_event) = insert_work_unit_execution_in_tx(
+        let (execution, execution_event) = Box::pin(insert_work_unit_execution_in_tx(
             self,
             &mut tx,
             admission,
             artifact_input_ids,
             &execution_event_input,
-        )
+        ))
         .await?;
         Box::pin(super::review_range::mark_range_review_started_in_tx(
             self,

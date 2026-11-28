@@ -815,16 +815,16 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
         .await
         .expect("Task version loads after materialization")
         .expect("batch Task remains current");
-    let human_replan_binding = crate::TaskCoordinationService::new(
-        Arc::clone(&database),
-        Arc::clone(&event_bus),
-    )
-    .project_batch_binding_for_approved_plan(
-        &task.id,
-        &owner_id,
-        &plan_artifact_id,
-        task_after_materialization.version,
-        coordination.authorization_version,
+    let coordination_service =
+        crate::TaskCoordinationService::new(Arc::clone(&database), Arc::clone(&event_bus));
+    let human_replan_binding = Box::pin(
+        coordination_service.project_batch_binding_for_approved_plan(
+            &task.id,
+            &owner_id,
+            &plan_artifact_id,
+            task_after_materialization.version,
+            coordination.authorization_version,
+        ),
     )
     .await
     .expect("exact materialized plan binding lookup succeeds")

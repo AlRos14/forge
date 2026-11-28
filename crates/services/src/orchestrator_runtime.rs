@@ -384,6 +384,13 @@ impl OrchestratorRuntime {
     }
 
     pub async fn run_once(&self, limit: i64) -> Result<OrchestratorRun> {
+        // Keep the orchestration state machine on the heap. This method is
+        // awaited directly by the runtime loop and by integration tests; the
+        // inline future would otherwise become part of every caller's stack.
+        Box::pin(self.run_once_inner(limit)).await
+    }
+
+    async fn run_once_inner(&self, limit: i64) -> Result<OrchestratorRun> {
         // Range review recovery is a bounded durable scan. Event-triggered
         // runs can be frequent, so throttle the fallback scan independently;
         // matching events still reconcile promptly below.
@@ -392,25 +399,23 @@ impl OrchestratorRuntime {
             let now = tokio::time::Instant::now();
             if last_recovery.is_none_or(|last| now.duration_since(last) >= REVIEW_RECOVERY_INTERVAL)
             {
-                self.review_scheduler.recover(100).await?;
+                Box::pin(self.review_scheduler.recover(100)).await?;
                 *last_recovery = Some(now);
             }
         }
         // Pending automatic rework is durable and remains pending across a
         // Task pause. The periodic run rechecks it after resume, even though
         // Task dispatch transitions are not EventBus-delivered.
-        crate::task_rework::TaskReworkService::new(
+        let rework = crate::task_rework::TaskReworkService::new(
             Arc::clone(&self.db),
             Arc::clone(&self.event_bus),
-        )
-        .process_pending_automatic_rework(100)
-        .await?;
-        crate::task_quality::TaskQualityService::new(
+        );
+        Box::pin(rework.process_pending_automatic_rework(100)).await?;
+        let quality = crate::task_quality::TaskQualityService::new(
             Arc::clone(&self.db),
             Arc::clone(&self.event_bus),
-        )
-        .process_pending(100)
-        .await?;
+        );
+        Box::pin(quality.process_pending(100)).await?;
         let now = now_rfc3339();
         let events = DomainEventRepo::claim_event_batch(
             &*self.db,
@@ -433,20 +438,22 @@ impl OrchestratorRuntime {
         };
 
         for event in events {
-            self.gate_engine.process_domain_event(&event).await?;
-            self.review_scheduler.process_domain_event(&event).await?;
-            crate::task_rework::TaskReworkService::new(
+            Box::pin(self.gate_engine.process_domain_event(&event)).await?;
+            Box::pin(self.review_scheduler.process_domain_event(&event)).await?;
+            let rework = crate::task_rework::TaskReworkService::new(
                 Arc::clone(&self.db),
                 Arc::clone(&self.event_bus),
-            )
-            .process_domain_event(&event)
-            .await?;
+            );
+            Box::pin(rework.process_domain_event(&event)).await?;
             if event.event_type == "artifact.created" && event.entity_type == "artifact" {
-                if let Err(error) = crate::task_coordination::TaskCoordinationService::new(
+                let coordination = crate::task_coordination::TaskCoordinationService::new(
                     Arc::clone(&self.db),
                     Arc::clone(&self.event_bus),
+                );
+                if let Err(error) = Box::pin(
+                    coordination
+                        .request_review_findings_for_report(&event.scope_id, &event.entity_id),
                 )
-                .request_review_findings_for_report(&event.scope_id, &event.entity_id)
                 .await
                 {
                     tracing::warn!(
@@ -457,28 +464,28 @@ impl OrchestratorRuntime {
                     );
                 }
             }
-            crate::task_quality::TaskQualityService::new(
+            let quality = crate::task_quality::TaskQualityService::new(
                 Arc::clone(&self.db),
                 Arc::clone(&self.event_bus),
-            )
-            .process_domain_event(&event)
-            .await?;
+            );
+            Box::pin(quality.process_domain_event(&event)).await?;
             if event.event_type == "execution.completed" {
-                self.task_service
-                    .complete_coordination_delivery_for_execution(&event.entity_id)
-                    .await?;
+                Box::pin(
+                    self.task_service
+                        .complete_coordination_delivery_for_execution(&event.entity_id),
+                )
+                .await?;
             }
-            crate::task_failure_retry::TaskFailureRetryService::new(
+            let failure_retry = crate::task_failure_retry::TaskFailureRetryService::new(
                 Arc::clone(&self.db),
                 Arc::clone(&self.event_bus),
-            )
-            .process_domain_event(&event)
-            .await?;
-            if self.reconcile_orchestrator_terminal(&event).await? {
+            );
+            Box::pin(failure_retry.process_domain_event(&event)).await?;
+            if Box::pin(self.reconcile_orchestrator_terminal(&event)).await? {
                 // Orchestrator lifecycle is handled only for its exact source
                 // wake. It never enters generic event classification.
-            } else if let Some(signal) = self.classify_event(&event).await? {
-                run.admitted_wakes += self.admit_signal(&event, signal).await?;
+            } else if let Some(signal) = Box::pin(self.classify_event(&event)).await? {
+                run.admitted_wakes += Box::pin(self.admit_signal(&event, signal)).await?;
             }
             let dedupe_key = event.dedupe_key.clone().unwrap_or_else(|| event.id.clone());
             DomainEventRepo::complete_claimed_event(
@@ -499,19 +506,17 @@ impl OrchestratorRuntime {
         // An artifact.created event may have added a pending intent above.
         // Process it after the whole claimed batch has been classified so a
         // crash/replay cannot make event ordering the source of authority.
-        crate::task_rework::TaskReworkService::new(
+        let rework = crate::task_rework::TaskReworkService::new(
+            Arc::clone(&self.db),
+            Arc::clone(&self.event_bus),
+        );
+        Box::pin(rework.process_pending_automatic_rework(100)).await?;
+        let review_findings = crate::task_coordination::TaskCoordinationService::new(
             Arc::clone(&self.db),
             Arc::clone(&self.event_bus),
         )
-        .process_pending_automatic_rework(100)
-        .await?;
-        crate::task_coordination::TaskCoordinationService::new(
-            Arc::clone(&self.db),
-            Arc::clone(&self.event_bus),
-        )
-        .with_workspace_root(self.task_service.workspace_root().to_path_buf())
-        .process_pending_review_findings_requests(100)
-        .await?;
+        .with_workspace_root(self.task_service.workspace_root().to_path_buf());
+        Box::pin(review_findings.process_pending_review_findings_requests(100)).await?;
         {
             // Terminal catalog checks and answered human decisions are durable
             // sources; the request is the receipt, so retries charge no turn.
@@ -519,12 +524,8 @@ impl OrchestratorRuntime {
                 Arc::clone(&self.db),
                 Arc::clone(&self.event_bus),
             );
-            coordination
-                .process_pending_validation_findings_requests(100)
-                .await?;
-            coordination
-                .process_pending_human_decision_resumes(100)
-                .await?;
+            Box::pin(coordination.process_pending_validation_findings_requests(100)).await?;
+            Box::pin(coordination.process_pending_human_decision_resumes(100)).await?;
         }
         {
             // Phase 2: trusted PR feedback, the effects of triaged feedback
@@ -536,30 +537,24 @@ impl OrchestratorRuntime {
                 Arc::clone(&self.event_bus),
             )
             .with_work_unit_service(Arc::new(self.task_service.orchestrator_work_unit_service()));
-            coordination
-                .process_pending_external_feedback_requests(100)
-                .await?;
-            coordination
-                .process_pending_external_feedback_effects(100)
-                .await?;
-            coordination
-                .process_external_feedback_decision_effects(100)
-                .await?;
+            Box::pin(coordination.process_pending_external_feedback_requests(100)).await?;
+            Box::pin(coordination.process_pending_external_feedback_effects(100)).await?;
+            Box::pin(coordination.process_external_feedback_decision_effects(100)).await?;
         }
-        crate::task_quality::TaskQualityService::new(
+        let quality = crate::task_quality::TaskQualityService::new(
             Arc::clone(&self.db),
             Arc::clone(&self.event_bus),
-        )
-        .process_pending(100)
-        .await?;
+        );
+        Box::pin(quality.process_pending(100)).await?;
 
-        run.admitted_wakes += self.recover_unlinked_review_findings_requests(100).await?;
-        run.processed_events += self.recover_completed_review_findings_requests(100).await?;
-        run.admitted_wakes += self.recover_unlinked_new_kind_requests(100).await?;
-        run.processed_events += self.recover_completed_new_kind_requests(100).await?;
+        run.admitted_wakes += Box::pin(self.recover_unlinked_review_findings_requests(100)).await?;
+        run.processed_events +=
+            Box::pin(self.recover_completed_review_findings_requests(100)).await?;
+        run.admitted_wakes += Box::pin(self.recover_unlinked_new_kind_requests(100)).await?;
+        run.processed_events += Box::pin(self.recover_completed_new_kind_requests(100)).await?;
 
         for _ in 0..16 {
-            match self.dispatch_one().await? {
+            match Box::pin(self.dispatch_one()).await? {
                 DispatchOutcome::Idle => break,
                 DispatchOutcome::Dispatched => run.dispatched_wakes += 1,
                 DispatchOutcome::Retried => run.retried_wakes += 1,
