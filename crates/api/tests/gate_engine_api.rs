@@ -380,6 +380,8 @@ async fn review_range_gate_generators_preserve_current_review_coverage() {
         review_policy_digest
     );
 
+    let mut revised_decision = decision.clone();
+    revised_decision["policy_ref"] = json!("merge-policy-revised");
     let revised_v1: GatePolicyRevisionResponse = json_request(
         &harness.app,
         Method::PUT,
@@ -391,7 +393,7 @@ async fn review_range_gate_generators_preserve_current_review_coverage() {
                 "scope_requirement": null,
                 "review": null,
                 "validations": [],
-                "decisions": [decision.clone()],
+                "decisions": [revised_decision.clone()],
                 "work_units": []
             }
         }),
@@ -404,6 +406,26 @@ async fn review_range_gate_generators_preserve_current_review_coverage() {
         1
     );
 
+    // Revising to identical policy content cannot append a duplicate digest.
+    let _: serde_json::Value = json_request(
+        &harness.app,
+        Method::PUT,
+        &format!("/api/v1/gates/{}/policy", v1_gate.gate.id),
+        json!({
+            "expected_active_revision": 2,
+            "policy": {
+                "schema_version": 1,
+                "scope_requirement": null,
+                "review": null,
+                "validations": [],
+                "decisions": [revised_decision.clone()],
+                "work_units": []
+            }
+        }),
+        StatusCode::CONFLICT,
+    )
+    .await;
+
     let revised_v2: GatePolicyRevisionResponse = json_request(
         &harness.app,
         Method::PUT,
@@ -415,7 +437,7 @@ async fn review_range_gate_generators_preserve_current_review_coverage() {
                 "scope_requirement": null,
                 "review": null,
                 "validations": [],
-                "decisions": [decision],
+                "decisions": [revised_decision],
                 "work_units": [],
                 "required_checks": []
             }

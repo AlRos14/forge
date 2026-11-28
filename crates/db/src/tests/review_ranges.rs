@@ -6,27 +6,28 @@
 //! are always left installed.
 
 use super::{
-    copy_migrations_through, ensure_task_role, insert_test_work_unit, multirepo_seed_repo,
-    multirepo_seed_task, seed_agent, seed_agent_task_role_member, seed_project, seed_user,
-    sqlite_db,
+    authorized_agent_execution_snapshot, copy_migrations_through, ensure_task_role,
+    insert_test_work_unit, multirepo_seed_repo, multirepo_seed_task, seed_agent,
+    seed_agent_task_role_member, seed_owned_daemon, seed_project, seed_user, sqlite_db,
 };
 use crate::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, run_migrations_from,
-    ActivateReviewCheckpoint, ActorKind, ActorRef, ApplyReviewCorrections, ArtifactKind,
-    ArtifactStorageKind, CollaborationRepo, CreateArtifact, CreateDecision, CreateDomainEvent,
-    CreateExecution, CreateProposal, CreateRoleMembership, CreateWorkUnit, CreateWorkUnitExecution,
-    CreateWorkspace, DbError, DecisionOutcome, ExecutionStatus, IngestRangeReport, PageRequest,
-    ProjectRepo, ProposalTarget, ProposalTargetKind, ReviewAttributionKind, ReviewBaseSource,
-    ReviewCheckpoint, ReviewCheckpointReason, ReviewCheckpointRepo, ReviewCheckpointState,
-    ReviewCorrectionLink, ReviewFinding, ReviewFindingFilter, ReviewFindingLocation,
-    ReviewFindingResolution, ReviewFindingSeverity, ReviewHumanDecision, ReviewLedgerRepo,
-    ReviewLocationAttribution, ReviewPolicyDocument, ReviewPolicyRepo, ReviewPolicySource,
-    ReviewRange, ReviewRangeContributor, ReviewRangeReport, ReviewRangeReportRepo,
-    ReviewResolutionOutcome, ReviewReworkRound, ReviewRiskClass, ReviewSizeThreshold,
-    ReviewTriggerMode, ReviewVerdict, RoleMembershipRepo, RoleMembershipStatus, SortBy, SortOrder,
-    SqliteDb, TaskRepositoryRole, TaskRepositorySetRepo, TaskRepositoryWrite, UpdateProject,
-    UpsertQueuedReviewCheckpoint, WorkUnitExecutionRepo, WorkUnitReviewRange, WorkspaceRepo,
-    WorkspaceStatus, WriteProjectReviewPolicy, WriteTaskReviewPolicy,
+    ActivateReviewCheckpoint, ActorKind, ActorRef, AgentRepo, AgentStatus, ApplyReviewCorrections,
+    ArtifactKind, ArtifactStorageKind, CollaborationRepo, CreateAgent, CreateArtifact,
+    CreateDecision, CreateDomainEvent, CreateExecution, CreateProposal, CreateRoleMembership,
+    CreateWorkUnit, CreateWorkUnitExecution, CreateWorkspace, DbError, DecisionOutcome,
+    ExecutionStatus, IngestRangeReport, PageRequest, ProjectRepo, ProposalTarget,
+    ProposalTargetKind, ReviewAttributionKind, ReviewBaseSource, ReviewCheckpoint,
+    ReviewCheckpointReason, ReviewCheckpointRepo, ReviewCheckpointState, ReviewCorrectionLink,
+    ReviewFinding, ReviewFindingFilter, ReviewFindingLocation, ReviewFindingResolution,
+    ReviewFindingSeverity, ReviewHumanDecision, ReviewLedgerRepo, ReviewLocationAttribution,
+    ReviewPolicyDocument, ReviewPolicyRepo, ReviewPolicySource, ReviewRange,
+    ReviewRangeContributor, ReviewRangeReport, ReviewRangeReportRepo, ReviewResolutionOutcome,
+    ReviewReworkRound, ReviewRiskClass, ReviewSizeThreshold, ReviewTriggerMode, ReviewVerdict,
+    RoleMembershipRepo, RoleMembershipStatus, SortBy, SortOrder, SqliteDb, TaskRepositoryRole,
+    TaskRepositorySetRepo, TaskRepositoryWrite, UpdateProject, UpsertQueuedReviewCheckpoint,
+    WorkUnitExecutionRepo, WorkUnitReviewRange, WorkspaceRepo, WorkspaceStatus,
+    WriteProjectReviewPolicy, WriteTaskReviewPolicy,
 };
 use sqlx::SqlitePool;
 
@@ -51,6 +52,42 @@ fn event(task_id: &str, user_id: &str, entity_id: &str) -> CreateDomainEvent {
         payload_json: "{}".to_owned(),
         created_at: now_rfc3339(),
     }
+}
+
+async fn seed_daemon_agent(db: &SqliteDb, name: &str, owner_id: &str, daemon_id: &str) -> String {
+    let now = now_rfc3339();
+    let agent_id = new_uuid_v4();
+    AgentRepo::create(
+        db,
+        CreateAgent {
+            id: agent_id.clone(),
+            name: name.to_owned(),
+            description: None,
+            executor_type: "shell".to_owned(),
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "[]".to_owned(),
+            config_json: "{}".to_owned(),
+            credential_ref: None,
+            daemon_id: Some(daemon_id.to_owned()),
+            max_concurrent_tasks: 1,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: AgentStatus::Idle,
+            last_heartbeat_at: None,
+            is_default: false,
+            paused: false,
+            owner_id: Some(owner_id.to_owned()),
+            visibility: "global".to_owned(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("daemon-backed Agent creates");
+    agent_id
 }
 
 fn policy_document() -> ReviewPolicyDocument {
@@ -174,7 +211,8 @@ async fn world_keeping(execution_guards: &[&str]) -> World {
         .expect("repository set initializes")
         .expect("Task exists");
     let producer = seed_agent(&db, "range producer", "global", None).await;
-    let reviewer = seed_agent(&db, "range reviewer", "global", None).await;
+    let reviewer_daemon = seed_owned_daemon(&db, &owner).await;
+    let reviewer = seed_daemon_agent(&db, "range reviewer", &owner, &reviewer_daemon).await;
     seed_agent_task_role_member(&db, &task, "implementer", &producer).await;
     let producer_unit =
         insert_test_work_unit(&db, &task, &producer, "implementer", true, Some(&producer)).await;
@@ -1420,7 +1458,9 @@ async fn review_range_checkpoint_moves_in_review_atomically_with_reviewer_admiss
                 before_sha: None,
                 after_sha: None,
                 error: None,
-                executor_config_snapshot_json: None,
+                executor_config_snapshot_json: Some(
+                    authorized_agent_execution_snapshot(&w.db, &w.reviewer).await,
+                ),
                 workspace_id: None,
                 created_at: now.clone(),
                 updated_at: now.clone(),

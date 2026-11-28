@@ -20,6 +20,17 @@ pub(crate) async fn dispatch_tool(
     arguments: Value,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
+    // The tool match embeds every handler future. Keep that large state
+    // machine on the heap so RPC/test callers only store a small future.
+    Box::pin(dispatch_tool_inner(state, name, arguments, context)).await
+}
+
+async fn dispatch_tool_inner(
+    state: &AppState,
+    name: &str,
+    arguments: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
     match name {
         "forge_create_task" => handlers::forge_create_task(state, arguments).await,
         "forge_create_sub_tasks" => handlers::forge_create_sub_tasks(state, arguments).await,

@@ -1116,7 +1116,9 @@ impl ReviewScheduler {
             })
             .collect::<Vec<_>>();
         let input_findings_digest = canonical_digest(&input_findings)?;
-        let reviewer_wu_id = format!("review:{}:1", checkpoint.id);
+        // Workspace groups derive filesystem paths from this opaque WorkUnit
+        // identity, so it must stay a single safe path segment.
+        let reviewer_wu_id = format!("review-{}-1", checkpoint.id);
         let work_unit = CreateWorkUnit {
             id: reviewer_wu_id.clone(),
             task_id: task_id.to_owned(),

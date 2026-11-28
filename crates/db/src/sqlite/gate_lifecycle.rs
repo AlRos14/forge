@@ -173,6 +173,23 @@ pub(super) async fn insert_gate_policy_revision_in_tx(
     if active != input.expected_active_revision {
         return Err(DbError::VersionConflict);
     }
+    // A policy revision is identified by its exact digest as well as its
+    // revision number. Re-submitting identical policy content cannot append
+    // another revision; report a typed conflict instead of surfacing the
+    // UNIQUE constraint as an internal error.
+    let duplicate_digest: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM gate_policy_revision
+             WHERE gate_id = ? AND policy_digest = ?
+         )",
+    )
+    .bind(&input.gate_id)
+    .bind(&input.policy_digest)
+    .fetch_one(&mut **transaction)
+    .await?;
+    if duplicate_digest != 0 {
+        return Err(DbError::VersionConflict);
+    }
     sqlx::query(
         "INSERT INTO gate_policy_revision
             (gate_id, revision, schema_version, policy_json, policy_digest, created_at)

@@ -605,7 +605,9 @@ impl ReviewPolicyRepo for SqliteDb {
         // silently left on an older review policy.
         let mut actual_gates: Vec<(String, Option<i64>)> = sqlx::query_as(
             "SELECT id, active_policy_revision FROM gate
-             WHERE task_id = ? AND gate_kind = 'merge_readiness' ORDER BY id",
+             WHERE task_id = ? AND gate_kind = 'merge_readiness'
+               AND active_policy_revision IS NOT NULL
+             ORDER BY id",
         )
         .bind(&input.task_id)
         .fetch_all(&mut *tx)

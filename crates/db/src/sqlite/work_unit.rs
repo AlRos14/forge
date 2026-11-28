@@ -1568,12 +1568,12 @@ impl WorkUnitExecutionRepo for SqliteDb {
             &event_input,
         )
         .await?;
-        super::review_range::mark_range_review_started_in_tx(
+        Box::pin(super::review_range::mark_range_review_started_in_tx(
             self,
             &mut tx,
             &review_work_unit_id,
             &started_at,
-        )
+        ))
         .await?;
         tx.commit().await?;
         Ok(CollaborationWrite {
@@ -2134,12 +2134,12 @@ impl WorkUnitExecutionRepo for SqliteDb {
             &execution_event_input,
         )
         .await?;
-        super::review_range::mark_range_review_started_in_tx(
+        Box::pin(super::review_range::mark_range_review_started_in_tx(
             self,
             &mut tx,
             &review_work_unit_id,
             &started_at,
-        )
+        ))
         .await?;
         if let Some(receipt) = input.follow_up_receipt {
             sqlx::query(
@@ -2693,12 +2693,12 @@ impl WorkUnitExecutionRepo for SqliteDb {
             &execution_event_input,
         )
         .await?;
-        super::review_range::mark_range_review_started_in_tx(
+        Box::pin(super::review_range::mark_range_review_started_in_tx(
             self,
             &mut tx,
             &review_work_unit_id,
             &started_at,
-        )
+        ))
         .await?;
         let request_receipt_event = if let Some(receipt) = input.request_receipt.as_ref() {
             Some(DomainEventRepo::append_event_in_tx(self, &mut tx, receipt).await?)
