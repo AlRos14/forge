@@ -177,6 +177,27 @@ pub enum PublicEventType {
     #[serde(rename = "task.coordinator_replan_proposed")]
     #[ts(rename = "task.coordinator_replan_proposed")]
     TaskCoordinatorReplanProposed,
+    #[serde(rename = "task.review_policy_updated")]
+    #[ts(rename = "task.review_policy_updated")]
+    TaskReviewPolicyUpdated,
+    #[serde(rename = "review.checkpoint_created")]
+    #[ts(rename = "review.checkpoint_created")]
+    ReviewCheckpointCreated,
+    #[serde(rename = "review.checkpoint_state_changed")]
+    #[ts(rename = "review.checkpoint_state_changed")]
+    ReviewCheckpointStateChanged,
+    #[serde(rename = "review.range_reported")]
+    #[ts(rename = "review.range_reported")]
+    ReviewRangeReported,
+    #[serde(rename = "review.findings_triaged")]
+    #[ts(rename = "review.findings_triaged")]
+    ReviewFindingsTriaged,
+    #[serde(rename = "review.finding_resolved")]
+    #[ts(rename = "review.finding_resolved")]
+    ReviewFindingResolved,
+    #[serde(rename = "review.coverage_changed")]
+    #[ts(rename = "review.coverage_changed")]
+    ReviewCoverageChanged,
     #[serde(rename = "project.created")]
     #[ts(rename = "project.created")]
     ProjectCreated,
@@ -280,6 +301,13 @@ impl PublicEventType {
             Self::TaskWorkUnitFallback => "task.work_unit_fallback",
             Self::TaskMicroFixBoundsExceeded => "task.micro_fix_bounds_exceeded",
             Self::TaskCoordinatorReplanProposed => "task.coordinator_replan_proposed",
+            Self::TaskReviewPolicyUpdated => "task.review_policy_updated",
+            Self::ReviewCheckpointCreated => "review.checkpoint_created",
+            Self::ReviewCheckpointStateChanged => "review.checkpoint_state_changed",
+            Self::ReviewRangeReported => "review.range_reported",
+            Self::ReviewFindingsTriaged => "review.findings_triaged",
+            Self::ReviewFindingResolved => "review.finding_resolved",
+            Self::ReviewCoverageChanged => "review.coverage_changed",
             Self::ProjectCreated => "project.created",
             Self::ProjectUpdated => "project.updated",
             Self::ProjectDeleted => "project.deleted",

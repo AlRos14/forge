@@ -56,7 +56,11 @@ pub async fn create_project(
         },
     });
 
-    Ok((StatusCode::OK, Json(project_response(project)?)).into_response())
+    Ok((
+        StatusCode::OK,
+        Json(project_response(&state.db, project).await?),
+    )
+        .into_response())
 }
 
 pub async fn list_projects(
@@ -69,12 +73,12 @@ pub async fn list_projects(
     let has_more = page.next_cursor.is_some();
     let next_cursor = page.next_cursor;
     let total_count = page.total_count.and_then(|count| u64::try_from(count).ok());
+    let mut items = Vec::with_capacity(page.items.len());
+    for project in page.items {
+        items.push(project_response(&state.db, project).await?);
+    }
     let response = PaginatedResponse {
-        items: page
-            .items
-            .into_iter()
-            .map(project_response)
-            .collect::<ApiResult<Vec<_>>>()?,
+        items,
         next_cursor,
         has_more,
         total_count,
@@ -93,7 +97,7 @@ pub async fn get_project(
     if !project_is_visible(&state, &project, &user.user_id).await? {
         return Err(ApiError::not_found("project", id));
     }
-    Ok(Json(project_response(project)?))
+    Ok(Json(project_response(&state.db, project).await?))
 }
 
 pub async fn list_project_hook_runs(
@@ -170,7 +174,7 @@ pub async fn pause_project(
 ) -> ApiResult<Json<ProjectResponse>> {
     let project = require_project_admin(&state, &id, &user.user_id).await?;
     if project.paused_at.is_some() {
-        return Ok(Json(project_response(project)?));
+        return Ok(Json(project_response(&state.db, project).await?));
     }
 
     let paused_at = now_rfc3339();
@@ -192,7 +196,7 @@ pub async fn pause_project(
         context: EventContext::ProjectPaused { paused_at },
     });
 
-    Ok(Json(project_response(project)?))
+    Ok(Json(project_response(&state.db, project).await?))
 }
 
 pub async fn resume_project(
@@ -202,7 +206,7 @@ pub async fn resume_project(
 ) -> ApiResult<Json<ProjectResponse>> {
     let project = require_project_admin(&state, &id, &user.user_id).await?;
     if project.paused_at.is_none() {
-        return Ok(Json(project_response(project)?));
+        return Ok(Json(project_response(&state.db, project).await?));
     }
 
     ProjectRepo::set_paused_at(&*state.db, &id, None, Some(&user.user_id)).await?;
@@ -217,7 +221,7 @@ pub async fn resume_project(
         context: EventContext::ProjectResumed {},
     });
 
-    Ok(Json(project_response(project)?))
+    Ok(Json(project_response(&state.db, project).await?))
 }
 
 pub async fn update_project(
@@ -233,6 +237,7 @@ pub async fn update_project(
         project_hooks,
         primary_repo_id,
         version,
+        default_review_policy,
     } = request;
     let project_hooks_json = match project_hooks {
         Some(rules) => {
@@ -245,7 +250,7 @@ pub async fn update_project(
         None => None,
     };
     let project = services::ProjectRepositoryService::new(state.db.clone())
-        .update_project_at_version(
+        .update_project_at_version_with_review_policy(
             UpdateProject {
                 id,
                 name,
@@ -257,6 +262,7 @@ pub async fn update_project(
             version,
             project_hooks_json,
             &user.user_id,
+            default_review_policy.map(|policy| policy.map(super::review_ranges::policy_to_db)),
         )
         .await?;
     state.event_bus.publish(ForgeEvent {
@@ -266,7 +272,7 @@ pub async fn update_project(
         context: EventContext::ProjectUpdated {},
     });
 
-    Ok(Json(project_response(project)?))
+    Ok(Json(project_response(&state.db, project).await?))
 }
 
 pub async fn get_task_role_defaults(

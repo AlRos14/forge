@@ -235,6 +235,10 @@ fn proposal_target_to_db(value: ApiProposalTarget) -> ProposalTarget {
             ApiProposalTargetKind::Workspace => ProposalTargetKind::Workspace,
             ApiProposalTargetKind::WorkUnit => ProposalTargetKind::WorkUnit,
             ApiProposalTargetKind::PrExternalAction => ProposalTargetKind::PrExternalAction,
+            // CollaborationService rejects these generic-route targets (403).
+            ApiProposalTargetKind::ReviewFinding => ProposalTargetKind::ReviewFinding,
+            ApiProposalTargetKind::ReviewBase => ProposalTargetKind::ReviewBase,
+            ApiProposalTargetKind::ReviewCommit => ProposalTargetKind::ReviewCommit,
         },
         id: value.id,
     }
@@ -248,6 +252,9 @@ fn proposal_target_to_api(value: ProposalTarget) -> ApiProposalTarget {
             ProposalTargetKind::Workspace => ApiProposalTargetKind::Workspace,
             ProposalTargetKind::WorkUnit => ApiProposalTargetKind::WorkUnit,
             ProposalTargetKind::PrExternalAction => ApiProposalTargetKind::PrExternalAction,
+            ProposalTargetKind::ReviewFinding => ApiProposalTargetKind::ReviewFinding,
+            ProposalTargetKind::ReviewBase => ApiProposalTargetKind::ReviewBase,
+            ProposalTargetKind::ReviewCommit => ApiProposalTargetKind::ReviewCommit,
         },
         id: value.id,
     }

@@ -183,6 +183,11 @@ pub enum ProposalTargetKind {
     Workspace,
     WorkUnit,
     PrExternalAction,
+    /// Review-range targets are created and decided only by their dedicated
+    /// Human routes, never through the generic proposal/decision routes.
+    ReviewFinding,
+    ReviewBase,
+    ReviewCommit,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]

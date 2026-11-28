@@ -309,6 +309,7 @@ fn materialization_response(
 }
 
 fn plan_response(view: PlanView) -> ApiResult<TaskCoordinationPlanResponse> {
+    let review_checkpoints = view.parsed.review_checkpoints;
     let work_units = view
         .parsed
         .work_units
@@ -343,6 +344,7 @@ fn plan_response(view: PlanView) -> ApiResult<TaskCoordinationPlanResponse> {
         objective_digest: view.parsed.objective_digest,
         work_units,
         repository_set: view.parsed.repository_set,
+        review_checkpoints,
         proposal_id: view.plan.proposal_id,
         decision_id: view.plan.decision_id,
         materialization: view

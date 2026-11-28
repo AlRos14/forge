@@ -426,11 +426,11 @@ impl TaskService {
                 ));
             }
             let expected_repo_ids = if formal_review {
-                db::WorkUnitRepo::list_review_subject_repositories(&*self.db, work_unit_id)
-                    .await?
-                    .into_iter()
-                    .map(|repository| repository.repo_id)
-                    .collect::<std::collections::HashSet<_>>()
+                crate::work_unit_service::range_review::review_group_repository_ids(
+                    &self.db,
+                    work_unit_id,
+                )
+                .await?
             } else {
                 if !work_unit.requires_integration {
                     return Err(ServiceError::invalid_operation(
@@ -527,6 +527,14 @@ impl TaskService {
             if !workspaces.is_empty() {
                 return Err(ServiceError::invalid_operation(
                     "non-repository WorkUnit cannot bind a Workspace",
+                ));
+            }
+            if crate::work_unit_service::range_review::frozen_range(&self.db, work_unit_id)
+                .await?
+                .is_some()
+            {
+                return Err(ServiceError::invalid_operation(
+                    "range review requires its prepared read-only WorkspaceGroup",
                 ));
             }
             None

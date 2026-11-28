@@ -192,6 +192,14 @@ impl TaskRepo for SqliteDb {
         .bind(&input.updated_at)
         .execute(&mut **transaction)
         .await?;
+        super::review_range::copy_project_default_policy_in_tx(
+            self,
+            transaction,
+            &input.id,
+            &input.project_id,
+            &input.created_at,
+        )
+        .await?;
         let row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
             .bind(&input.id)
             .fetch_one(&mut **transaction)

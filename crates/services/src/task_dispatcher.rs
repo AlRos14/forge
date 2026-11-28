@@ -15,6 +15,7 @@ use crate::{project_plan::ProjectPlanService, Result, TaskService};
 mod active_recovery;
 mod dispatch;
 mod fallback;
+mod range_review_prompt;
 pub(crate) use dispatch::work_unit_consumption_context;
 
 pub use dispatch::DispatchOutcome;
@@ -118,13 +119,20 @@ impl TaskDispatcher {
 
     #[tracing::instrument(skip(self))]
     pub async fn check_once(&self) -> Result<u64> {
-        let pending_starts = self.recover_pending_provider_starts().await?;
-        let auto_recovered = self.recover_auto_cancelled_work_unit_executions().await?;
+        // The dispatcher aggregates several large admission scanners. Keep
+        // that state machine on the heap so callers (the runtime loop and
+        // integration tests) do not embed it in their own stack frames.
+        Box::pin(self.check_once_inner()).await
+    }
+
+    async fn check_once_inner(&self) -> Result<u64> {
+        let pending_starts = Box::pin(self.recover_pending_provider_starts()).await?;
+        let auto_recovered = Box::pin(self.recover_auto_cancelled_work_unit_executions()).await?;
         let plan_service =
             ProjectPlanService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
-        let project_plan_requests = plan_service.check_once().await?;
-        let fallback_resolutions = self.process_work_unit_fallbacks().await?;
-        let dispatched_units = self.dispatch_eligible_work_units().await?;
+        let project_plan_requests = Box::pin(plan_service.check_once()).await?;
+        let fallback_resolutions = Box::pin(self.process_work_unit_fallbacks()).await?;
+        let dispatched_units = Box::pin(self.dispatch_eligible_work_units()).await?;
         let dispatched = pending_starts
             + dispatched_units
             + auto_recovered

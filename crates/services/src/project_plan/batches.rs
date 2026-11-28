@@ -31,18 +31,17 @@ impl ProjectPlanService {
         max_parallel_tasks: i64,
         idempotency_key: &str,
     ) -> Result<ProjectPlanBatch> {
-        let batch = self
-            .create_batch_record(
-                project_id,
-                user_id,
-                expected_version,
-                task_ids,
-                max_parallel_tasks,
-                idempotency_key,
-            )
-            .await?;
-        self.prepare_batch(&batch.id).await?;
-        self.load_batch(&batch.id).await
+        let batch = Box::pin(self.create_batch_record(
+            project_id,
+            user_id,
+            expected_version,
+            task_ids,
+            max_parallel_tasks,
+            idempotency_key,
+        ))
+        .await?;
+        Box::pin(self.prepare_batch(&batch.id)).await?;
+        Box::pin(self.load_batch(&batch.id)).await
     }
 
     /// Create the durable, explicitly authorized batch and capture its exact

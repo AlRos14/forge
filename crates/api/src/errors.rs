@@ -267,6 +267,7 @@ impl From<ServiceError> for ApiError {
                     || code == "validation.catalog_forbidden"
                     || code == "human_decision.authority_required"
                     || code == "pr_feedback.policy_forbidden"
+                    || code == "review.range.not_permitted"
                 {
                     StatusCode::FORBIDDEN
                 } else if code.ends_with("host_unavailable") {
@@ -283,12 +284,21 @@ impl From<ServiceError> for ApiError {
                             | "coordination.coordinator_harness_unsupported"
                             | "pr_feedback.extend_out_of_scope"
                             | "pr_feedback.plan_without_extend"
+                            | "review.report.invalid_findings"
+                            | "review.policy.invalid"
+                            | "review.finding.not_waivable"
+                            | "review.finding.rework_requires_human"
+                            | "review.range.repo_not_writable"
                     )
                 {
                     StatusCode::UNPROCESSABLE_ENTITY
-                } else if code.ends_with("budget_exhausted") {
+                } else if code.ends_with("budget_exhausted")
+                    || code == "review.checkpoint.limit_reached"
+                {
                     StatusCode::TOO_MANY_REQUESTS
                 } else {
+                    // Every other domain rule violation, including review
+                    // version, base and checkpoint conflicts, is a 409.
                     StatusCode::CONFLICT
                 };
                 Self {
@@ -512,6 +522,16 @@ impl From<DbError> for ApiError {
                 Self::forbidden_with_code(
                     "copilot_authority_lost",
                     "The Project Copilot delegation is no longer valid",
+                )
+            }
+            DbError::Sqlx(error)
+                if error
+                    .as_database_error()
+                    .is_some_and(|error| error.message() == "gate.review_coverage_missing") =>
+            {
+                Self::conflict_with_code(
+                    "gate.review_coverage_missing",
+                    "required review coverage is missing",
                 )
             }
             DbError::NotFound => Self {

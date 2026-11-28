@@ -69,6 +69,7 @@ fn work_unit_response(
     unit: WorkUnit,
     readiness: services::WorkUnitReadiness,
     review_subject: Option<api_types::ReviewSubjectResponse>,
+    review_range: Option<api_types::WorkUnitReviewRangeResponse>,
     repository_ids: Vec<String>,
     integrations: Vec<WorkUnitRepositoryIntegration>,
 ) -> WorkUnitResponse {
@@ -100,6 +101,7 @@ fn work_unit_response(
         updated_at: unit.updated_at,
         readiness: readiness_to_api(readiness),
         review_subject,
+        review_range,
         repository_ids,
         integrations: integrations
             .into_iter()
@@ -126,6 +128,28 @@ pub(crate) async fn response_for(
         .map_err(ApiError::from)?
         .as_ref()
         .map(services::task_rework::review_subject_response);
+    let review_range =
+        match db::ReviewCheckpointRepo::get_work_unit_review_range(&*state.db, &unit.id).await? {
+            Some(frozen) => {
+                let range =
+                    db::ReviewCheckpointRepo::get_review_range(&*state.db, &frozen.range_id)
+                        .await?
+                        .ok_or_else(|| {
+                            ApiError::not_found("review range", frozen.range_id.clone())
+                        })?;
+                Some(api_types::WorkUnitReviewRangeResponse {
+                    review_work_unit_id: frozen.review_work_unit_id,
+                    checkpoint_id: frozen.checkpoint_id,
+                    range: super::review_ranges::range_response(range),
+                    input_finding_ids: frozen
+                        .input_findings
+                        .into_iter()
+                        .map(|finding| finding.finding_id)
+                        .collect(),
+                })
+            }
+            None => None,
+        };
     let repository_ids = db::WorkUnitRepo::list_repository_ids(&*state.db, &unit.id).await?;
     let integrations =
         WorkUnitRepositoryIntegrationRepo::list_by_work_unit(&*state.db, &unit.id).await?;
@@ -133,6 +157,7 @@ pub(crate) async fn response_for(
         unit,
         readiness,
         review_subject,
+        review_range,
         repository_ids,
         integrations,
     ))

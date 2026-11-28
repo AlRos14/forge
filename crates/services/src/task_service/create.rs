@@ -12,7 +12,7 @@ impl TaskService {
         initial_lifecycle_state: Option<db::TaskLifecycleState>,
         merge_config: Option<Value>,
     ) -> Result<Task> {
-        self.create_task_inner(
+        Box::pin(self.create_task_inner(
             project_id,
             title,
             description,
@@ -22,7 +22,7 @@ impl TaskService {
             initial_lifecycle_state,
             merge_config,
             None,
-        )
+        ))
         .await
     }
 
@@ -38,7 +38,7 @@ impl TaskService {
         initial_lifecycle_state: Option<db::TaskLifecycleState>,
         merge_config: Option<Value>,
     ) -> Result<Task> {
-        self.create_task_inner(
+        Box::pin(self.create_task_inner(
             project_id,
             title,
             description,
@@ -48,7 +48,7 @@ impl TaskService {
             initial_lifecycle_state,
             merge_config,
             None,
-        )
+        ))
         .await
     }
 

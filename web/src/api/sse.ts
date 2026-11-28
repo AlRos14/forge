@@ -8,6 +8,16 @@ type SsePayload = ForgeEvent
 
 type BrowserEvents = { dispatch: (name: string, detail: SsePayload) => void }
 
+const REVIEW_RANGE_EVENTS: readonly PublicEventType[] = [
+  'task.review_policy_updated',
+  'review.checkpoint_created',
+  'review.checkpoint_state_changed',
+  'review.range_reported',
+  'review.findings_triaged',
+  'review.finding_resolved',
+  'review.coverage_changed',
+]
+
 function parseSseData(raw: string): SsePayload | undefined {
   try {
     return JSON.parse(raw) as SsePayload
@@ -143,6 +153,24 @@ export function routeSsePayload(
       predicate: (query) => String(query.queryKey[0]) === 'notifications',
     })
     browserEvents.dispatch('forge:notification-created', { ...payload, ...facts })
+  }
+
+  if (REVIEW_RANGE_EVENTS.includes(eventType)) {
+    const taskId =
+      typeof facts.task_id === 'string'
+        ? facts.task_id
+        : payload.scope_type === 'task'
+          ? (payload.scope_id ?? undefined)
+          : undefined
+    if (taskId) {
+      void queryClient.invalidateQueries({ queryKey: qk.reviewPolicy(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.reviewCoverage(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.reviewCheckpoints(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskDetail(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.workUnits(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.gates(taskId) })
+    }
   }
 
   if (
@@ -367,6 +395,7 @@ export function useSSE(queryClient: QueryClient, accessToken: string | null): vo
             'task.coordination_plan_rejected',
             'task.coordination_plan_materialized',
             'task.review_triaged',
+            ...REVIEW_RANGE_EVENTS,
             'task.autonomy_limits_changed',
             'task.quality_requested',
             'task.quality_request_resolved',

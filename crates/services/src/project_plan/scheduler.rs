@@ -252,11 +252,17 @@ impl ProjectPlanService {
     /// are committed before a coordination request; request IDs are stable per
     /// batch+Task so a crash after request creation replays the exact request.
     pub async fn check_once(&self) -> Result<u64> {
+        // Batch preparation and drive can await several large service
+        // futures. Keep the scheduler state on the heap for its callers.
+        Box::pin(self.check_once_inner()).await
+    }
+
+    async fn check_once_inner(&self) -> Result<u64> {
         let preparing = sqlx::query_scalar::<_, String>(
             "SELECT id FROM project_plan_batch WHERE state='paused' AND preparation_complete=0 ORDER BY created_at,id",
         ).fetch_all(self.db.pool()).await?;
         for batch_id in preparing {
-            self.prepare_batch(&batch_id).await?;
+            Box::pin(self.prepare_batch(&batch_id)).await?;
         }
 
         let batch_ids = sqlx::query_scalar::<_, String>(
@@ -266,7 +272,7 @@ impl ProjectPlanService {
         .await?;
         let mut requested = 0_u64;
         for batch_id in batch_ids {
-            requested += self.drive_batch_once(&batch_id).await?;
+            requested += Box::pin(self.drive_batch_once(&batch_id)).await?;
         }
         Ok(requested)
     }

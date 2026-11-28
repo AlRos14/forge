@@ -267,6 +267,7 @@ impl MergeService {
                     "single-repository merge requires exactly one changed repository candidate",
                 ));
             }
+            let all_candidates = candidates.clone();
             let candidate = candidates
                 .into_iter()
                 .next()
@@ -275,11 +276,29 @@ impl MergeService {
                 .await?
                 .ok_or_else(|| ServiceError::not_found("repo", candidate.repo_id.clone()))?;
             let outcome = if repo.work_mode == WorkMode::PullRequest {
-                self.publish_repository_pr(&task, &repo, gate_evaluation_id, None, &candidate)
-                    .await?
+                self.publish_repository_pr(
+                    &task,
+                    &repo,
+                    gate_evaluation_id,
+                    &evaluation,
+                    &revision,
+                    None,
+                    &all_candidates,
+                    &candidate,
+                )
+                .await?
             } else {
-                self.merge_repository_direct(&task, &repo, gate_evaluation_id, None, &candidate)
-                    .await?
+                self.merge_repository_direct(
+                    &task,
+                    &repo,
+                    gate_evaluation_id,
+                    &evaluation,
+                    &revision,
+                    None,
+                    &all_candidates,
+                    &candidate,
+                )
+                .await?
             };
             drop(_local_task_lock);
             if matches!(&outcome, MergeOutcome::Done { .. }) {
@@ -337,6 +356,7 @@ impl MergeService {
                 "Task is already merging from a different repository batch".to_owned(),
             ));
         }
+        let all_candidates = candidates.clone();
         let mut candidates_by_repo = candidates
             .into_iter()
             .map(|candidate| (candidate.repo_id.clone(), candidate))
@@ -385,7 +405,10 @@ impl MergeService {
                     &task,
                     &repo,
                     gate_evaluation_id,
+                    &evaluation,
+                    &revision,
                     Some(&batch),
+                    &all_candidates,
                     &candidate,
                 )
                 .await?;
@@ -395,7 +418,10 @@ impl MergeService {
                         &task,
                         &repo,
                         gate_evaluation_id,
+                        &evaluation,
+                        &revision,
                         Some(&batch),
+                        &all_candidates,
                         &candidate,
                     )
                     .await?;
@@ -611,12 +637,16 @@ impl MergeService {
         Ok(candidates)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn publish_repository_pr(
         &self,
         task: &db::Task,
         repo: &db::Repo,
         gate_evaluation_id: &str,
+        gate_evaluation: &GateEvaluation,
+        repository_set: &db::TaskRepositorySetRevision,
         batch: Option<&db::TaskRepositoryMergeBatch>,
+        all_candidates: &[RepositoryMergeCandidate],
         candidate: &RepositoryMergeCandidate,
     ) -> Result<MergeOutcome> {
         crate::pr_service::validate_credential_free_remote_identity(&repo.remote_url)?;
@@ -634,18 +664,6 @@ impl MergeService {
             )));
         }
         let target = target_branch(&task.merge_config, &repo.default_branch)?;
-        if db::PrReworkRepo::get_open_supersession_by_task(&*self.db, &task.id)
-            .await?
-            .is_none()
-        {
-            push_branch(source_path, &candidate.source.branch).await?;
-        }
-        if git::get_current_sha(source_path).await? != candidate.after_sha {
-            return Err(ServiceError::Conflict(format!(
-                "repository {} source commit changed before PR admission",
-                repo.id
-            )));
-        }
         let provider_config = PrProviderConfigRepo::get_by_repo_id(&*self.db, &repo.id)
             .await?
             .ok_or_else(|| ServiceError::PrProviderMissing {
@@ -655,6 +673,21 @@ impl MergeService {
             .integration_operations
             .lock_for_gate_admission(&task.id)
             .await?;
+        if !git::is_worktree_clean(source_path).await?
+            || git::get_current_sha(source_path).await? != candidate.after_sha
+        {
+            return Err(ServiceError::Conflict(format!(
+                "repository {} integration Workspace changed before Gate revalidation",
+                repo.id
+            )));
+        }
+        self.ensure_current_gate_evaluation(
+            &task.id,
+            gate_evaluation,
+            repository_set,
+            all_candidates,
+        )
+        .await?;
         let (merge, publication) = self
             .integration_operations
             .admit_pull_request_publication_with_lock(
@@ -677,6 +710,76 @@ impl MergeService {
             .await?
             .ok_or_else(|| ServiceError::not_found("PR metadata", merge.id().to_owned()))?;
         let merge_id = merge.id().to_owned();
+        let admission = TaskIntegrationOperationRepo::get_remote_pr_admission(&*self.db, &merge_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("remote PR admission", merge_id.clone()))?;
+        let mut pr_service =
+            crate::pr_service::PrService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
+        if let Some(credentials) = self
+            .credentials
+            .read()
+            .ok()
+            .and_then(|configured| configured.clone())
+        {
+            pr_service = pr_service.with_credentials(credentials);
+        }
+
+        if let Err(error) = self
+            .ensure_current_gate_evaluation(
+                &task.id,
+                gate_evaluation,
+                repository_set,
+                all_candidates,
+            )
+            .await
+        {
+            pr_service
+                .apply_publication_failure(&admission, &metadata, &error.to_string())
+                .await?;
+            return Err(error);
+        }
+
+        if !git::is_worktree_clean(source_path).await?
+            || git::get_current_sha(source_path).await? != candidate.after_sha
+        {
+            pr_service
+                .mark_reconciliation_required(
+                    &admission,
+                    Some(&metadata),
+                    "the source Workspace changed after the pre-push coverage check",
+                )
+                .await?;
+            return Err(ServiceError::Conflict(format!(
+                "repository {} integration Workspace changed after Gate revalidation",
+                repo.id
+            )));
+        }
+        if db::PrReworkRepo::get_open_supersession_by_task(&*self.db, &task.id)
+            .await?
+            .is_none()
+        {
+            if let Err(error) =
+                push_branch(source_path, &candidate.source.branch, &candidate.after_sha).await
+            {
+                pr_service
+                    .mark_reconciliation_required(&admission, Some(&metadata), &error.to_string())
+                    .await?;
+                return Err(error);
+            }
+        }
+        if git::get_current_sha(source_path).await? != candidate.after_sha {
+            pr_service
+                .mark_reconciliation_required(
+                    &admission,
+                    Some(&metadata),
+                    "the source commit changed after the pre-push coverage check",
+                )
+                .await?;
+            return Err(ServiceError::Conflict(format!(
+                "repository {} source commit changed before PR publication",
+                repo.id
+            )));
+        }
         if let Some(batch) = batch {
             let batch = TaskRepositoryMergeBatchRepo::get_by_id(&*self.db, &batch.id)
                 .await?
@@ -697,16 +800,6 @@ impl MergeService {
             )
             .await?;
             emit_repository_merge_batch_events(&self.db, &self.event_bus, &batch.id).await?;
-        }
-        let mut pr_service =
-            crate::pr_service::PrService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
-        if let Some(credentials) = self
-            .credentials
-            .read()
-            .ok()
-            .and_then(|configured| configured.clone())
-        {
-            pr_service = pr_service.with_credentials(credentials);
         }
         let result = pr_service
             .publish_pr(task, repo, &candidate.source.branch, &target)
@@ -761,12 +854,16 @@ impl MergeService {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn merge_repository_direct(
         &self,
         task: &db::Task,
         repo: &db::Repo,
         gate_evaluation_id: &str,
+        gate_evaluation: &GateEvaluation,
+        repository_set: &db::TaskRepositorySetRevision,
         batch: Option<&db::TaskRepositoryMergeBatch>,
+        all_candidates: &[RepositoryMergeCandidate],
         candidate: &RepositoryMergeCandidate,
     ) -> Result<MergeOutcome> {
         let _workspace_guard = self
@@ -777,6 +874,13 @@ impl MergeService {
             .integration_operations
             .lock_for_gate_admission(&task.id)
             .await?;
+        self.ensure_current_gate_evaluation(
+            &task.id,
+            gate_evaluation,
+            repository_set,
+            all_candidates,
+        )
+        .await?;
         let operation = self
             .integration_operations
             .acquire_kind_after_gate_with_lock(
@@ -978,6 +1082,22 @@ impl MergeService {
                 "review_report" | "validation_run"
             )
         }) {
+            if input.input_kind == "review_report"
+                && serde_json::from_str::<Value>(&input.subject_json)
+                    .ok()
+                    .and_then(|subject| {
+                        subject
+                            .get("kind")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .as_deref()
+                    == Some("commit_range")
+            {
+                // Range reviews are bound through review_coverage, not to the
+                // exact merge-candidate commit.
+                continue;
+            }
             let subject = merge_candidate_subject(input)?;
             if subject.workspace_id != candidate.workspace_id
                 || subject.commit_sha != candidate.commit_sha
@@ -1023,6 +1143,77 @@ impl MergeService {
         Ok(candidate.commit_sha.clone())
     }
 
+    /// Rebuild the exact merge candidate and Gate evidence for a PR rework push
+    /// while its Task integration claim is held. An active Task review policy
+    /// must be pinned by the admitted v4 Gate revision.
+    pub(crate) async fn ensure_current_gate_evaluation_for_pr_rework_push(
+        &self,
+        task_id: &str,
+        evaluation_id: &str,
+    ) -> Result<()> {
+        let evaluation = GateRepo::get_gate_evaluation(&*self.db, evaluation_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("GateEvaluation", evaluation_id.to_owned()))?;
+        if evaluation.task_id != task_id || evaluation.outcome != GateEvaluationOutcome::Satisfied {
+            return Err(ServiceError::Conflict(
+                "PR rework push requires its exact satisfied GateEvaluation".to_owned(),
+            ));
+        }
+        let gate = GateRepo::get_gate(&*self.db, &evaluation.gate_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("Gate", evaluation.gate_id.clone()))?;
+        if gate.gate_kind != "merge_readiness"
+            || gate.scope_kind != db::GateScopeKind::Task
+            || gate.scope_id != task_id
+            || gate.active_policy_revision != Some(evaluation.policy_revision)
+        {
+            return Err(ServiceError::Conflict(
+                "PR rework push is not authorized by a Task merge-readiness Gate".to_owned(),
+            ));
+        }
+        let active_revision = gate.active_policy_revision.ok_or_else(|| {
+            ServiceError::invalid_operation("merge-readiness Gate has no active policy")
+        })?;
+        let active_policy =
+            GateRepo::get_gate_policy_revision(&*self.db, &gate.id, active_revision)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::not_found(
+                        "gate policy revision",
+                        format!("{}:{active_revision}", gate.id),
+                    )
+                })?;
+        let current_review_policy =
+            db::ReviewPolicyRepo::get_current_task_review_policy(&*self.db, task_id).await?;
+        if current_review_policy.is_some() && active_policy.schema_version != 4 {
+            return Err(ServiceError::Coordination {
+                code: "gate.review_coverage_missing",
+                message: "an active Task review policy requires a v4 merge-readiness Gate before PR rework can be pushed".to_owned(),
+            });
+        }
+        if active_policy.schema_version == 4 && current_review_policy.is_none() {
+            return Err(ServiceError::Coordination {
+                code: "gate.review_coverage_missing",
+                message: "the v4 merge-readiness Gate has no current Task review policy".to_owned(),
+            });
+        }
+        let repository_set = TaskRepositorySetRepo::get_current(&*self.db, task_id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::invalid_operation("Task has no current repository-set revision")
+            })?;
+        let candidates = self
+            .repository_merge_candidates(task_id, &evaluation, &repository_set)
+            .await?;
+        if candidates.is_empty() {
+            return Err(ServiceError::Conflict(
+                "PR rework push has no current changed repository candidates".to_owned(),
+            ));
+        }
+        self.ensure_current_gate_evaluation(task_id, &evaluation, &repository_set, &candidates)
+            .await
+    }
+
     async fn ensure_current_gate_evaluation(
         &self,
         task_id: &str,
@@ -1062,31 +1253,55 @@ impl MergeService {
                 )
             })
             .count();
-        if writable_repository_count > 1 && policy_revision.schema_version != 3 {
+        if writable_repository_count > 1 && !matches!(policy_revision.schema_version, 3 | 4) {
             return Err(ServiceError::invalid_operation(
-                "multi-repository merge readiness requires Gate policy v3",
+                "multi-repository merge readiness requires Gate policy v3 or v4",
             ));
         }
         let engine = GateEngine::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
-        let current = if policy_revision.schema_version == 3 {
-            let subjects = candidates
-                .iter()
-                .map(
-                    |candidate| crate::gate_engine::RepositoryValidationSubject {
-                        repo_id: candidate.repo_id.clone(),
-                        workspace_id: candidate.source.workspace.id.clone(),
-                        commit_sha: candidate.after_sha.clone(),
-                    },
+        let current = match policy_revision.schema_version {
+            3 => {
+                let subjects = candidates
+                    .iter()
+                    .map(
+                        |candidate| crate::gate_engine::RepositoryValidationSubject {
+                            repo_id: candidate.repo_id.clone(),
+                            workspace_id: candidate.source.workspace.id.clone(),
+                            commit_sha: candidate.after_sha.clone(),
+                        },
+                    )
+                    .collect::<Vec<_>>();
+                engine
+                    .evaluate_required_checks_by_repo(task_id, &subjects)
+                    .await?
+            }
+            4 => {
+                let subjects = candidates
+                    .iter()
+                    .map(
+                        |candidate| crate::gate_engine::RepositoryValidationSubject {
+                            repo_id: candidate.repo_id.clone(),
+                            workspace_id: candidate.source.workspace.id.clone(),
+                            commit_sha: candidate.after_sha.clone(),
+                        },
+                    )
+                    .collect::<Vec<_>>();
+                let evidence = crate::gate_engine::snapshot_gate_review_coverage(
+                    Arc::clone(&self.db),
+                    self.workspace_root.clone(),
+                    task_id,
                 )
-                .collect::<Vec<_>>();
-            engine
-                .evaluate_required_checks_by_repo(task_id, &subjects)
-                .await?
-        } else {
-            engine
-                .evaluate_revision(gate, evaluation.policy_revision)
-                .await?
-                .evaluation
+                .await?;
+                engine
+                    .evaluate_merge_readiness_with_coverage(task_id, &subjects, &evidence)
+                    .await?
+            }
+            _ => {
+                engine
+                    .evaluate_revision(gate, evaluation.policy_revision)
+                    .await?
+                    .evaluation
+            }
         };
         if current.id != evaluation.id || current.outcome != GateEvaluationOutcome::Satisfied {
             return Err(ServiceError::Conflict(
@@ -1439,9 +1654,10 @@ async fn ensure_managed_clone(remote_url: &str, clone_path: &Path) -> Result<Str
     Ok(clone_path.to_string_lossy().into_owned())
 }
 
-async fn push_branch(worktree_path: &Path, branch: &str) -> Result<()> {
+async fn push_branch(worktree_path: &Path, branch: &str, commit_sha: &str) -> Result<()> {
+    let refspec = format!("{commit_sha}:refs/heads/{branch}");
     let output = Command::new("git")
-        .args(["push", "-u", "origin", branch])
+        .args(["push", "origin", "--", refspec.as_str()])
         .current_dir(worktree_path)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")

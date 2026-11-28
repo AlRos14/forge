@@ -3,7 +3,7 @@
 mod common;
 
 use api_types::{
-    ErrorResponse, ExternalFeedbackItemListResponse, PrExternalActionListResponse,
+    ErrorResponse, ExternalFeedbackItemListResponse, GateResponse, PrExternalActionListResponse,
     PrFeedbackPolicyResponse, PrReworkListResponse, ProviderEntriesResponse, ProviderEntryResponse,
     RepoResponse, TaskResponse,
 };
@@ -50,6 +50,70 @@ async fn fixture(prefix: &str) -> Fixture {
         _workspace: workspace,
         _repo: repo_root,
     }
+}
+
+#[tokio::test]
+async fn review_range_coordinator_gate_creation_pins_current_review_policy() {
+    let f = fixture("review-range-coordinator-gate").await;
+    let owner_id: String = sqlx::query_scalar("SELECT owner_id FROM project WHERE id = ?")
+        .bind(&f.project_id)
+        .fetch_one(f.harness.state.db.pool())
+        .await
+        .expect("Project owner");
+    let review_policy = json!({
+        "schema_version": 1,
+        "risk_class": "r1",
+        "coverage_required": true,
+        "trigger_mode": "auto",
+        "reviewer_role": "reviewer",
+        "required_reviewers": 1,
+        "require_human": false,
+        "size_threshold": {"changed_lines": 800, "changed_files": 25},
+        "coordinator_may_request": true,
+        "max_checkpoints_per_repo": 12
+    });
+    let review_policy_digest = "c".repeat(64);
+    sqlx::query(
+        "INSERT INTO task_review_policy_revision (
+             task_id, revision, state, policy_json, digest, risk_class,
+             coverage_required, source, created_by_user_id, created_at, superseded_at
+         ) VALUES (?, 1, 'current', ?, ?, 'r1', 1, 'owner', ?, ?, NULL)",
+    )
+    .bind(&f.task_id)
+    .bind(review_policy.to_string())
+    .bind(&review_policy_digest)
+    .bind(&owner_id)
+    .bind(db::now_rfc3339())
+    .execute(f.harness.state.db.pool())
+    .await
+    .expect("current Task review policy");
+
+    let gate: GateResponse = json_request_with_bearer(
+        &f.harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/gates", f.task_id),
+        &f.token,
+        json!({
+            "gate_kind": "merge_readiness",
+            "policy": {
+                "schema_version": 1,
+                "scope_requirement": null,
+                "review": null,
+                "validations": [],
+                "decisions": [],
+                "work_units": []
+            }
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let policy = gate.active_policy.expect("active Gate policy").policy;
+    assert_eq!(policy["schema_version"], 4);
+    assert_eq!(policy["review_coverage"]["review_policy_revision"], 1);
+    assert_eq!(
+        policy["review_coverage"]["review_policy_digest"],
+        review_policy_digest
+    );
 }
 
 async fn create_scm_credential(

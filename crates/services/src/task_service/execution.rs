@@ -91,11 +91,8 @@ pub(crate) async fn has_exact_work_unit_target(
             false
         };
         let expected_repo_ids = if formal_review {
-            WorkUnitRepo::list_review_subject_repositories(db, work_unit_id)
+            crate::work_unit_service::range_review::review_group_repository_ids(db, work_unit_id)
                 .await?
-                .into_iter()
-                .map(|repository| repository.repo_id)
-                .collect::<std::collections::HashSet<_>>()
         } else if work_unit.requires_integration {
             task_repositories
                 .iter()
@@ -182,7 +179,11 @@ pub(crate) async fn has_exact_work_unit_target(
             return Ok(false);
         }
         Ok(true)
-    } else if work_unit.requires_integration {
+    } else if work_unit.requires_integration
+        || crate::work_unit_service::range_review::frozen_range(db, work_unit_id)
+            .await?
+            .is_some()
+    {
         Ok(false)
     } else {
         Ok(execution.workspace_id.is_none()

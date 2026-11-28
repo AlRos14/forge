@@ -83,7 +83,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
-          cargo clippy --locked -p services -p db -p cli-adapters -p api -p api-types -p mcp-server -p executors --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/forge-ci-clippy.log"
+          cargo clippy --locked -p git -p services -p db -p cli-adapters -p api -p api-types -p mcp-server -p executors --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/forge-ci-clippy.log"
       - name: Upload Clippy diagnostic log
         if: ${{ failure() && !cancelled() && steps.rust_clippy.outcome == 'failure' }}
         uses: actions/upload-artifact@v6
@@ -284,3 +284,23 @@ jobs:
         run: cargo test --locked -p mcp-server --lib multirepo_pr_
       - if: ${{ !cancelled() }}
         run: cargo test --locked -p mcp-server --lib multirepo_lifecycle_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p db --lib review_range_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p db --test task_coordination_schema review_range_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p git --lib review_range_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib review_range_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --test task_coordination review_range_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api --test work_unit_reviews review_range_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api --test gate_engine_api review_range_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api --test coordinator_verification_pr_loop review_range_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api --test happy_path review_range_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p mcp-server --lib review_range_

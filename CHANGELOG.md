@@ -8,6 +8,22 @@ source version is 0.9.2.
 
 ## [Unreleased]
 
+### Added
+
+- Add optional versioned Project-default and Task review policies, immutable
+  per-repository commit-range checkpoints, structured findings and resolutions,
+  review coverage projections, waiver/attribution/re-baseline decisions, and
+  coverage-aware merge-readiness Gates. REST, MCP, SSE and the Task review panel
+  expose the new review surfaces.
+
+### Changed
+
+- For Tasks with an opted-in review policy, merge-readiness now requires Gate
+  schema v4 coverage evidence for each changed writable repository. Existing
+  Tasks without a policy keep their current behavior. `TaskReviewDisposition`
+  adds `defer` for non-blocking P2/P3 range findings; exhaustive clients must
+  handle the new enum value. P0/P1 findings cannot be deferred or waived.
+
 ## [0.9.2] - 2026-11-27
 
 Multirepo Tasks, per-Agent Git attribution, and coordination fixes found in a

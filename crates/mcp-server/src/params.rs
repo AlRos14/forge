@@ -249,6 +249,15 @@ where
 {
     Option::<String>::deserialize(deserializer).map(Some)
 }
+
+fn nullable_review_policy_if_present<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<api_types::ReviewPolicyDocument>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<api_types::ReviewPolicyDocument>::deserialize(deserializer).map(Some)
+}
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RegisterAgentParams {
@@ -288,6 +297,8 @@ pub(crate) struct UpdateProjectParams {
     pub(crate) paused: Option<bool>,
     #[serde(default, deserialize_with = "nullable_string_if_present")]
     pub(crate) primary_repo_id: Option<Option<String>>,
+    #[serde(default, deserialize_with = "nullable_review_policy_if_present")]
+    pub(crate) default_review_policy: Option<Option<api_types::ReviewPolicyDocument>>,
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

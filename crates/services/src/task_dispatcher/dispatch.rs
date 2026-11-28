@@ -27,7 +27,7 @@ impl TaskDispatcher {
             if self.is_stopped() {
                 break;
             }
-            let outcome = self.dispatch_task_once(&dispatch.task_id).await?;
+            let outcome = Box::pin(self.dispatch_task_once(&dispatch.task_id)).await?;
             admitted += outcome.admitted_execution_ids.len() as u64;
         }
         Ok(admitted)
@@ -79,20 +79,32 @@ impl TaskDispatcher {
             preparation_user,
             db::TaskCoordinationRepo::get_task_coordination(&*self.db, &task.id).await?,
         ) {
-            let blockers = self
-                .task_service
-                .orchestrator_work_unit_service()
-                .prepare_coordination_workspaces(
-                    &task.id,
-                    user_id,
-                    coordination.authorization_version,
-                )
-                .await?;
+            let blockers = Box::pin(
+                self.task_service
+                    .orchestrator_work_unit_service()
+                    .prepare_coordination_workspaces(
+                        &task.id,
+                        user_id,
+                        coordination.authorization_version,
+                    ),
+            )
+            .await?;
             for blocker in blockers {
                 tracing::warn!(task_id = %task.id, %blocker, "guided workspace preparation deferred");
             }
         }
-        let preflight = lifecycle_service.launch_preflight(&task.id).await?;
+        // Range reviewer WorkUnits come from the review policy, with or
+        // without a coordinator.
+        let blockers = Box::pin(
+            self.task_service
+                .orchestrator_work_unit_service()
+                .prepare_range_review_workspaces(&task.id, preparation_user),
+        )
+        .await?;
+        for blocker in blockers {
+            tracing::warn!(task_id = %task.id, %blocker, "range review preparation deferred");
+        }
+        let preflight = Box::pin(lifecycle_service.launch_preflight(&task.id)).await?;
         let mut outcome = DispatchOutcome::default();
         for candidate in preflight
             .work_units
@@ -113,25 +125,24 @@ impl TaskDispatcher {
                 .clone()
                 .filter(|instructions| !instructions.trim().is_empty())
                 .unwrap_or_else(|| automatic_work_unit_prompt(&task, &work_unit));
-            let launch = self
-                .task_service
-                .launch_work_unit_execution(
-                    &work_unit.id,
-                    work_unit.version,
-                    prompt,
-                    Vec::new(),
-                    None,
-                )
-                .await;
+            let launch = Box::pin(self.task_service.launch_work_unit_execution(
+                &work_unit.id,
+                work_unit.version,
+                prompt,
+                Vec::new(),
+                None,
+            ))
+            .await;
             match launch {
                 Ok(launched) => {
                     outcome
                         .admitted_execution_ids
                         .push(launched.execution.id.clone());
-                    match self
-                        .task_service
-                        .start_execution(launched.execution.id.clone())
-                        .await
+                    match Box::pin(
+                        self.task_service
+                            .start_execution(launched.execution.id.clone()),
+                    )
+                    .await
                     {
                         Ok(result) if result.accepted => outcome
                             .started_execution_ids
@@ -176,7 +187,11 @@ pub(crate) async fn work_unit_consumption_context(
     use db::{CollaborationRepo, ExecutionRepo, WorkspaceRepo};
     use sqlx::Row;
     let mut sections = Vec::new();
-    if let Some(subject) = crate::task_rework::get_review_subject(db, &work_unit.id).await? {
+    if let Some(frozen) =
+        crate::work_unit_service::range_review::frozen_range(db, &work_unit.id).await?
+    {
+        sections.push(super::range_review_prompt::range_review_context(db, &frozen).await?);
+    } else if let Some(subject) = crate::task_rework::get_review_subject(db, &work_unit.id).await? {
         sections.push("You are performing formal independent review. Inspect the exact result against its scope and acceptance criteria. Do not edit files, implement fixes, approve your own reasoning as evidence, or contact external providers. Report only concrete findings with reproduction/evidence; distinguish unavailable checks from passes. End your assistant output with exactly one final line in this contract: FORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass|fail|needs_human\",\"summary\":\"nonempty factual summary\",\"criteria\":[\"criterion checked\"],\"findings\":[\"concrete defect with location and evidence\"],\"questions\":[],\"evidence_considered\":[]}. Choose one verdict. Use fail for confirmed defects, pass only when the required criteria are met, and needs_human for an unresolved decision or missing essential evidence. findings and questions must be JSON arrays; findings must be concrete strings, not instructions to silently change scope.".to_owned());
         let repository_subjects =
             db::WorkUnitRepo::list_review_subject_repositories(db, &work_unit.id).await?;

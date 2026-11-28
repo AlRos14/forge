@@ -134,8 +134,15 @@ impl TaskAutonomyService {
             .bind(task_id).bind(&input.idempotency_key).bind(&digest).bind(&response).bind(&now).execute(&mut *tx).await?;
         sqlx::query("INSERT INTO task_autonomy_retry_grant(intent_id,limits_version,user_id,created_at)
             SELECT id,?,?,? FROM task_rework_automation_intent WHERE task_id=? AND state='blocked' AND block_reason LIKE '%rework budget exhausted%'
-            AND (SELECT count(*) FROM task_rework_receipt WHERE task_id=?) + (SELECT count(*) FROM task_review_triage WHERE task_id=? AND disposition='recheck') < ?")
-            .bind(result.version).bind(user_id).bind(&now).bind(task_id).bind(task_id).bind(task_id).bind(result.max_rework_rounds).execute(&mut *tx).await?;
+            AND (SELECT count(*) FROM task_rework_receipt WHERE task_id=?)
+              + (SELECT count(*) FROM review_rework_round WHERE task_id=?)
+              + (SELECT count(*) FROM task_review_triage triage WHERE triage.task_id=?
+                   AND (triage.disposition='recheck' OR EXISTS (
+                       SELECT 1 FROM review_finding_triage finding_triage
+                       WHERE finding_triage.report_artifact_id=triage.review_report_artifact_id
+                         AND finding_triage.disposition='recheck'
+                   ))) < ?")
+            .bind(result.version).bind(user_id).bind(&now).bind(task_id).bind(task_id).bind(task_id).bind(task_id).bind(result.max_rework_rounds).execute(&mut *tx).await?;
         sqlx::query("UPDATE task_rework_automation_intent SET state='pending',block_reason=NULL,updated_at=? WHERE task_id=? AND state='blocked' AND EXISTS(SELECT 1 FROM task_autonomy_retry_grant grant_record WHERE grant_record.intent_id=task_rework_automation_intent.id AND grant_record.limits_version=?)")
             .bind(&now).bind(task_id).bind(result.version).execute(&mut *tx).await?;
         let exhausted=sqlx::query("SELECT id,route_id FROM task_quality_request WHERE task_id=? AND state='requires_human' AND requires_human_reason_code IN ('coordination.budget_exhausted','coordination.quality_route_budget_exhausted') ORDER BY created_at,id")

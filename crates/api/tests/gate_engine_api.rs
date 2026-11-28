@@ -2,7 +2,10 @@
 
 mod common;
 
-use api_types::{GateEvaluationResponse, GateResponse, TaskLifecycleResponse, TaskResponse};
+use api_types::{
+    GateEvaluationResponse, GatePolicyRevisionResponse, GateResponse, TaskLifecycleResponse,
+    TaskResponse,
+};
 use axum::http::{Method, StatusCode};
 use common::{create_project_and_repo, json_request, setup_git_repo, test_app, TestDir};
 use serde_json::json;
@@ -252,4 +255,199 @@ async fn rejected_decision_cannot_authorize_merge_and_invalid_creation_leaves_no
         .await
         .expect("Gate count after successful atomic create");
     assert_eq!(gate_count, 1);
+}
+
+#[tokio::test]
+async fn review_range_gate_generators_preserve_current_review_coverage() {
+    let workspace = TestDir::new("review-range-gate-generator-workspaces");
+    let repo_root = TestDir::new("review-range-gate-generator-repo");
+    let repo_path = setup_git_repo(repo_root.path());
+    let harness = test_app(workspace.path(), "review-range-gate-generators").await;
+    let (project_id, _repo_id) =
+        create_project_and_repo(&harness.app, "Review range Gate generators", &repo_path).await;
+    let task: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({"title": "Preserve coverage on generated Gates"}),
+        StatusCode::OK,
+    )
+    .await;
+    // A Task has one merge_readiness Gate per scope, so each generator gets its own Task.
+    let v2_task: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({"title": "Preserve coverage on generated v2 Gates"}),
+        StatusCode::OK,
+    )
+    .await;
+    let owner_id: String = sqlx::query_scalar("SELECT owner_id FROM project WHERE id = ?")
+        .bind(&project_id)
+        .fetch_one(harness.state.db.pool())
+        .await
+        .expect("Project owner");
+    let review_policy = json!({
+        "schema_version": 1,
+        "risk_class": "r1",
+        "coverage_required": true,
+        "trigger_mode": "auto",
+        "reviewer_role": "reviewer",
+        "required_reviewers": 1,
+        "require_human": false,
+        "size_threshold": {"changed_lines": 800, "changed_files": 25},
+        "coordinator_may_request": true,
+        "max_checkpoints_per_repo": 12
+    });
+    let review_policy_digest = "a".repeat(64);
+    for task_id in [&task.id, &v2_task.id] {
+        sqlx::query(
+            "INSERT INTO task_review_policy_revision (
+             task_id, revision, state, policy_json, digest, risk_class,
+             coverage_required, source, created_by_user_id, created_at, superseded_at
+         ) VALUES (?, 1, 'current', ?, ?, 'r1', 1, 'owner', ?, ?, NULL)",
+        )
+        .bind(task_id)
+        .bind(review_policy.to_string())
+        .bind(&review_policy_digest)
+        .bind(&owner_id)
+        .bind(db::now_rfc3339())
+        .execute(harness.state.db.pool())
+        .await
+        .expect("current Task review policy");
+    }
+
+    let decision = json!({
+        "proposal_id": "proposal-exact",
+        "proposal_version": 1,
+        "decision_id": "decision-exact",
+        "outcome": "approve",
+        "policy_ref": "merge-policy",
+        "policy_version": 1,
+        "policy_digest": "b".repeat(64),
+        "permitted_deciders": []
+    });
+    let v1_gate: GateResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/gates", task.id),
+        json!({
+            "gate_kind": "merge_readiness",
+            "policy": {
+                "schema_version": 1,
+                "scope_requirement": null,
+                "review": null,
+                "validations": [],
+                "decisions": [decision.clone()],
+                "work_units": []
+            }
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let v1_policy = v1_gate.active_policy.expect("v4 policy is returned").policy;
+    assert_eq!(v1_policy["schema_version"], 4);
+    assert_eq!(v1_policy["review_coverage"]["review_policy_revision"], 1);
+    assert_eq!(
+        v1_policy["review_coverage"]["review_policy_digest"],
+        review_policy_digest
+    );
+
+    let v2_gate: GateResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/gates", v2_task.id),
+        json!({
+            "gate_kind": "merge_readiness",
+            "policy": {
+                "schema_version": 2,
+                "scope_requirement": null,
+                "review": null,
+                "validations": [],
+                "decisions": [decision.clone()],
+                "work_units": [],
+                "required_checks": []
+            }
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let v2_policy = v2_gate.active_policy.expect("v4 policy is returned").policy;
+    assert_eq!(v2_policy["schema_version"], 4);
+    assert_eq!(v2_policy["review_coverage"]["review_policy_revision"], 1);
+    assert_eq!(
+        v2_policy["review_coverage"]["review_policy_digest"],
+        review_policy_digest
+    );
+
+    let mut revised_decision = decision.clone();
+    revised_decision["policy_ref"] = json!("merge-policy-revised");
+    let revised_v1: GatePolicyRevisionResponse = json_request(
+        &harness.app,
+        Method::PUT,
+        &format!("/api/v1/gates/{}/policy", v1_gate.gate.id),
+        json!({
+            "expected_active_revision": 1,
+            "policy": {
+                "schema_version": 1,
+                "scope_requirement": null,
+                "review": null,
+                "validations": [],
+                "decisions": [revised_decision.clone()],
+                "work_units": []
+            }
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(revised_v1.schema_version, 4);
+    assert_eq!(
+        revised_v1.policy["review_coverage"]["review_policy_revision"],
+        1
+    );
+
+    // Revising to identical policy content cannot append a duplicate digest.
+    let _: serde_json::Value = json_request(
+        &harness.app,
+        Method::PUT,
+        &format!("/api/v1/gates/{}/policy", v1_gate.gate.id),
+        json!({
+            "expected_active_revision": 2,
+            "policy": {
+                "schema_version": 1,
+                "scope_requirement": null,
+                "review": null,
+                "validations": [],
+                "decisions": [revised_decision.clone()],
+                "work_units": []
+            }
+        }),
+        StatusCode::CONFLICT,
+    )
+    .await;
+
+    let revised_v2: GatePolicyRevisionResponse = json_request(
+        &harness.app,
+        Method::PUT,
+        &format!("/api/v1/gates/{}/policy", v2_gate.gate.id),
+        json!({
+            "expected_active_revision": 1,
+            "policy": {
+                "schema_version": 2,
+                "scope_requirement": null,
+                "review": null,
+                "validations": [],
+                "decisions": [revised_decision],
+                "work_units": [],
+                "required_checks": []
+            }
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(revised_v2.schema_version, 4);
+    assert_eq!(
+        revised_v2.policy["review_coverage"]["review_policy_revision"],
+        1
+    );
 }

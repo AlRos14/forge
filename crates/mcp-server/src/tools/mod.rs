@@ -1,6 +1,7 @@
 mod descriptors;
 mod handlers;
 mod project_plan;
+mod review_ranges;
 mod verification;
 
 use serde_json::Value;
@@ -19,6 +20,17 @@ pub(crate) async fn dispatch_tool(
     arguments: Value,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
+    // The tool match embeds every handler future. Keep that large state
+    // machine on the heap so RPC/test callers only store a small future.
+    Box::pin(dispatch_tool_inner(state, name, arguments, context)).await
+}
+
+async fn dispatch_tool_inner(
+    state: &AppState,
+    name: &str,
+    arguments: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
     match name {
         "forge_create_task" => handlers::forge_create_task(state, arguments).await,
         "forge_create_sub_tasks" => handlers::forge_create_sub_tasks(state, arguments).await,
@@ -29,6 +41,36 @@ pub(crate) async fn dispatch_tool(
             handlers::forge_remove_task_dependency(state, arguments, context).await
         }
         "forge_get_project_plan" => project_plan::get_project_plan(state, arguments, context).await,
+        "forge_get_review_coverage" => {
+            review_ranges::get_review_coverage(state, arguments, context).await
+        }
+        "forge_get_task_review_policy" => {
+            review_ranges::get_task_review_policy(state, arguments, context).await
+        }
+        "forge_set_task_review_policy" => {
+            review_ranges::set_task_review_policy(state, arguments, context).await
+        }
+        "forge_request_range_review" => {
+            review_ranges::request_range_review(state, arguments, context).await
+        }
+        "forge_waive_review_finding" => {
+            review_ranges::waive_review_finding(state, arguments, context).await
+        }
+        "forge_list_review_checkpoints" => {
+            review_ranges::list_review_checkpoints(state, arguments, context).await
+        }
+        "forge_retry_review_checkpoint" => {
+            review_ranges::retry_review_checkpoint(state, arguments, context).await
+        }
+        "forge_attribute_review_commits" => {
+            review_ranges::attribute_review_commits(state, arguments, context).await
+        }
+        "forge_rebaseline_review" => {
+            review_ranges::rebaseline_review(state, arguments, context).await
+        }
+        "forge_list_review_findings" => {
+            review_ranges::list_review_findings(state, arguments, context).await
+        }
         "forge_propose_project_plan" => {
             project_plan::propose_project_plan(state, arguments, context).await
         }

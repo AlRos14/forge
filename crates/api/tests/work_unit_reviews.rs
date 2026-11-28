@@ -389,6 +389,113 @@ async fn human_reviews_an_exact_work_unit_without_creating_an_execution_manually
 }
 
 #[tokio::test]
+async fn review_range_fields_and_proposals_are_refused_outside_range_review() {
+    let repo = TestDir::new("range-guard-repo");
+    let repo_path = setup_git_repo(repo.path());
+    let workspace = TestDir::new("range-guard-workspaces");
+    let harness = test_app(workspace.path(), "range-guard").await;
+    let (project_id, _) = create_project_and_repo(&harness.app, "Range guards", &repo_path).await;
+    let (agent_id, _) = create_shell_agents(&harness.app, workspace.path(), "range-guard").await;
+    let task: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({"title":"Result review stays version 1"}),
+        StatusCode::OK,
+    )
+    .await;
+    for (role, actor, configuration) in [
+        (
+            "implementer",
+            json!({"kind":"agent","id":agent_id}),
+            json!({}),
+        ),
+        (
+            "reviewer",
+            json!({"kind":"human","id":"test-user-id"}),
+            json!({"capabilities":["formal_review"]}),
+        ),
+    ] {
+        let _: Value = json_request(
+            &harness.app,
+            Method::POST,
+            &format!("/api/v1/tasks/{}/task-roles", task.id),
+            json!({"role":role,"coordination_mode":"independent","policy":{},"configuration":configuration}),
+            StatusCode::OK,
+        )
+        .await;
+        let _: Value = json_request(
+            &harness.app,
+            Method::POST,
+            &format!("/api/v1/tasks/{}/task-roles/{role}/members", task.id),
+            json!({"actor_ref":actor}),
+            StatusCode::OK,
+        )
+        .await;
+    }
+    let implementation = create_allocated_work_unit(
+        &harness.app,
+        &task.id,
+        "implementer",
+        &agent_id,
+        "Deliver",
+        "true",
+        true,
+    )
+    .await;
+    let review: WorkUnitResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/work-units", task.id),
+        json!({
+            "title":"Review", "scope":"Review the exact delivered result", "role":"reviewer",
+            "assigned_actor":{"kind":"human","id":"test-user-id"}, "requires_integration":false,
+            "review_subject":{"reviewed_work_unit_id":implementation.id}
+        }),
+        StatusCode::CREATED,
+    )
+    .await;
+    assert!(review.review_range.is_none());
+    for report in [
+        json!({"verdict":"pass","summary":"Range fields","structured_findings":[]}),
+        json!({"verdict":"pass","summary":"Range fields","resolutions":[]}),
+        json!({"verdict":"pass","summary":"Range fields","structured_findings":[],"resolutions":[]}),
+    ] {
+        let refused: Value = json_request(
+            &harness.app,
+            Method::POST,
+            &format!("/api/v1/work-units/{}/review-report", review.id),
+            json!({"expected_version":review.version,"report":report}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        )
+        .await;
+        assert!(
+            refused
+                .to_string()
+                .contains("review.report.invalid_findings"),
+            "{refused}"
+        );
+    }
+    // Waivers, re-baselines and attributions have dedicated Human routes.
+    for kind in ["review_finding", "review_base", "review_commit"] {
+        let _: Value = json_request(
+            &harness.app,
+            Method::POST,
+            &format!("/api/v1/tasks/{}/proposals", task.id),
+            json!({
+                "target":{"kind":kind,"id":"target"},
+                "action":"waive","reason":"generic route",
+                "target_version":null,"target_digest":null,
+                "required_policy_ref":null,"required_policy_version":null,
+                "required_policy_digest":null,"supersedes_proposal_id":null
+            }),
+            StatusCode::FORBIDDEN,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
 async fn multirepo_result_review_response_lists_each_repo() {
     let primary_dir = TestDir::new("multirepo-review-response-primary");
     let primary_path = setup_git_repo(primary_dir.path());

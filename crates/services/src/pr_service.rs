@@ -1227,6 +1227,9 @@ impl PrService {
                     "state": state,
                     "admission_status": metadata.as_ref().map(|metadata| metadata.admission_status.as_str()),
                     "pr_state": metadata.as_ref().map(|metadata| metadata.pr_state.as_str()),
+                    "admitted_source_sha": admission.admitted_source_sha,
+                    "observed_head_sha": admission.observed_head_sha,
+                    "result_classification": admission.result_classification,
                     "version": version,
                 })
                 .to_string(),

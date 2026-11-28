@@ -48,6 +48,7 @@ pub mod provider_authorization;
 pub mod recovery;
 pub mod release_history;
 mod replan_classifier;
+pub mod review_range;
 pub mod role_capabilities;
 pub mod shared_media_cleanup;
 pub mod shutdown;
@@ -286,9 +287,52 @@ pub enum ServiceError {
     TerminalInvalidInput { message: String },
 }
 
+/// A commit-range review submits `structured_findings` and `resolutions` and
+/// leaves the free-text `findings` empty.
+pub(crate) fn require_range_report_fields(
+    report: &api_types::SubmitReviewReportRequest,
+) -> Result<()> {
+    if report.structured_findings.is_none()
+        || report.resolutions.is_none()
+        || !report.findings.is_empty()
+    {
+        return Err(ServiceError::Coordination {
+            code: "review.report.invalid_findings",
+            message: "a commit-range review requires structured_findings and resolutions with empty findings"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Commit-range ReviewReport fields are not accepted for a WorkUnit result
+/// review.
+pub(crate) fn reject_range_report_fields(
+    report: &api_types::SubmitReviewReportRequest,
+) -> Result<()> {
+    if report.structured_findings.is_some() || report.resolutions.is_some() {
+        return Err(ServiceError::Coordination {
+            code: "review.report.invalid_findings",
+            message: "structured_findings and resolutions are only valid for a commit-range review"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
 impl From<db::DbError> for ServiceError {
     fn from(error: db::DbError) -> Self {
         match error {
+            db::DbError::Sqlx(error)
+                if error
+                    .as_database_error()
+                    .is_some_and(|error| error.message() == "gate.review_coverage_missing") =>
+            {
+                Self::Coordination {
+                    code: "gate.review_coverage_missing",
+                    message: "required review coverage is missing".to_owned(),
+                }
+            }
             db::DbError::DependencyGate => Self::DependencyGate,
             db::DbError::AgentPaused { agent_id } => Self::AgentPaused { agent_id },
             db::DbError::QualityRequestBudgetExhausted => Self::Coordination {

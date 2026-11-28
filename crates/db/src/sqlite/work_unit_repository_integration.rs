@@ -1,6 +1,6 @@
 use super::*;
 
-fn map_repository_integration(row: SqliteRow) -> Result<WorkUnitRepositoryIntegration> {
+pub(super) fn map_repository_integration(row: SqliteRow) -> Result<WorkUnitRepositoryIntegration> {
     Ok(WorkUnitRepositoryIntegration {
         id: row.try_get("id")?,
         work_unit_integration_id: row.try_get("work_unit_integration_id")?,

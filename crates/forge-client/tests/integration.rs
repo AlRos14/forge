@@ -274,6 +274,7 @@ async fn create_project_route(
         paused: false,
         project_hooks: vec![],
         version: 1,
+        default_review_policy: None,
     };
     data.projects.insert(project.id.clone(), project.clone());
     Json(project)

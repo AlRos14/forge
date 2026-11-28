@@ -934,6 +934,15 @@ impl TaskDispatcher {
                 return Ok(false);
             }
         }
+        if !crate::work_unit_service::range_review::actor_did_not_contribute(
+            &self.db,
+            &context.work_unit_id,
+            &db::ActorRef::Agent(agent.id.clone()),
+        )
+        .await?
+        {
+            return Ok(false);
+        }
         let actor = api_types::ActorRef::Agent(agent.id.clone());
         crate::task_rework::reviewer_is_independent(&self.db, &context.work_unit_id, &actor).await
     }

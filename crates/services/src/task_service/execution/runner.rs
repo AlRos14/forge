@@ -1258,7 +1258,8 @@ impl TaskService {
                     let collaboration = crate::CollaborationService::new(
                         Arc::clone(&self.db),
                         Arc::clone(&self.event_bus),
-                    );
+                    )
+                    .with_review_workspace_root(self.workspace_root.clone());
                     let materialized = match collaboration
                         .ensure_review_subject_current(&current_execution)
                         .await
@@ -1617,6 +1618,29 @@ impl TaskService {
         }
         let mut ids = Vec::new();
         if let Some(id) = execution.work_unit_id.as_deref() {
+            if crate::work_unit_service::range_review::frozen_range(&self.db, id)
+                .await?
+                .is_some()
+            {
+                // Only the verified read-only range checkout is readable.
+                let mut paths = Vec::new();
+                for member in crate::work_unit_service::range_review::verify_range_checkout(
+                    &self.db,
+                    &execution.task_id,
+                    id,
+                )
+                .await?
+                {
+                    let workspace = WorkspaceRepo::get_by_id(&*self.db, &member.workspace_id)
+                        .await?
+                        .ok_or_else(|| {
+                            ServiceError::invalid_operation("Exact review Workspace is unavailable")
+                        })?;
+                    paths.push(workspace.worktree_path);
+                }
+                paths.sort();
+                return Ok(paths);
+            }
             let subject = crate::task_rework::get_review_subject(&self.db, id)
                 .await?
                 .ok_or_else(|| {
@@ -1703,6 +1727,27 @@ impl TaskService {
             ServiceError::invalid_operation("WorkspaceGroup Execution has no WorkUnit")
         })?;
         let selected = WorkUnitRepo::list_repository_ids(&*self.db, work_unit_id).await?;
+        if is_review
+            && crate::work_unit_service::range_review::frozen_range(&self.db, work_unit_id)
+                .await?
+                .is_some()
+        {
+            // No-write verification of the lease-free range checkout.
+            let checkout = crate::work_unit_service::range_review::verify_range_checkout(
+                &self.db,
+                &execution.task_id,
+                work_unit_id,
+            )
+            .await?;
+            let expected_repos = checkout
+                .into_iter()
+                .map(|member| member.repo_id)
+                .collect::<HashSet<_>>();
+            return ensure_no_unexpected_git_repositories(
+                Path::new(&group.root_path),
+                &expected_repos,
+            );
+        }
         let mut expected_context = HashSet::new();
         if !is_review {
             expected_context.extend(

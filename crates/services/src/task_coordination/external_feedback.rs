@@ -696,6 +696,7 @@ impl TaskCoordinationService {
 Return exactly one JSON object and no markdown fences matching:\n\
 {{\"schema_version\":2,\"request_id\":{request_id},\"task_id\":{task_id},\"authorization_version\":{authorization_version},\"external_feedback\":[{{\"feedback_item_id\":\"...\",\"body_digest\":\"<the item's body_digest>\",\"disposition\":\"extend_task|propose_task|human|dismiss\",\"rationale\":\"...\",\"instructions\":\"...\",\"scope_assessment\":\"within_task_scope|scope_change|null\",\"dismiss_reason\":null,\"proposal\":null,\"micro_fix\":null}}],\"work_unit_plan\":null,\"outputs\":[]}}\n\
 Exactly one entry per item, with its exact feedback_item_id and body_digest. `extend_task`: the item is a defect, edge case or reviewer request about what this Task already delivers; it is reworked in the same pull request and REQUIRES `work_unit_plan` ({{\"items\":[{{\"key\",\"title\",\"scope\",\"role\",\"assigned_actor\",\"parent_key\",\"depends_on\",\"requires_integration\",\"execution_instructions\",\"acceptance\",\"provenance\":{{\"kind\":\"external_feedback\",\"item_ids\":[extend_task item ids]}}}}]}}) covering every extend_task item with at least one WorkUnit; use only TaskRole names and active members of the team, paths inside the original scope, no review_subject_key and no artifact_inputs. Rust measures the scope; an extend_task outside the original scope is rejected. `propose_task`: a scope expansion; set `proposal` {{title (<=120), description (<=2 KiB), acceptance_criteria (<=8)}}; a Human must approve before any Task exists. `human`: you need a Human to decide; add one `ask_human` output per such item (question, 2-6 options with id/label/description/consequence/authority_effect, evidence_links with exactly one {{\"kind\":\"external_feedback\",\"id\":<item id>}}). `dismiss`: not actionable, not shared, or duplicate; set `dismiss_reason` (not_actionable|disagree|duplicate|already_addressed|out_of_date). `work_unit_plan` is forbidden unless at least one item is extend_task. Optional `micro_fix` is allowed only for `extend_task`, `envelope.micro_fix.enabled` and an explicit TaskRole `micro_fix` action; use exact finding text and paths from the untruncated item, with up to 3 paths, and give that item one dedicated WorkUnit. Keep rationale under 1 KiB and instructions under 4 KiB. Never include commands, tokens or paths outside the Task scope.\n\
+Optional `request_range_review` may request a review under the Task policy and explicit TaskRole permission; provide only an exact writable `repo_id` and reason (1..1024 bytes), with no commit or reviewer.\n\
 Exact source: admission {admission_id} ({digest})\nContext: {context}",
             request_id = serde_json::to_string(&request.id).unwrap(),
             task_id = serde_json::to_string(&request.task_id).unwrap(),
@@ -726,6 +727,7 @@ Exact source: admission {admission_id} ({digest})\nContext: {context}",
             Some(&[
                 CoordinatorOutputKind::AskHuman,
                 CoordinatorOutputKind::ProposeReplan,
+                CoordinatorOutputKind::RequestRangeReview,
             ]),
         )?;
         Ok((parsed, set))
@@ -902,6 +904,8 @@ Exact source: admission {admission_id} ({digest})\nContext: {context}",
                 self.validate_external_feedback_plan(plan, &team)?;
             }
             let classification = classify_rework_scope(parsed.plan.as_ref(), &envelope, &original);
+            self.apply_request_range_review_outputs(request, execution, &parsed.outputs)
+                .await?;
             apply_external_feedback_triage(
                 &self.db,
                 ApplyExternalFeedbackTriage {

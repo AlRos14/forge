@@ -2696,6 +2696,13 @@ pub enum ProposalTargetKind {
     WorkUnit,
     /// A `human_approval` PR external action (V177; plan node P3).
     PrExternalAction,
+    /// A range review finding waived by an active Task member or Project
+    /// owner/admin Decision (V185).
+    ReviewFinding,
+    /// A Human re-baseline of one Task repository (V185).
+    ReviewBase,
+    /// A Human attribution of unrecorded commits of one repository (V185).
+    ReviewCommit,
 }
 
 enum_strings!(ProposalTargetKind {
@@ -2704,6 +2711,9 @@ enum_strings!(ProposalTargetKind {
     Workspace => "workspace",
     WorkUnit => "work_unit",
     PrExternalAction => "pr_external_action",
+    ReviewFinding => "review_finding",
+    ReviewBase => "review_base",
+    ReviewCommit => "review_commit",
 });
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -5155,4 +5165,511 @@ pub struct CreateExternalFeedbackDisposition {
     pub dismiss_reason: Option<FeedbackDismissReason>,
     pub proposal_json: Option<String>,
     pub created_at: String,
+}
+
+// ---------------------------------------------------------------------------
+// Review ranges and per-repository coverage (V184/V185).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewRiskClass {
+    R0,
+    R1,
+    R2,
+}
+
+enum_strings!(ReviewRiskClass {
+    R0 => "r0",
+    R1 => "r1",
+    R2 => "r2",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewTriggerMode {
+    Auto,
+    Manual,
+}
+
+enum_strings!(ReviewTriggerMode {
+    Auto => "auto",
+    Manual => "manual",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewPolicyRevisionState {
+    Current,
+    Superseded,
+}
+
+enum_strings!(ReviewPolicyRevisionState {
+    Current => "current",
+    Superseded => "superseded",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewPolicySource {
+    ProjectDefault,
+    Owner,
+}
+
+enum_strings!(ReviewPolicySource {
+    ProjectDefault => "project_default",
+    Owner => "owner",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewBaseSource {
+    FirstIntegration,
+    WorkspacePrepare,
+    HumanRebaseline,
+}
+
+enum_strings!(ReviewBaseSource {
+    FirstIntegration => "first_integration",
+    WorkspacePrepare => "workspace_prepare",
+    HumanRebaseline => "human_rebaseline",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewCheckpointState {
+    Queued,
+    Pending,
+    InReview,
+    Reviewed,
+    Blocked,
+    Superseded,
+}
+
+enum_strings!(ReviewCheckpointState {
+    Queued => "queued",
+    Pending => "pending",
+    InReview => "in_review",
+    Reviewed => "reviewed",
+    Blocked => "blocked",
+    Superseded => "superseded",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewCheckpointReason {
+    Baseline,
+    Delta,
+    AfterWorkUnit,
+    SizeThreshold,
+    Requested,
+    Final,
+    Recheck,
+}
+
+enum_strings!(ReviewCheckpointReason {
+    Baseline => "baseline",
+    Delta => "delta",
+    AfterWorkUnit => "after_work_unit",
+    SizeThreshold => "size_threshold",
+    Requested => "requested",
+    Final => "final",
+    Recheck => "recheck",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewRequestSourceKind {
+    Human,
+    Coordinator,
+    Scheduler,
+}
+
+enum_strings!(ReviewRequestSourceKind {
+    Human => "human",
+    Coordinator => "coordinator",
+    Scheduler => "scheduler",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewVerdict {
+    Pass,
+    RequestChanges,
+    Questions,
+}
+
+enum_strings!(ReviewVerdict {
+    Pass => "pass",
+    RequestChanges => "request_changes",
+    Questions => "questions",
+});
+
+/// Ordered from most to least severe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ReviewFindingSeverity {
+    P0,
+    P1,
+    P2,
+    P3,
+}
+
+impl ReviewFindingSeverity {
+    pub fn is_blocking(self) -> bool {
+        matches!(self, Self::P0 | Self::P1)
+    }
+}
+
+enum_strings!(ReviewFindingSeverity {
+    P0 => "P0",
+    P1 => "P1",
+    P2 => "P2",
+    P3 => "P3",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewResolutionOutcome {
+    Fixed,
+    NotReproduced,
+    Waived,
+}
+
+enum_strings!(ReviewResolutionOutcome {
+    Fixed => "fixed",
+    NotReproduced => "not_reproduced",
+    Waived => "waived",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewAttributionKind {
+    WorkUnit,
+    Preexisting,
+    Upstream,
+    Unattributed,
+}
+
+enum_strings!(ReviewAttributionKind {
+    WorkUnit => "work_unit",
+    Preexisting => "preexisting",
+    Upstream => "upstream",
+    Unattributed => "unattributed",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewFindingDisposition {
+    Correct,
+    Recheck,
+    Human,
+    Defer,
+}
+
+enum_strings!(ReviewFindingDisposition {
+    Correct => "correct",
+    Recheck => "recheck",
+    Human => "human",
+    Defer => "defer",
+});
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewSizeThreshold {
+    pub changed_lines: u64,
+    pub changed_files: u64,
+}
+
+/// Canonical Task review policy. Field order is part of the policy digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewPolicyDocument {
+    pub schema_version: u32,
+    pub risk_class: ReviewRiskClass,
+    pub coverage_required: bool,
+    pub trigger_mode: ReviewTriggerMode,
+    pub reviewer_role: String,
+    pub required_reviewers: u32,
+    pub require_human: bool,
+    pub size_threshold: ReviewSizeThreshold,
+    pub coordinator_may_request: bool,
+    #[serde(default = "default_max_review_checkpoints_per_repo")]
+    pub max_checkpoints_per_repo: u32,
+}
+
+fn default_max_review_checkpoints_per_repo() -> u32 {
+    12
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectReviewPolicy {
+    pub project_id: String,
+    pub version: i64,
+    pub policy: Option<ReviewPolicyDocument>,
+    pub digest: Option<String>,
+    pub updated_by_user_id: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskReviewPolicyRevision {
+    pub task_id: String,
+    pub revision: i64,
+    pub state: ReviewPolicyRevisionState,
+    pub policy: ReviewPolicyDocument,
+    pub digest: String,
+    pub source: ReviewPolicySource,
+    pub created_by_user_id: String,
+    pub created_at: String,
+    pub superseded_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewPolicyRef {
+    pub revision: i64,
+    pub digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskReviewBase {
+    pub task_id: String,
+    pub repo_id: String,
+    pub revision: i64,
+    pub base_commit: String,
+    pub base_tree: String,
+    pub source: ReviewBaseSource,
+    pub decision_id: Option<String>,
+    pub pinned_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewCommitAttribution {
+    pub id: String,
+    pub task_id: String,
+    pub repo_id: String,
+    pub commit_sha: String,
+    pub actor: ActorRef,
+    pub decision_id: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewRange {
+    pub id: String,
+    pub task_id: String,
+    pub repo_id: String,
+    pub repository_set_revision: i64,
+    pub base_commit: String,
+    pub head_commit: String,
+    pub base_tree: String,
+    pub head_tree: String,
+    pub range_digest: String,
+    pub integration_workspace_id: String,
+    pub head_integration_id: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewCheckpoint {
+    pub id: String,
+    pub task_id: String,
+    pub repo_id: String,
+    pub state: ReviewCheckpointState,
+    pub reasons: Vec<ReviewCheckpointReason>,
+    pub attempt: i64,
+    pub base_commit: Option<String>,
+    pub head_commit: String,
+    pub range_id: Option<String>,
+    pub policy_revision: i64,
+    pub blocked_code: Option<String>,
+    pub blocked_detail_json: Option<String>,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewPlanCheckpoint {
+    pub task_id: String,
+    pub plan_artifact_id: String,
+    pub plan_key: String,
+    pub work_unit_ids: Vec<String>,
+    pub repository_ids: Vec<String>,
+    pub reason: String,
+    pub active: bool,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewRangeContributor {
+    pub id: String,
+    pub task_id: String,
+    pub range_id: String,
+    pub work_unit_id: Option<String>,
+    pub execution_id: Option<String>,
+    pub attribution_id: Option<String>,
+    pub actor: ActorRef,
+    pub created_at: String,
+}
+
+/// One open finding frozen as review input. Lists are ordered by `finding_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewInputFinding {
+    pub finding_id: String,
+    pub severity: ReviewFindingSeverity,
+    pub digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkUnitReviewRange {
+    pub review_work_unit_id: String,
+    pub task_id: String,
+    pub checkpoint_id: String,
+    pub range_id: String,
+    pub repo_id: String,
+    pub input_findings: Vec<ReviewInputFinding>,
+    pub input_findings_digest: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewRangeReport {
+    pub report_artifact_id: String,
+    pub task_id: String,
+    pub repo_id: String,
+    pub range_id: String,
+    pub checkpoint_id: String,
+    pub review_work_unit_id: String,
+    pub execution_id: String,
+    pub actor: ActorRef,
+    pub verdict: ReviewVerdict,
+    pub report_digest: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewFinding {
+    pub id: String,
+    pub task_id: String,
+    pub repo_id: String,
+    pub range_id: String,
+    pub report_artifact_id: String,
+    pub ordinal: i64,
+    pub label: String,
+    pub severity: ReviewFindingSeverity,
+    pub title: String,
+    pub evidence: String,
+    pub invariant: Option<String>,
+    pub anchor_commit: String,
+    pub digest: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewFindingLocation {
+    pub finding_id: String,
+    pub task_id: String,
+    pub ordinal: i64,
+    pub path: String,
+    pub line_start: Option<i64>,
+    pub line_end: Option<i64>,
+    pub attribution: ReviewLocationAttribution,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewLocationAttribution {
+    pub kind: ReviewAttributionKind,
+    pub work_unit_id: Option<String>,
+    pub execution_id: Option<String>,
+    pub actor: Option<ActorRef>,
+    pub commit_sha: Option<String>,
+    pub integration_id: Option<String>,
+    pub line_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewFindingResolution {
+    pub id: String,
+    pub finding_id: String,
+    pub task_id: String,
+    pub repo_id: String,
+    pub outcome: ReviewResolutionOutcome,
+    pub anchor_commit: String,
+    pub report_artifact_id: Option<String>,
+    pub decision_id: Option<String>,
+    pub waiver_reference: Option<String>,
+    pub evidence: String,
+    pub actor: ActorRef,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewFindingTriage {
+    pub finding_id: String,
+    pub request_id: String,
+    pub task_id: String,
+    pub report_artifact_id: String,
+    pub execution_id: String,
+    pub authorization_version: i64,
+    pub disposition: ReviewFindingDisposition,
+    pub rationale: String,
+    pub instructions: String,
+    pub created_at: String,
+}
+
+/// The aggregate `task_review_triage` row written for one range report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTaskReviewTriage {
+    pub review_report_artifact_id: String,
+    pub task_id: String,
+    pub report_digest: String,
+    pub execution_id: String,
+    pub authorization_version: i64,
+    pub disposition: ReviewFindingDisposition,
+    pub rationale: String,
+    pub instructions: String,
+    pub decision_digest: String,
+    pub review_work_unit_id: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewReworkRound {
+    pub report_artifact_id: String,
+    pub task_id: String,
+    pub round: i64,
+    pub request_id: Option<String>,
+    pub created_by: ActorRef,
+    pub idempotency_key: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewCorrectionLink {
+    pub correction_work_unit_id: String,
+    pub finding_id: String,
+    pub task_id: String,
+    pub repo_id: String,
+    pub report_artifact_id: String,
+    pub base_commit: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskReviewCoverageState {
+    pub task_id: String,
+    pub repo_id: String,
+    pub revision: i64,
+    pub updated_at: String,
+}
+
+/// Rows needed by the pure coverage evaluator, read in one transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewCoverageRows {
+    pub policy: Option<TaskReviewPolicyRevision>,
+    pub base: Option<TaskReviewBase>,
+    pub state_revision: i64,
+    pub integrations: Vec<WorkUnitRepositoryIntegration>,
+    pub ranges: Vec<ReviewRange>,
+    pub checkpoints: Vec<ReviewCheckpoint>,
+    pub reports: Vec<ReviewRangeReport>,
+    pub findings: Vec<ReviewFinding>,
+    pub resolutions: Vec<ReviewFindingResolution>,
+    pub attributions: Vec<ReviewCommitAttribution>,
+    /// Result review lines touching this repository whose latest verdict is
+    /// `request_changes`.
+    pub failing_result_lines: Vec<String>,
 }

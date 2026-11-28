@@ -81,9 +81,15 @@ pub struct ReplanClassificationFacts {
     pub repository_set_unchanged: bool,
     pub repositories_within_original: bool,
     pub work_unit_repository_scopes_unchanged: bool,
+    #[serde(default = "default_true")]
+    pub review_checkpoints_unchanged: bool,
     pub paths_within_original: bool,
     pub no_new_envelope_flags: bool,
     pub plan_items: usize,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,6 +222,7 @@ pub fn classify_replan(
         repository_set_unchanged,
         repositories_within_original,
         work_unit_repository_scopes_unchanged,
+        review_checkpoints_unchanged: true,
         paths_within_original,
         no_new_envelope_flags,
         plan_items: items.len(),
@@ -226,6 +233,7 @@ pub fn classify_replan(
         && facts.work_units_within_limit
         && facts.repositories_within_original
         && facts.work_unit_repository_scopes_unchanged
+        && facts.review_checkpoints_unchanged
         && facts.paths_within_original
         && facts.no_new_envelope_flags;
     ReplanClassificationResult {
@@ -411,6 +419,8 @@ mod tests {
                 artifact_inputs: vec![],
                 repository_ids: vec![],
             }],
+            review_checkpoints: Vec::new(),
+            review_policy_digest: None,
             repository_set: None,
             delivery: None,
             review: None,
@@ -429,7 +439,7 @@ mod tests {
         assert_eq!(result.classification, ReplanClassification::WithinEnvelope);
         assert_eq!(
             result.classification_facts_json(),
-            r#"{"objective_digest_unchanged":true,"roles_within_team":true,"actors_within_team":true,"work_units_within_limit":true,"work_units_total":2,"max_work_units":2,"repository_set_unchanged":true,"repositories_within_original":true,"work_unit_repository_scopes_unchanged":true,"paths_within_original":true,"no_new_envelope_flags":true,"plan_items":1}"#
+            r#"{"objective_digest_unchanged":true,"roles_within_team":true,"actors_within_team":true,"work_units_within_limit":true,"work_units_total":2,"max_work_units":2,"repository_set_unchanged":true,"repositories_within_original":true,"work_unit_repository_scopes_unchanged":true,"review_checkpoints_unchanged":true,"paths_within_original":true,"no_new_envelope_flags":true,"plan_items":1}"#
         );
     }
 

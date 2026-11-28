@@ -161,6 +161,15 @@ Artifact inputs before creating WorkUnits in one transaction with an idempotent
 receipt. `manual` remains the default. See the
 [PR0 contract](../plans/pr0-task-coordination-contract.md).
 
+When a Task has review policy R2, a plan may also pin `review_policy_digest`
+and add `review_checkpoints` after integrated WorkUnits. Each checkpoint has a
+unique key, one or more `after_work_unit_keys`, an optional writable
+`repository_ids` subset (empty means the repositories written by those
+WorkUnits), and a reason. Forge materializes these as durable review
+checkpoints after the exact named integrations; checkpoint limits and range
+authority remain in the review service. Plans must not create repository
+`formal_review` WorkUnits or result-review subjects for integrated changes.
+
 Any team change (RoleMembership, TaskRole or capability) marks the authorization
 stale (`coordination.authorization_stale`) until a Human re-authorizes. The one
 exception is a pure narrowing: when a currently authorized, non-stale,
@@ -188,8 +197,11 @@ pins `authorization_version`, `review_report_artifact_id`, `report_digest`,
 `disposition`, `rationale`, and `instructions`. `correct` releases the configured
 correction route with the coordinator's actionable brief; `recheck` creates a fresh
 review WorkUnit for the same immutable result and the disputed findings; `human`
-stops automatic correction for that report. Decisions are immutable and replay
-safe. A coordinator never rewrites a ReviewReport or supplies approval evidence.
+stops automatic correction for that report. For commit-range reports, `defer`
+records an exact non-blocking P2/P3 finding for later handling; P0/P1 findings
+cannot be deferred and must be corrected, rechecked, or raised to a Human.
+Decisions are immutable and replay safe. A coordinator never rewrites a
+ReviewReport or supplies approval evidence.
 Current team, role policy, wake lease, exact report and authorization are checked
 inside the writer transaction. Revoked, stale, paused or terminal work is rejected.
 

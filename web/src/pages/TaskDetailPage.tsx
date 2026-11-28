@@ -46,6 +46,7 @@ import { TaskWorkManagement } from '@/components/task-detail/task-work-managemen
 import { TaskRepositoryPanel } from '@/components/task-detail/task-repository-panel'
 import { TaskReworkPanel } from '@/components/task-detail/task-rework-panel'
 import { WorkUnitHumanReviewPanel } from '@/components/task-detail/work-unit-review-panel'
+import { TaskReviewCoveragePanel } from '@/components/task-detail/task-review-coverage-panel'
 import { ActorIdentity } from '@/features/task-roles/ActorIdentity'
 import { CopyReferenceButton } from '@/components/ui/copy-reference-button'
 import { TaskCoordinationPanel } from '@/components/task-detail/task-coordination-panel'
@@ -1189,6 +1190,10 @@ export function TaskDetailPage({
 
       {activeTab === 'review' ? (
         <section className="space-y-4">
+          <TaskReviewCoveragePanel
+            taskId={task.id}
+            projectPolicy={projectQuery.data?.default_review_policy ?? null}
+          />
           <div className="rounded-lg border p-4">
             <h2 className="font-semibold">Review Executions</h2>
             <p className="text-xs text-muted-foreground">

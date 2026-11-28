@@ -52,19 +52,17 @@ impl TaskService {
                         "Review Execution must keep workspace_id NULL",
                     ));
                 }
-                let subject =
-                    WorkUnitRepo::list_review_subject_repositories(&*self.db, &work_unit.id)
-                        .await?;
-                let repo_ids = subject
-                    .iter()
-                    .map(|repository| repository.repo_id.clone())
-                    .collect::<HashSet<_>>();
+                let repo_ids = crate::work_unit_service::range_review::review_group_repository_ids(
+                    &self.db,
+                    &work_unit.id,
+                )
+                .await?;
                 if repo_ids.is_empty()
-                    || subject.iter().any(|repository| {
-                        repository.result_execution_id.is_none()
-                            || repository.result_commit_sha.is_none()
-                            || repository.result_workspace_id.is_none()
-                    })
+                    || !crate::work_unit_service::range_review::review_group_is_frozen(
+                        &self.db,
+                        &work_unit.id,
+                    )
+                    .await?
                 {
                     return Err(ServiceError::invalid_operation(
                         "Review WorkspaceGroup requires a fully frozen exact subject",
@@ -153,6 +151,14 @@ impl TaskService {
             return Ok(leases);
         }
 
+        if crate::work_unit_service::range_review::frozen_range(&self.db, &work_unit.id)
+            .await?
+            .is_some()
+        {
+            return Err(ServiceError::invalid_operation(
+                "range review requires its prepared read-only WorkspaceGroup",
+            ));
+        }
         if work_unit.requires_integration {
             let workspace_id = execution.workspace_id.as_deref().ok_or_else(|| {
                 ServiceError::invalid_operation(
@@ -758,17 +764,17 @@ impl TaskService {
             let task_repositories = TaskRepo::list_repositories(&*self.db, &task.id).await?;
             let selected = WorkUnitRepo::list_repository_ids(&*self.db, work_unit_id).await?;
             let expected_repositories = if formal_review {
-                let subject =
-                    WorkUnitRepo::list_review_subject_repositories(&*self.db, work_unit_id).await?;
+                let subject = crate::work_unit_service::range_review::review_group_repository_ids(
+                    &self.db,
+                    work_unit_id,
+                )
+                .await?;
                 if subject.is_empty() {
                     return Err(ServiceError::invalid_operation(
                         "Review WorkspaceGroup has no exact subject repositories",
                     ));
                 }
                 subject
-                    .into_iter()
-                    .map(|repository| repository.repo_id)
-                    .collect::<HashSet<_>>()
             } else {
                 if !unit.requires_integration {
                     return Err(ServiceError::invalid_operation(
@@ -901,6 +907,14 @@ impl TaskService {
             return Ok(active_leases
                 .into_iter()
                 .find(|lease| lease.execution_id == execution.id));
+        }
+        if crate::work_unit_service::range_review::frozen_range(&self.db, work_unit_id)
+            .await?
+            .is_some()
+        {
+            return Err(ServiceError::invalid_operation(
+                "range review requires its prepared read-only WorkspaceGroup",
+            ));
         }
         if !unit.requires_integration {
             if execution.workspace_id.is_some() {

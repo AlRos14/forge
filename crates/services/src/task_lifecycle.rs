@@ -342,7 +342,19 @@ impl TaskLifecycleService {
                 api_types::TaskRoleCapability::FormalReview,
             )
             .await?;
-            let review_subject_ready = if has_review_subject || formal_review {
+            // A range reviewer is ready while its checkpoint is active and
+            // its read-only WorkspaceGroup is prepared.
+            let frozen_range =
+                crate::work_unit_service::range_review::frozen_range(&self.db, &unit.id).await?;
+            let review_subject_ready = if let Some(frozen) = frozen_range.as_ref() {
+                formal_review
+                    && crate::work_unit_service::range_review::range_review_ready(&self.db, frozen)
+                        .await?
+                    && (!matches!(unit.assigned_actor, Some(db::ActorRef::Agent(_)))
+                        || WorkspaceRepo::get_group_by_work_unit_id(&*self.db, &unit.id)
+                            .await?
+                            .is_some())
+            } else if has_review_subject || formal_review {
                 if !has_review_subject || !formal_review {
                     false
                 } else {
@@ -402,7 +414,11 @@ impl TaskLifecycleService {
                 }
                 WorkUnitStatus::Open if !review_subject_ready => (
                     "waiting_dependency",
-                    Some("the exact reviewed WorkUnit result is not ready"),
+                    Some(if frozen_range.is_some() {
+                        "the range review checkpoint or its read-only checkout is not ready"
+                    } else {
+                        "the exact reviewed WorkUnit result is not ready"
+                    }),
                     None,
                 ),
                 WorkUnitStatus::Open if awaiting_acceptance => (

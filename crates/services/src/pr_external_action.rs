@@ -27,7 +27,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use db::{
     new_uuid_v4, now_rfc3339, CollaborationRepo, CreateDomainEvent, CreatePrExternalAction,
-    DbError, DecisionOutcome, DomainEvent, PrExternalAction, PrExternalActionKind,
+    DbError, DecisionOutcome, DomainEvent, GateRepo, PrExternalAction, PrExternalActionKind,
     PrExternalActionRepo, PrExternalActionState, PrFeedbackAuthorization, PrFeedbackPolicy,
     PrFeedbackSummaryMode, PrMetadataRepo, PrReworkRepo, PrReworkState, ProposalTarget,
     ProposalTargetKind, RemotePrAdmission, SqliteDb, TaskIntegrationOperationRepo, TaskRepo,
@@ -47,6 +47,7 @@ use crate::domain_event_service::DomainEventService;
 use crate::pr_feedback::forge_comment_marker;
 use crate::pr_github_client::{GitHubClient, GitHubClientError, GitHubRepoRef};
 use crate::pr_service::{PrService, RemotePrAdmissionKey};
+use crate::task_integration_operation::TaskIntegrationOperationManager;
 use crate::{Result, ServiceError};
 
 pub const CODE_NOT_AUTHORIZED: &str = "pr_action.not_authorized";
@@ -55,6 +56,7 @@ pub const CODE_PROVIDER_REJECTED: &str = "pr_action.provider_rejected";
 pub const CODE_OUTCOME_UNKNOWN_EXPIRED: &str = "pr_action.outcome_unknown_expired";
 pub const CODE_NOT_FAST_FORWARD: &str = crate::pr_rework::CODE_NOT_FAST_FORWARD;
 pub const CODE_REUSE_TARGET_MISSING: &str = crate::pr_rework::CODE_REUSE_TARGET_MISSING;
+const CODE_REVIEW_COVERAGE_STALE: &str = "review.coverage.facts_stale";
 
 /// An `outcome_unknown` that stays unresolved this long needs a human.
 const RECOVERY_WINDOW_SECONDS: i64 = 3600;
@@ -99,6 +101,7 @@ pub struct PrExternalActionStats {
 #[derive(Clone)]
 pub struct PrExternalActionService {
     db: Arc<SqliteDb>,
+    event_bus: Arc<EventBus>,
     pr: PrService,
     collaboration: CollaborationService,
     events: DomainEventService,
@@ -111,8 +114,9 @@ impl PrExternalActionService {
     pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>, pr: PrService) -> Self {
         Self {
             collaboration: CollaborationService::new(Arc::clone(&db), Arc::clone(&event_bus)),
-            events: DomainEventService::new(Arc::clone(&db), event_bus),
+            events: DomainEventService::new(Arc::clone(&db), Arc::clone(&event_bus)),
             db,
+            event_bus,
             pr,
             #[cfg(test)]
             push_source_override: None,
@@ -759,6 +763,34 @@ impl PrExternalActionService {
             Ok(secret) => Some(secret),
             Err(error) => return self.defer(&action, &error.to_string()).await,
         };
+        let lock_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let integration_operations =
+            TaskIntegrationOperationManager::new(Arc::clone(&self.db), lock_root);
+        let Some(_integration_claim) = integration_operations
+            .try_pr_recovery_lock(
+                &admission.task_id,
+                &admission.task_merge_operation_id,
+                &admission.publish_operation_id,
+            )
+            .await?
+        else {
+            return self
+                .defer(
+                    &action,
+                    "the exact Task PR integration claim is busy or no longer current",
+                )
+                .await;
+        };
+        if let Err(error) = self.ensure_review_coverage_before_push(&admission).await {
+            return self
+                .reconcile_push(
+                    action,
+                    &admission,
+                    CODE_REVIEW_COVERAGE_STALE,
+                    &error.to_string(),
+                )
+                .await;
+        }
         let running = self.to_running(action).await?;
         match git_push_cas(
             &dir,
@@ -835,6 +867,55 @@ impl PrExternalActionService {
             PathBuf::from(workspace.worktree_path),
             admission.remote_repo_identity.clone(),
         ))
+    }
+
+    async fn ensure_review_coverage_before_push(
+        &self,
+        admission: &RemotePrAdmission,
+    ) -> Result<()> {
+        let merge =
+            TaskIntegrationOperationRepo::get_by_id(&*self.db, &admission.task_merge_operation_id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::not_found(
+                        "TaskMerge operation",
+                        admission.task_merge_operation_id.clone(),
+                    )
+                })?;
+        let evaluation_id = merge.gate_evaluation_id.as_deref().ok_or_else(|| {
+            ServiceError::invalid_operation("PR rework admission has no GateEvaluation")
+        })?;
+        let evaluation = GateRepo::get_gate_evaluation(&*self.db, evaluation_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("GateEvaluation", evaluation_id.to_owned()))?;
+        let gate = GateRepo::get_gate(&*self.db, &evaluation.gate_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("Gate", evaluation.gate_id.clone()))?;
+        let active_revision = gate.active_policy_revision.ok_or_else(|| {
+            ServiceError::invalid_operation("merge-readiness Gate has no active policy")
+        })?;
+        let active_policy =
+            GateRepo::get_gate_policy_revision(&*self.db, &gate.id, active_revision)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::not_found(
+                        "gate policy revision",
+                        format!("{}:{active_revision}", gate.id),
+                    )
+                })?;
+        let workspace_root = if active_policy.schema_version == 4 {
+            crate::gate_engine::infer_review_coverage_workspace_root(&self.db, &admission.task_id)
+                .await?
+        } else {
+            PathBuf::from(".")
+        };
+        crate::merge_service::MergeService::new(
+            Arc::clone(&self.db),
+            Arc::clone(&self.event_bus),
+            workspace_root,
+        )
+        .ensure_current_gate_evaluation_for_pr_rework_push(&admission.task_id, evaluation_id)
+        .await
     }
 
     async fn after_push_success(

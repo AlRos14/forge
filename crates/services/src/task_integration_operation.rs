@@ -3689,7 +3689,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn pull_request_admission_survives_open_restart_gate_change_and_merged_replay() {
+    async fn review_range_external_merge_is_recorded_after_coverage_changes() {
         let temp = TempDir::new().expect("temporary directory");
         let database_url = format!("sqlite://{}", temp.path().join("pr-open.db").display());
         let fixture = fixture(&database_url, temp.path()).await;
@@ -3700,7 +3700,7 @@ pub(crate) mod tests {
                 .expect("PR publication admission");
         let merge_id = merge.id().to_owned();
         let publish_id = publish.id().to_owned();
-        let metadata = create_test_pr_metadata(&fixture, &merge, &publish, "open").await;
+        let _metadata = create_test_pr_metadata(&fixture, &merge, &publish, "open").await;
         publish
             .finish(TaskIntegrationOperationStatus::Succeeded)
             .await
@@ -3738,12 +3738,28 @@ pub(crate) mod tests {
         .expect("TaskMerge history count");
         assert_eq!(task_merge_count, 1, "recovery reuses one admission");
 
+        let admission =
+            TaskIntegrationOperationRepo::get_remote_pr_admission(&*fixture.db, &merge_id)
+                .await
+                .expect("remote admission lookup")
+                .expect("remote admission remains open");
+        let provider = Arc::new(ScriptedPrProvider::default());
+        provider.push_status(Ok(crate::pr_service::RemotePrStatus::Open(
+            crate::pr_service::PrObservation {
+                provider_event_id: "provider-open-before-coverage-change".to_owned(),
+                remote_repo_identity: admission.remote_repo_identity.clone(),
+                source_branch: admission.source_branch.clone(),
+                target_branch: admission.target_branch.clone(),
+                head_sha: admission.admitted_source_sha.clone(),
+                merged_commit_sha: None,
+            },
+        )));
         let reconciler = crate::pr_service::PrReconciler::new(
             Arc::clone(&fixture.db),
             Arc::clone(&event_bus),
             None,
         )
-        .with_provider_for_test(Arc::new(MetadataEchoPrProvider));
+        .with_provider_for_test(provider.clone());
         reconciler
             .reconcile_once()
             .await
@@ -3756,14 +3772,85 @@ pub(crate) mod tests {
 
         let engine =
             crate::gate_engine::GateEngine::new(Arc::clone(&fixture.db), Arc::clone(&event_bus));
+        let review_policy = db::ReviewPolicyDocument {
+            schema_version: 1,
+            risk_class: db::ReviewRiskClass::R1,
+            coverage_required: true,
+            trigger_mode: db::ReviewTriggerMode::Auto,
+            reviewer_role: "reviewer".to_owned(),
+            required_reviewers: 1,
+            require_human: false,
+            size_threshold: db::ReviewSizeThreshold {
+                changed_lines: 800,
+                changed_files: 25,
+            },
+            coordinator_may_request: true,
+            max_checkpoints_per_repo: 12,
+        };
+        let review_policy_json =
+            serde_json::to_string(&review_policy).expect("review policy serializes");
+        let review_policy_digest = crate::review_range::ReviewPolicyService::digest(&review_policy)
+            .expect("review policy digest");
+        let owner_id: String = sqlx::query_scalar(
+            "SELECT project.owner_id FROM task JOIN project ON project.id = task.project_id
+             WHERE task.id = ?",
+        )
+        .bind(&fixture.task_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("Task Project owner");
+        sqlx::query(
+            "INSERT INTO task_review_policy_revision (
+                 task_id, revision, state, policy_json, digest, risk_class,
+                 coverage_required, source, created_by_user_id, created_at, superseded_at
+             ) VALUES (?, 1, 'current', ?, ?, 'r1', 1, 'owner', ?, ?, NULL)",
+        )
+        .bind(&fixture.task_id)
+        .bind(&review_policy_json)
+        .bind(&review_policy_digest)
+        .bind(&owner_id)
+        .bind(now_rfc3339())
+        .execute(fixture.db.pool())
+        .await
+        .expect("Task review policy advances coverage revision");
+        let initial_coverage_revision: i64 = sqlx::query_scalar(
+            "SELECT revision FROM task_review_coverage_state WHERE task_id = ? AND repo_id = ?",
+        )
+        .bind(&fixture.task_id)
+        .bind(&fixture.repo_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("initial review coverage revision");
+        sqlx::query(
+            "UPDATE task_review_coverage_state
+             SET revision = revision + 1, updated_at = ? WHERE task_id = ? AND repo_id = ?",
+        )
+        .bind(now_rfc3339())
+        .bind(&fixture.task_id)
+        .bind(&fixture.repo_id)
+        .execute(fixture.db.pool())
+        .await
+        .expect("coverage changes after the external PR is open");
+        let changed_coverage_revision: i64 = sqlx::query_scalar(
+            "SELECT revision FROM task_review_coverage_state WHERE task_id = ? AND repo_id = ?",
+        )
+        .bind(&fixture.task_id)
+        .bind(&fixture.repo_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("changed review coverage revision");
+        assert_eq!(changed_coverage_revision, initial_coverage_revision + 1);
+
         let mut changed_policy = policy;
         changed_policy.decisions[0].permitted_deciders = vec![db::ActorRef::Human(
             "policy-revision-after-admission".to_owned(),
         )];
-        engine
+        let revised = engine
             .revise_policy(&gate_id, Some(1), changed_policy)
             .await
             .expect("new Gate policy revision after PR admission");
+        assert_eq!(revised.schema_version, 4);
+        assert_ne!(revised.revision, evaluation.policy_revision);
         let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &fixture.task_id)
             .await
             .expect("post-policy-change lifecycle lookup")
@@ -3771,25 +3858,16 @@ pub(crate) mod tests {
         assert_eq!(lifecycle.state, db::TaskLifecycleState::Merging);
         assert_eq!(lifecycle.reason_ref.as_deref(), Some(merge_id.as_str()));
 
-        PrMetadataRepo::update(
-            &*fixture.db,
-            db::UpdatePrMetadata {
-                id: metadata.id.clone(),
-                provider_type: None,
-                provider_pr_id: None,
-                pr_url: None,
-                source_branch: None,
-                target_branch: None,
-                pr_state: Some("merged".to_owned()),
-                merge_status: None,
-                task_merge_operation_id: None,
-                publish_operation_id: None,
-                last_synced_at: None,
-                updated_at: now_rfc3339(),
+        provider.push_status(Ok(crate::pr_service::RemotePrStatus::Merged(
+            crate::pr_service::PrObservation {
+                provider_event_id: "provider-merged-after-coverage-change".to_owned(),
+                remote_repo_identity: admission.remote_repo_identity.clone(),
+                source_branch: admission.source_branch.clone(),
+                target_branch: admission.target_branch.clone(),
+                head_sha: admission.admitted_source_sha.clone(),
+                merged_commit_sha: Some("external-merge-commit-after-coverage-change".to_owned()),
             },
-        )
-        .await
-        .expect("provider reports Merged");
+        )));
         reconciler
             .reconcile_once()
             .await
@@ -3825,6 +3903,17 @@ pub(crate) mod tests {
                 .await
                 .expect("remote admission lookup")
                 .expect("remote admission remains immutable");
+        assert_eq!(admission.state, "merged");
+        assert_eq!(admission.provider_status.as_deref(), Some("merged"));
+        assert_eq!(
+            admission.observed_head_sha.as_deref(),
+            Some(admission.admitted_source_sha.as_str())
+        );
+        assert_eq!(
+            admission.merged_commit_sha.as_deref(),
+            Some("external-merge-commit-after-coverage-change")
+        );
+        assert_eq!(result_payload["status"], "merged");
         let replay = TaskIntegrationOperationRepo::record_remote_pr_outcome(
             &*fixture.db,
             db::RecordRemotePrOutcome {
@@ -3882,7 +3971,7 @@ pub(crate) mod tests {
                 .await
                 .expect("PR publication admission");
         let merge_id = merge.id().to_owned();
-        let metadata = create_test_pr_metadata(&fixture, &merge, &publish, "closed").await;
+        let _metadata = create_test_pr_metadata(&fixture, &merge, &publish, "closed").await;
         publish
             .finish(TaskIntegrationOperationStatus::Succeeded)
             .await
@@ -3950,7 +4039,6 @@ pub(crate) mod tests {
                 .expect("closed PR is not a TaskMerge retry failure"),
             0
         );
-        let _ = metadata;
     }
 
     #[tokio::test]
@@ -4466,7 +4554,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn remote_merge_with_force_pushed_head_is_blocked_and_conflicting_result_rejected() {
+    async fn review_range_remote_merge_with_force_pushed_head_is_visible_and_blocked() {
         let temp = TempDir::new().expect("temporary directory");
         let database_url = format!(
             "sqlite://{}",
@@ -4706,6 +4794,32 @@ pub(crate) mod tests {
         assert_eq!(
             result_payload["merged_commit_sha"],
             "wrong-head-merge-commit"
+        );
+        let task_pr_status_payload: String = sqlx::query_scalar(
+            "SELECT payload_json FROM domain_event
+             WHERE event_type = 'task.repository_pr_status_changed'
+               AND scope_id = ?
+               AND json_extract(payload_json, '$.admission_id') = ?
+             ORDER BY sequence DESC LIMIT 1",
+        )
+        .bind(&fixture.task_id)
+        .bind(&merge_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("public Task PR status event");
+        let task_pr_status_payload: serde_json::Value =
+            serde_json::from_str(&task_pr_status_payload).expect("valid Task PR status payload");
+        assert_eq!(
+            task_pr_status_payload["admitted_source_sha"],
+            admission.admitted_source_sha
+        );
+        assert_eq!(
+            task_pr_status_payload["observed_head_sha"],
+            "force-pushed-sha-B"
+        );
+        assert_eq!(
+            task_pr_status_payload["result_classification"],
+            "head_mismatch"
         );
         let blocked = db::TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &fixture.task_id)
             .await

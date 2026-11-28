@@ -1,5 +1,8 @@
 use super::*;
 use crate::coordinator_outputs::MicroFixOutput;
+use db::{
+    ReviewCheckpointRepo, ReviewLedgerRepo, ReviewRangeReportRepo, TaskCoordinationRequestState,
+};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -15,6 +18,11 @@ pub(crate) struct ReviewFindingsDecision {
 }
 
 use api_types::TaskReviewDisposition as ReviewFindingsDisposition;
+
+/// `defer` applies only to non-blocking findings of a commit-range review.
+fn defer_not_permitted() -> ServiceError {
+    ServiceError::invalid_operation("defer is only valid for commit-range review findings")
+}
 
 impl TaskReworkService {
     pub async fn list_review_triage(
@@ -32,6 +40,7 @@ impl TaskReworkService {
                         "correct" => ReviewFindingsDisposition::Correct,
                         "recheck" => ReviewFindingsDisposition::Recheck,
                         "human" => ReviewFindingsDisposition::Human,
+                        "defer" => ReviewFindingsDisposition::Defer,
                         _ => {
                             return Err(ServiceError::invalid_operation(
                                 "Invalid persisted review disposition",
@@ -75,6 +84,24 @@ impl TaskReworkService {
                     "ReviewFindings request has no report producer Execution",
                 )
             })?;
+        let is_range: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM review_range_report
+             WHERE report_artifact_id=? AND task_id=?)",
+        )
+        .bind(report_id)
+        .bind(&request.task_id)
+        .fetch_one(self.db.pool())
+        .await?;
+        if is_range {
+            return self
+                .exact_range_review_findings_context(
+                    request,
+                    report_id,
+                    report_digest,
+                    review_producer_execution_id,
+                )
+                .await;
+        }
         let row = sqlx::query(
             "SELECT report.id,report.digest,report.content,
                     intent.reviewed_work_unit_id,intent.reviewed_work_unit_version,
@@ -167,12 +194,291 @@ impl TaskReworkService {
         }))
     }
 
+    async fn exact_range_review_findings_context(
+        &self,
+        request: &db::TaskCoordinationRequest,
+        report_id: &str,
+        report_digest: &str,
+        producer_execution_id: &str,
+    ) -> Result<serde_json::Value> {
+        let mut source_current: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM task_review_coordination_source_current source
+                JOIN task_coordination_request request
+                  ON request.id=? AND request.task_id=source.task_id
+                 AND request.kind='review_findings'
+                 AND request.review_report_artifact_id=source.report_id
+                 AND request.review_report_digest=source.report_digest
+                 AND request.review_producer_execution_id=source.producer_execution_id
+                 AND request.authorization_version=source.authorization_version
+                 AND request.state IN ('requested','running','uncertain')
+                WHERE source.report_id=? AND source.task_id=?
+                  AND source.report_digest=? AND source.producer_execution_id=?
+            )",
+        )
+        .bind(&request.id)
+        .bind(report_id)
+        .bind(&request.task_id)
+        .bind(report_digest)
+        .bind(producer_execution_id)
+        .fetch_one(self.db.pool())
+        .await?;
+        if !source_current && request.state == TaskCoordinationRequestState::Triaged {
+            source_current = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM task_coordination_request request
+                    JOIN task_review_triage triage
+                      ON triage.task_id=request.task_id
+                     AND triage.review_report_artifact_id=request.review_report_artifact_id
+                    JOIN review_range_report rr
+                      ON rr.report_artifact_id=request.review_report_artifact_id
+                     AND rr.task_id=request.task_id
+                    JOIN artifact report
+                      ON report.id=rr.report_artifact_id AND report.task_id=rr.task_id
+                    JOIN artifact_execution_producer producer
+                      ON producer.artifact_id=report.id AND producer.execution_id=rr.execution_id
+                    JOIN task_coordination coordination
+                      ON coordination.task_id=request.task_id
+                    JOIN task_lifecycle lifecycle
+                      ON lifecycle.task_id=request.task_id
+                     AND lifecycle.state NOT IN ('done','cancelled','merging')
+                    JOIN task_dispatch dispatch
+                      ON dispatch.task_id=request.task_id AND dispatch.state='running'
+                    WHERE request.id=? AND request.task_id=? AND request.kind='review_findings'
+                      AND request.state='triaged'
+                      AND request.review_report_artifact_id=?
+                      AND request.review_report_digest=?
+                      AND request.review_producer_execution_id=producer.execution_id
+                      AND request.authorization_version=?
+                      AND triage.execution_id=request.execution_id
+                      AND triage.authorization_version=request.authorization_version
+                      AND triage.report_digest=report.digest
+                      AND triage.disposition='human'
+                      AND rr.report_digest=report.digest
+                      AND coordination.authorization_version=request.authorization_version
+                      AND coordination.mode!='manual' AND coordination.revoked_at IS NULL
+                      AND coordination.team_stale=0
+                      AND COALESCE(json_extract(coordination.envelope_json,'$.orchestrator_reviews_findings'),0)=1
+                      AND NOT EXISTS(
+                          SELECT 1 FROM review_checkpoint newer
+                          JOIN review_checkpoint current ON current.id=rr.checkpoint_id
+                          WHERE newer.range_id=current.range_id
+                            AND newer.attempt>current.attempt AND newer.state='reviewed'
+                      )
+                )",
+            )
+            .bind(&request.id)
+            .bind(&request.task_id)
+            .bind(report_id)
+            .bind(report_digest)
+            .bind(request.authorization_version)
+            .fetch_one(self.db.pool())
+            .await?;
+        }
+        if !source_current {
+            return Err(ServiceError::invalid_operation(
+                "range ReviewFindings source is no longer current or does not match its request",
+            ));
+        }
+        let report = ReviewRangeReportRepo::get_review_range_report(&*self.db, report_id)
+            .await?
+            .filter(|report| {
+                report.task_id == request.task_id && report.report_digest == report_digest
+            })
+            .ok_or_else(|| ServiceError::not_found("ReviewRangeReport", report_id.to_owned()))?;
+        let artifact = CollaborationRepo::get_artifact(&*self.db, report_id)
+            .await?
+            .filter(|artifact| {
+                artifact.task_id == request.task_id
+                    && artifact.digest.as_deref() == Some(report_digest)
+            })
+            .ok_or_else(|| ServiceError::not_found("ReviewReport", report_id.to_owned()))?;
+        let artifact_content = artifact
+            .content
+            .as_deref()
+            .ok_or_else(|| ServiceError::invalid_operation("range ReviewReport is not inline"))?;
+        if artifact_content.len() > 64 * 1024 {
+            return Err(ServiceError::invalid_operation(
+                "range ReviewReport exceeds the coordinator context limit",
+            ));
+        }
+        let report_content: serde_json::Value = serde_json::from_str(artifact_content)
+            .map_err(|_| ServiceError::invalid_operation("range ReviewReport JSON is invalid"))?;
+        let range = ReviewCheckpointRepo::get_review_range(&*self.db, &report.range_id)
+            .await?
+            .filter(|range| range.task_id == request.task_id && range.repo_id == report.repo_id)
+            .ok_or_else(|| ServiceError::invalid_operation("ReviewRange subject is stale"))?;
+        let work_unit_range = ReviewCheckpointRepo::get_work_unit_review_range(
+            &*self.db,
+            &report.review_work_unit_id,
+        )
+        .await?
+        .filter(|subject| {
+            subject.task_id == request.task_id
+                && subject.range_id == report.range_id
+                && subject.repo_id == report.repo_id
+        })
+        .ok_or_else(|| ServiceError::invalid_operation("reviewer WorkUnit range is stale"))?;
+        let coverage_rows = ReviewLedgerRepo::load_review_coverage_rows(
+            &*self.db,
+            &request.task_id,
+            &report.repo_id,
+        )
+        .await?;
+        let mut finding_ids = coverage_rows
+            .findings
+            .iter()
+            .filter(|finding| finding.report_artifact_id == report_id)
+            .map(|finding| finding.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        for input in &work_unit_range.input_findings {
+            let resolved_by_this_report = coverage_rows.resolutions.iter().any(|resolution| {
+                resolution.finding_id == input.finding_id
+                    && resolution.report_artifact_id.as_deref() == Some(report_id)
+            });
+            if !resolved_by_this_report {
+                finding_ids.insert(input.finding_id.clone());
+            }
+        }
+        if finding_ids.len() > 256 {
+            return Err(ServiceError::invalid_operation(
+                "range review findings exceed the coordinator context limit",
+            ));
+        }
+        let mut findings = Vec::with_capacity(finding_ids.len());
+        for finding_id in finding_ids {
+            let finding = coverage_rows
+                .findings
+                .iter()
+                .find(|finding| finding.id == finding_id)
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation(format!(
+                        "range review input finding {finding_id} is missing"
+                    ))
+                })?;
+            let locations = ReviewLedgerRepo::list_review_finding_locations(&*self.db, &finding_id)
+                .await?
+                .into_iter()
+                .map(|location| {
+                    serde_json::json!({
+                        "path": location.path,
+                        "line_start": location.line_start,
+                        "line_end": location.line_end,
+                        "attribution": {
+                            "kind": location.attribution.kind.to_string(),
+                            "work_unit_id": location.attribution.work_unit_id,
+                            "execution_id": location.attribution.execution_id,
+                            "actor": location.attribution.actor,
+                            "commit_sha": location.attribution.commit_sha,
+                            "integration_id": location.attribution.integration_id,
+                            "line_count": location.attribution.line_count,
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            findings.push(serde_json::json!({
+                "finding_id": finding.id,
+                "ordinal": finding.ordinal,
+                "severity": finding.severity.to_string(),
+                "title": finding.title,
+                "evidence": finding.evidence,
+                "invariant": finding.invariant,
+                "locations": locations,
+            }));
+        }
+        let repository_set = db::TaskRepositorySetRepo::get_current(&*self.db, &request.task_id)
+            .await?
+            .ok_or_else(|| ServiceError::invalid_operation("Task has no current repository set"))?;
+        let coverage_service = crate::review_range::ReviewCoverageService::new(
+            Arc::clone(&self.db),
+            crate::task_service::workspace::default_workspace_root(),
+        );
+        let mut coverage_by_repo = Vec::new();
+        for repository in repository_set
+            .repositories
+            .into_iter()
+            .filter(|repository| {
+                matches!(
+                    repository.role,
+                    db::TaskRepositoryRole::Primary | db::TaskRepositoryRole::Affected
+                )
+            })
+        {
+            let rows = if repository.repo_id == report.repo_id {
+                coverage_rows.clone()
+            } else {
+                ReviewLedgerRepo::load_review_coverage_rows(
+                    &*self.db,
+                    &request.task_id,
+                    &repository.repo_id,
+                )
+                .await?
+            };
+            let candidate = rows
+                .integrations
+                .iter()
+                .filter(|integration| {
+                    integration.outcome == db::WorkUnitRepositoryIntegrationOutcome::Success
+                })
+                .max_by(|left, right| {
+                    (&left.started_at, &left.id).cmp(&(&right.started_at, &right.id))
+                })
+                .and_then(|integration| integration.target_after_sha.as_deref());
+            let coverage = coverage_service
+                .compute(&request.task_id, &repository.repo_id, candidate)
+                .await?;
+            coverage_by_repo.push(serde_json::json!({
+                "repo_id": repository.repo_id,
+                "candidate_commit": candidate,
+                "status": coverage.status.as_str(),
+                "frontier_commit": coverage.frontier_commit,
+                "open_findings": {
+                    "p0": coverage.open_findings.p0,
+                    "p1": coverage.open_findings.p1,
+                    "p2": coverage.open_findings.p2,
+                    "p3": coverage.open_findings.p3,
+                },
+            }));
+        }
+        let context = serde_json::json!({
+            "kind": "commit_range",
+            "report_artifact_id": report_id,
+            "report_digest": report_digest,
+            "report": report_content,
+            "review_work_unit_id": report.review_work_unit_id,
+            "review_producer_execution_id": producer_execution_id,
+            "range": {
+                "id": range.id,
+                "repo_id": range.repo_id,
+                "base_commit": range.base_commit,
+                "head_commit": range.head_commit,
+                "base_tree": range.base_tree,
+                "head_tree": range.head_tree,
+                "range_digest": range.range_digest,
+            },
+            "checkpoint_id": report.checkpoint_id,
+            "findings": findings,
+            "coverage_by_repo": coverage_by_repo
+        });
+        let context_bytes = serde_json::to_vec(&context)
+            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+        if context_bytes.len() > 64 * 1024 {
+            return Err(ServiceError::invalid_operation(
+                "range ReviewFindings context exceeds 64 KiB",
+            ));
+        }
+        Ok(context)
+    }
+
     pub(crate) async fn record_review_triage(
         &self,
         execution_id: &str,
         request_id: &str,
         input: ReviewFindingsDecision,
     ) -> Result<()> {
+        if matches!(input.disposition, ReviewFindingsDisposition::Defer) {
+            return Err(defer_not_permitted());
+        }
         if input.rationale.trim().is_empty()
             || input.rationale.len() > 8192
             || input.instructions.trim().is_empty()
@@ -328,8 +634,8 @@ impl TaskReworkService {
             ActorRef::Human(id) => db::ActorRef::Human(id.clone()),
         };
         let review_id = if matches!(input.disposition, ReviewFindingsDisposition::Recheck) {
-            let consumed:i64=sqlx::query_scalar("SELECT (SELECT count(*) FROM task_rework_receipt WHERE task_id=?)+(SELECT count(*) FROM task_review_triage WHERE task_id=? AND disposition='recheck')")
-                .bind(&task_id).bind(&task_id).fetch_one(&mut *tx).await?;
+            let consumed:i64=sqlx::query_scalar("SELECT (SELECT count(*) FROM task_rework_receipt WHERE task_id=?)+(SELECT count(*) FROM review_rework_round WHERE task_id=?)+(SELECT count(*) FROM task_review_triage triage WHERE triage.task_id=? AND (triage.disposition='recheck' OR EXISTS (SELECT 1 FROM review_finding_triage finding_triage WHERE finding_triage.report_artifact_id=triage.review_report_artifact_id AND finding_triage.disposition='recheck')))")
+                .bind(&task_id).bind(&task_id).bind(&task_id).fetch_one(&mut *tx).await?;
             let max_rounds: i64 = sqlx::query_scalar(
                 "SELECT max_rework_rounds FROM task_autonomy_limits WHERE task_id=?",
             )
@@ -367,6 +673,7 @@ impl TaskReworkService {
             ReviewFindingsDisposition::Correct => "correct",
             ReviewFindingsDisposition::Recheck => "recheck",
             ReviewFindingsDisposition::Human => "human",
+            ReviewFindingsDisposition::Defer => return Err(defer_not_permitted()),
         };
         sqlx::query("INSERT INTO task_review_triage(review_report_artifact_id,task_id,report_digest,execution_id,authorization_version,disposition,rationale,instructions,decision_digest,review_work_unit_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)")
             .bind(&input.review_report_artifact_id).bind(&task_id).bind(&input.report_digest).bind(execution_id).bind(authorization_version).bind(disposition).bind(&input.rationale).bind(&input.instructions).bind(&decision_digest).bind(review_id.as_deref()).bind(&now).execute(&mut *tx).await?;

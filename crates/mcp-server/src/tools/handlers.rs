@@ -1105,7 +1105,7 @@ pub(super) async fn forge_create_project(
         &new_uuid_v4(),
     )
     .await?;
-    project_value(project)
+    super::review_ranges::project_response_value(state, project).await
 }
 
 pub(super) async fn forge_get_project(
@@ -1116,7 +1116,7 @@ pub(super) async fn forge_get_project(
     let project = ProjectRepo::get_by_id(&*state.db, &params.project_id)
         .await?
         .ok_or_else(|| McpToolError::not_found("project", params.project_id))?;
-    project_value(project)
+    super::review_ranges::project_response_value(state, project).await
 }
 
 pub(super) async fn forge_update_project(
@@ -1136,7 +1136,7 @@ pub(super) async fn forge_update_project(
     }
 
     let project = services::ProjectRepositoryService::new(Arc::clone(&state.db))
-        .update_project_at_version(
+        .update_project_at_version_with_review_policy(
             UpdateProject {
                 id: params.project_id,
                 name: params.name,
@@ -1148,9 +1148,12 @@ pub(super) async fn forge_update_project(
             params.version,
             None,
             user_id,
+            params
+                .default_review_policy
+                .map(|policy| policy.map(super::review_ranges::policy_to_db)),
         )
         .await?;
-    project_value(project)
+    super::review_ranges::project_response_value(state, project).await
 }
 
 pub(super) async fn forge_update_task_repositories(

@@ -1323,3 +1323,60 @@ async fn multirepo_lifecycle_replan_approved_resume_materializes_revision_and_pr
         .iter()
         .any(|repository| repository.repo_id == added_repo_id));
 }
+
+#[tokio::test]
+async fn review_range_schema_adds_no_policy_or_coverage_to_existing_tasks() {
+    let db = database().await;
+    let (task_id, _) = seed_task(&db).await;
+    assert!(
+        db::ReviewPolicyRepo::get_current_task_review_policy(&db, &task_id)
+            .await
+            .expect("policy lookup")
+            .is_none()
+    );
+    let rows = db::ReviewLedgerRepo::load_review_coverage_rows(
+        &db,
+        &task_id,
+        "00000000-0000-0000-0000-000000000000",
+    )
+    .await
+    .expect("coverage rows");
+    assert_eq!(rows.state_revision, 0);
+    assert!(rows.base.is_none() && rows.ranges.is_empty() && rows.checkpoints.is_empty());
+    let sources: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM task_review_coordination_source_current")
+            .fetch_one(db.pool())
+            .await
+            .expect("recreated source view");
+    assert_eq!(sources, 0);
+}
+
+#[tokio::test]
+async fn review_range_triage_defer_is_rejected_for_non_range_reports() {
+    let db = database().await;
+    let guards: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name IN (
+             'task_review_triage_defer_range_only',
+             'task_review_triage_current_request_guard',
+             'micro_fix_receipt_range_review_guard',
+             'review_coverage_lifecycle_guard',
+             'review_coverage_integration_admission_guard',
+             'review_coverage_push_update_guard')",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("V185 guards");
+    assert_eq!(guards, 6);
+    let (task_id, _) = seed_task(&db).await;
+    let rejected = sqlx::query(
+        "INSERT INTO task_review_triage (
+             review_report_artifact_id, task_id, report_digest, execution_id,
+             authorization_version, disposition, rationale, instructions, decision_digest,
+             created_at
+         ) VALUES ('missing', ?, 'd', 'missing', 1, 'defer', 'why', '', 'd', 'now')",
+    )
+    .bind(&task_id)
+    .execute(db.pool())
+    .await;
+    assert!(rejected.is_err());
+}

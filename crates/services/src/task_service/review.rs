@@ -359,6 +359,21 @@ impl TaskService {
         let mut execution = ExecutionRepo::get_by_id(&*self.db, execution_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("execution", execution_id.to_owned()))?;
+        let range_review = match execution.work_unit_id.as_deref() {
+            Some(work_unit_id) => {
+                crate::work_unit_service::range_review::frozen_range(&self.db, work_unit_id)
+                    .await?
+                    .is_some()
+            }
+            None => false,
+        };
+        // Structured findings and resolutions belong exclusively to a
+        // commit-range review.
+        if range_review {
+            crate::require_range_report_fields(&request)?;
+        } else {
+            crate::reject_range_report_fields(&request)?;
+        }
         let _workspace_review_guard = if execution.status == ExecutionStatus::Running {
             if let (Some(workspace_id), Some(locks)) = (
                 execution.workspace_id.as_deref(),
@@ -438,19 +453,22 @@ impl TaskService {
                     .map(|id| serde_json::json!({ "artifact_id": id })),
             )
             .collect::<Vec<_>>();
-        let assistant_output = format!(
-            "FORGE_RESULT: {}",
-            serde_json::json!({
-                "schema_version": 1,
-                "kind": "review",
-                "verdict": verdict,
-                "summary": summary,
-                "criteria": request.criteria,
-                "findings": request.findings,
-                "questions": request.questions,
-                "evidence_considered": evidence_considered,
-            })
-        );
+        let mut result = serde_json::json!({
+            "schema_version": 1,
+            "kind": "review",
+            "verdict": verdict,
+            "summary": summary,
+            "criteria": request.criteria,
+            "findings": request.findings,
+            "questions": request.questions,
+            "evidence_considered": evidence_considered,
+        });
+        if range_review {
+            result["schema_version"] = serde_json::json!(2);
+            result["findings"] = serde_json::json!(request.structured_findings);
+            result["resolutions"] = serde_json::json!(request.resolutions);
+        }
+        let assistant_output = format!("FORGE_RESULT: {result}");
         let existing_report = CollaborationRepo::get_execution_artifact_output(
             &*self.db,
             execution_id,
@@ -464,6 +482,7 @@ impl TaskService {
         }
         let report =
             crate::CollaborationService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
+                .with_review_workspace_root(self.workspace_root.clone())
                 .create_human_review_report_from_execution(
                     execution_id,
                     &assistant_output,

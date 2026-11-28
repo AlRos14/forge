@@ -98,6 +98,10 @@ pub struct TaskService {
 }
 
 impl TaskService {
+    pub(crate) fn workspace_root(&self) -> &std::path::Path {
+        &self.workspace_root
+    }
+
     /// Complete a coordination-materialized delivery after its exact
     /// Execution produced a result. This is technical completion, not review
     /// approval; reviewed WorkUnits keep their independent review subject and
@@ -132,6 +136,49 @@ impl TaskService {
         .bind(&unit.task_id)
         .fetch_optional(self.db.pool())
         .await?;
+        // A range review is complete once its exact report is persisted, with
+        // or without a coordinator.
+        let range_reported: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM review_range_report
+                WHERE execution_id = ? AND task_id = ? AND review_work_unit_id = ?
+            )",
+        )
+        .bind(&execution.id)
+        .bind(&unit.task_id)
+        .bind(&unit.id)
+        .fetch_one(self.db.pool())
+        .await?;
+        if range_reported {
+            let (Some(repo_cache_locks), Some(workspace_exec_locks)) = (
+                self.repo_cache_locks.clone(),
+                self.workspace_exec_locks.clone(),
+            ) else {
+                return Ok(None);
+            };
+            let completed = crate::WorkUnitService::new(
+                Arc::clone(&self.db),
+                Arc::clone(&self.event_bus),
+                self.workspace_root.clone(),
+                repo_cache_locks,
+                workspace_exec_locks,
+            )
+            .transition_system(&unit.id, unit.version, WorkUnitStatus::Completed, None)
+            .await;
+            return match completed {
+                Ok(unit) => Ok(Some(unit)),
+                // The persisted report is authoritative; a refused technical
+                // completion must not wedge the event consumer.
+                Err(error) => {
+                    tracing::warn!(
+                        work_unit_id = %unit.id,
+                        %error,
+                        "reported range review WorkUnit was not completed"
+                    );
+                    Ok(None)
+                }
+            };
+        }
         let Some(expected_authorization_version) = coordination_authorization_version else {
             return Ok(None);
         };
@@ -1619,7 +1666,8 @@ impl TaskService {
                 let collaboration = crate::CollaborationService::new(
                     Arc::clone(&self.db),
                     Arc::clone(&self.event_bus),
-                );
+                )
+                .with_review_workspace_root(self.workspace_root.clone());
                 match collaboration
                     .ensure_review_subject_current(&current_execution)
                     .await

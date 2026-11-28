@@ -13,9 +13,11 @@ use sqlx::Row;
 
 mod external_feedback_triage;
 mod micro_fix;
+mod range;
 mod triage;
 mod validation_triage;
 pub(crate) use micro_fix::MicroFixSourceReceiptInput;
+pub use range::RangeReworkResult;
 pub(crate) use triage::ReviewFindingsDecision;
 pub(crate) use validation_triage::ValidationFindingsDecision;
 
@@ -1452,7 +1454,8 @@ impl TaskReworkService {
             ));
         }
         let round: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) + 1 + (SELECT COUNT(*) FROM task_review_triage WHERE task_id=? AND disposition='recheck') FROM task_rework_receipt WHERE task_id = ?")
+            sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM task_rework_receipt WHERE task_id = ?) + (SELECT COUNT(*) FROM review_rework_round WHERE task_id = ?) + (SELECT COUNT(*) FROM task_review_triage triage WHERE triage.task_id = ? AND (triage.disposition='recheck' OR EXISTS (SELECT 1 FROM review_finding_triage finding_triage WHERE finding_triage.report_artifact_id=triage.review_report_artifact_id AND finding_triage.disposition='recheck'))) + 1")
+                .bind(&task.id)
                 .bind(&task.id)
                 .bind(&task.id)
                 .fetch_one(&mut *tx)

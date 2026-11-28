@@ -789,6 +789,7 @@ fn tools_list_returns_descriptors() {
             "forge_add_task_role_member",
             "forge_add_work_unit_dependency",
             "forge_allocate_work_unit",
+            "forge_attribute_review_commits",
             "forge_create_project",
             "forge_create_task_role",
             "forge_create_sub_tasks",
@@ -803,11 +804,15 @@ fn tools_list_returns_descriptors() {
             "forge_propose_project_plan",
             "forge_apply_project_plan",
             "forge_list_project_repo_tree",
+            "forge_list_review_checkpoints",
+            "forge_list_review_findings",
             "forge_read_project_repo_file",
+            "forge_get_review_coverage",
             "forge_get_review_execution",
             "forge_get_task",
             "forge_get_task_diff",
             "forge_get_task_lifecycle",
+            "forge_get_task_review_policy",
             "forge_get_validation_run",
             "forge_get_work_unit",
             "forge_get_work_unit_artifact_package",
@@ -829,6 +834,7 @@ fn tools_list_returns_descriptors() {
             "forge_list_validation_runs",
             "forge_list_work_unit_dependencies",
             "forge_list_work_units",
+            "forge_rebaseline_review",
             "forge_register_agent",
             "forge_remove_task_dependency",
             "forge_remove_work_unit_dependency",
@@ -853,7 +859,10 @@ fn tools_list_returns_descriptors() {
             "forge_resolve_task_quality_request",
             "forge_list_task_interventions",
             "forge_create_task_intervention",
+            "forge_request_range_review",
             "forge_request_rework",
+            "forge_retry_review_checkpoint",
+            "forge_set_task_review_policy",
             "forge_submit_work_unit_review",
             "forge_update_project",
             "forge_update_project_hooks",
@@ -861,6 +870,7 @@ fn tools_list_returns_descriptors() {
             "forge_update_task_repositories",
             "forge_update_task_role",
             "forge_update_work_unit",
+            "forge_waive_review_finding",
             "forge_list_validation_checks",
             "forge_list_task_validation_check_requests",
             "forge_list_task_validation_comparisons",
@@ -1258,6 +1268,50 @@ fn revised_public_surface_does_not_advertise_retired_collaboration_tools() {
         assert!(names.iter().all(|name| !name.contains("agent_chat")));
         assert!(names.iter().all(|name| !name.contains("memory")));
         assert!(names.iter().all(|name| !name.contains("main_agent")));
+    });
+}
+
+#[test]
+fn review_range_tools_are_advertised_with_structured_report_schema() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let result = dispatch(&state, "tools/list", json!({}))
+            .await
+            .expect("tools/list succeeds");
+        let tools = result["tools"]
+            .as_array()
+            .expect("tools/list returns {tools:[...]}");
+        let find_tool = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("tool {name} is advertised"))
+        };
+
+        for name in [
+            "forge_get_review_coverage",
+            "forge_get_task_review_policy",
+            "forge_set_task_review_policy",
+            "forge_request_range_review",
+            "forge_list_review_checkpoints",
+            "forge_retry_review_checkpoint",
+            "forge_attribute_review_commits",
+            "forge_rebaseline_review",
+            "forge_list_review_findings",
+            "forge_waive_review_finding",
+        ] {
+            find_tool(name);
+        }
+
+        let project_policy = find_tool("forge_update_project");
+        assert!(project_policy["inputSchema"]["properties"]
+            .get("default_review_policy")
+            .is_some());
+
+        let submit_review = find_tool("forge_submit_work_unit_review");
+        let report_properties = &submit_review["inputSchema"]["properties"]["report"]["properties"];
+        assert!(report_properties.get("structured_findings").is_some());
+        assert!(report_properties.get("resolutions").is_some());
     });
 }
 

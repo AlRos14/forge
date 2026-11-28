@@ -88,6 +88,10 @@ use std::{
 // V182 adds the Task repository context snapshots and WorkUnit repository
 // result requirements. V183 adds versioned Task repository sets, repository
 // integration results, per-repository PR metadata, and exact merge batches.
+// V184 adds the review-range model (policies, bases, ranges, checkpoints,
+// reports, the finding ledger, coverage revisions). V185 adapts review
+// independence, reviewer workspace, triage, coordination source, Proposal
+// target, Gate input and merge-readiness authority to range review.
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 #[derive(Debug, Clone, PartialEq, Eq)]

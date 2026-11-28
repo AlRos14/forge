@@ -1,6 +1,6 @@
 use crate::{models::*, pagination::*, Result};
 use async_trait::async_trait;
-use sqlx::{Sqlite, Transaction};
+use sqlx::{Sqlite, SqliteConnection, Transaction};
 
 #[async_trait]
 pub trait TaskRepo: Send + Sync {
@@ -1698,6 +1698,16 @@ pub trait ProjectRepo: Send + Sync {
         expected_version: i64,
         project_hooks_json: Option<String>,
         caller_user_id: Option<&str>,
+    ) -> Result<Project>;
+    /// Atomically updates versioned Project fields and its optional default
+    /// review policy in one `BEGIN IMMEDIATE` transaction.
+    async fn update_at_version_with_review_policy(
+        &self,
+        input: UpdateProject,
+        expected_version: i64,
+        project_hooks_json: Option<String>,
+        caller_user_id: Option<&str>,
+        review_policy: Option<WriteProjectReviewPolicy>,
     ) -> Result<Project>;
     async fn set_project_hooks_json(
         &self,
@@ -3529,4 +3539,294 @@ pub trait PrExternalActionRepo: Send + Sync {
         states: &[PrExternalActionState],
         limit: i64,
     ) -> Result<Vec<PrExternalAction>>;
+}
+
+// ---------------------------------------------------------------------------
+// Review ranges and per-repository coverage (V184/V185). Every writer runs in
+// one `BEGIN IMMEDIATE` transaction, revalidates the versions it depends on and
+// appends its events there. An exact replay returns the existing record.
+// ---------------------------------------------------------------------------
+
+/// One merge-readiness Gate revision applied together with a policy write.
+#[derive(Debug, Clone)]
+pub struct ReviseGateWithPolicy {
+    pub gate_id: String,
+    pub expected_active_revision: Option<i64>,
+    pub revision: CreateGatePolicyRevision,
+}
+
+#[derive(Debug, Clone)]
+pub struct WriteTaskReviewPolicy {
+    pub task_id: String,
+    pub expected_revision: Option<i64>,
+    pub policy: ReviewPolicyDocument,
+    pub digest: String,
+    pub source: ReviewPolicySource,
+    pub created_by_user_id: String,
+    pub gate_revisions: Vec<ReviseGateWithPolicy>,
+    /// Revision-1 bases pinned with this write; an already pinned base is kept.
+    pub initial_bases: Vec<TaskReviewBase>,
+    pub events: Vec<CreateDomainEvent>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct WriteProjectReviewPolicy {
+    pub project_id: String,
+    pub expected_version: Option<i64>,
+    pub policy: Option<(ReviewPolicyDocument, String)>,
+    pub updated_by_user_id: String,
+    pub updated_at: String,
+}
+
+#[async_trait]
+pub trait ReviewPolicyRepo: Send + Sync {
+    async fn get_current_task_review_policy(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<TaskReviewPolicyRevision>>;
+    /// `source=owner` requires a current Project owner/admin.
+    async fn write_task_review_policy(
+        &self,
+        input: WriteTaskReviewPolicy,
+    ) -> Result<TaskReviewPolicyRevision>;
+    async fn get_project_review_policy(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<ProjectReviewPolicy>>;
+    /// Requires a current Project owner/admin. The default is copied into new
+    /// Tasks by `TaskRepo::create_in_tx`.
+    async fn write_project_review_policy(
+        &self,
+        input: WriteProjectReviewPolicy,
+    ) -> Result<ProjectReviewPolicy>;
+}
+
+#[derive(Debug, Clone)]
+pub struct ReviewCheckpointRequestRecord {
+    pub idempotency_key: String,
+    pub source_kind: ReviewRequestSourceKind,
+    pub source_ref: String,
+    pub reason: String,
+}
+
+/// Creates a `queued` (or `blocked`) checkpoint, or accumulates reasons on the
+/// existing queued checkpoint of the same head.
+#[derive(Debug, Clone)]
+pub struct UpsertQueuedReviewCheckpoint {
+    pub checkpoint: ReviewCheckpoint,
+    pub request: Option<ReviewCheckpointRequestRecord>,
+    /// `(checkpoint_id, expected_version)` superseded in the same transaction.
+    pub supersede: Vec<(String, i64)>,
+    pub events: Vec<CreateDomainEvent>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActivateReviewCheckpoint {
+    pub checkpoint_id: String,
+    pub expected_version: i64,
+    pub expected_coverage_revision: i64,
+    pub range: ReviewRange,
+    /// Ignored when the range already has its contributors frozen.
+    pub contributors: Vec<ReviewRangeContributor>,
+    pub work_unit: CreateWorkUnit,
+    pub review_range: WorkUnitReviewRange,
+    pub updated_at: String,
+    pub events: Vec<CreateDomainEvent>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TransitionReviewCheckpoint {
+    pub checkpoint_id: String,
+    pub expected_version: i64,
+    pub state: ReviewCheckpointState,
+    pub add_reasons: Vec<ReviewCheckpointReason>,
+    pub blocked_code: Option<String>,
+    pub blocked_detail_json: Option<String>,
+    pub cancel_review_work_units: bool,
+    pub updated_at: String,
+    pub events: Vec<CreateDomainEvent>,
+}
+
+#[async_trait]
+pub trait ReviewCheckpointRepo: Send + Sync {
+    async fn get_review_checkpoint(&self, id: &str) -> Result<Option<ReviewCheckpoint>>;
+    async fn list_review_checkpoints(
+        &self,
+        task_id: &str,
+        repo_id: Option<&str>,
+        page: PageRequest,
+    ) -> Result<Page<ReviewCheckpoint>>;
+    async fn upsert_queued_review_checkpoint(
+        &self,
+        input: UpsertQueuedReviewCheckpoint,
+    ) -> Result<ReviewCheckpoint>;
+    async fn activate_review_checkpoint(
+        &self,
+        input: ActivateReviewCheckpoint,
+    ) -> Result<ReviewCheckpoint>;
+    async fn transition_review_checkpoint(
+        &self,
+        input: TransitionReviewCheckpoint,
+    ) -> Result<ReviewCheckpoint>;
+    async fn get_review_range(&self, id: &str) -> Result<Option<ReviewRange>>;
+    async fn get_work_unit_review_range(
+        &self,
+        work_unit_id: &str,
+    ) -> Result<Option<WorkUnitReviewRange>>;
+    async fn list_review_range_contributors(
+        &self,
+        range_id: &str,
+    ) -> Result<Vec<ReviewRangeContributor>>;
+    /// Reviewer WorkUnit ids bound to a checkpoint, ordered by id.
+    async fn list_checkpoint_review_work_unit_ids(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<Vec<String>>;
+    async fn list_tasks_with_review_policy(
+        &self,
+        after_task_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<String>>;
+    async fn list_active_review_plan_checkpoints(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<ReviewPlanCheckpoint>>;
+}
+
+#[derive(Debug, Clone)]
+pub struct IngestRangeReport {
+    pub report: ReviewRangeReport,
+    pub findings: Vec<(ReviewFinding, Vec<ReviewFindingLocation>)>,
+    pub resolutions: Vec<ReviewFindingResolution>,
+    pub expected_checkpoint_version: i64,
+    /// `InReview`, `Reviewed` or `Blocked`.
+    pub next_checkpoint_state: ReviewCheckpointState,
+    pub blocked_code: Option<String>,
+    pub events: Vec<CreateDomainEvent>,
+}
+
+#[async_trait]
+pub trait ReviewRangeReportRepo: Send + Sync {
+    /// Artifact, inputs, ledger, resolutions and checkpoint in one transaction.
+    async fn ingest_range_review_report(
+        &self,
+        artifact: CreateArtifact,
+        evidence_input_ids: Vec<String>,
+        artifact_input_ids: Vec<String>,
+        artifact_event: CreateDomainEvent,
+        range: IngestRangeReport,
+    ) -> Result<ExecutionArtifactOutputWrite>;
+    async fn get_review_range_report(&self, artifact_id: &str)
+        -> Result<Option<ReviewRangeReport>>;
+}
+
+/// An exact owner/admin Proposal and its approving Decision.
+#[derive(Debug, Clone)]
+pub struct ReviewHumanDecision {
+    pub proposal: CreateProposal,
+    pub decision: CreateDecision,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ReviewFindingFilter {
+    pub repo_id: Option<String>,
+    pub severity: Option<ReviewFindingSeverity>,
+    pub finding_ids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApplyReviewTriage {
+    pub aggregate: CreateTaskReviewTriage,
+    pub findings: Vec<ReviewFindingTriage>,
+    pub corrections: Option<ApplyReviewCorrections>,
+    pub recheck: Option<UpsertQueuedReviewCheckpoint>,
+    pub expected_request_version: i64,
+    pub events: Vec<CreateDomainEvent>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApplyReviewCorrections {
+    pub round: ReviewReworkRound,
+    pub work_units: Vec<CreateWorkUnit>,
+    pub dependencies: Vec<AddWorkUnitDependency>,
+    pub links: Vec<ReviewCorrectionLink>,
+    pub max_rework_rounds: i64,
+    pub events: Vec<CreateDomainEvent>,
+}
+
+#[async_trait]
+pub trait ReviewLedgerRepo: Send + Sync {
+    async fn load_review_coverage_rows(
+        &self,
+        task_id: &str,
+        repo_id: &str,
+    ) -> Result<ReviewCoverageRows>;
+    async fn load_review_coverage_rows_in_tx(
+        &self,
+        conn: &mut SqliteConnection,
+        task_id: &str,
+        repo_id: &str,
+    ) -> Result<ReviewCoverageRows>;
+    async fn list_review_findings(
+        &self,
+        task_id: &str,
+        filter: ReviewFindingFilter,
+        page: PageRequest,
+    ) -> Result<Page<ReviewFinding>>;
+    async fn get_review_finding(&self, id: &str) -> Result<Option<ReviewFinding>>;
+    async fn list_review_finding_locations(
+        &self,
+        finding_id: &str,
+    ) -> Result<Vec<ReviewFindingLocation>>;
+    async fn list_review_finding_resolutions(
+        &self,
+        finding_id: &str,
+    ) -> Result<Vec<ReviewFindingResolution>>;
+    async fn list_review_finding_triage(
+        &self,
+        finding_id: &str,
+    ) -> Result<Vec<ReviewFindingTriage>>;
+    async fn list_review_correction_links(
+        &self,
+        finding_id: &str,
+    ) -> Result<Vec<ReviewCorrectionLink>>;
+    async fn waive_review_finding(
+        &self,
+        expected_coverage_revision: i64,
+        decision: ReviewHumanDecision,
+        resolution: ReviewFindingResolution,
+        events: Vec<CreateDomainEvent>,
+    ) -> Result<ReviewFindingResolution>;
+    /// Pins the Task's first base for one writable repository. Only revision 1
+    /// from a first integration or workspace preparation is accepted; an exact
+    /// replay returns the existing base.
+    async fn pin_review_base(
+        &self,
+        base: TaskReviewBase,
+        events: Vec<CreateDomainEvent>,
+    ) -> Result<TaskReviewBase>;
+    async fn rebaseline_review(
+        &self,
+        expected_coverage_revision: i64,
+        decision: ReviewHumanDecision,
+        base: TaskReviewBase,
+        events: Vec<CreateDomainEvent>,
+    ) -> Result<TaskReviewBase>;
+    /// Records the attributions; the blocked checkpoint is returned unchanged
+    /// and is retried (superseded) separately.
+    async fn attribute_review_commits(
+        &self,
+        checkpoint_id: &str,
+        expected_version: i64,
+        decision: ReviewHumanDecision,
+        attributions: Vec<ReviewCommitAttribution>,
+        events: Vec<CreateDomainEvent>,
+    ) -> Result<ReviewCheckpoint>;
+    async fn apply_review_triage(&self, input: ApplyReviewTriage) -> Result<()>;
+    async fn apply_review_corrections(
+        &self,
+        input: ApplyReviewCorrections,
+    ) -> Result<ReviewReworkRound>;
+    async fn count_review_rework_rounds(&self, task_id: &str) -> Result<i64>;
 }

@@ -5,6 +5,7 @@ import type { WorkUnitProvenance } from './WorkUnitProvenance'
 import type { WorkUnitReadinessResponse } from './WorkUnitReadinessResponse'
 import type { WorkUnitStatus } from './WorkUnitStatus'
 import type { WorkUnitRepositoryIntegrationResponse } from './WorkUnitRepositoryIntegrationResponse'
+import type { WorkUnitReviewRangeResponse } from './WorkUnitReviewRangeResponse'
 
 export type WorkUnitResponse = {
   id: string
@@ -26,6 +27,7 @@ export type WorkUnitResponse = {
   updated_at: string
   readiness: WorkUnitReadinessResponse
   review_subject: ReviewSubjectResponse | null
+  review_range?: WorkUnitReviewRangeResponse
   repository_ids: Array<string>
   integrations: Array<WorkUnitRepositoryIntegrationResponse>
 }

@@ -13,6 +13,7 @@ mod ask_human;
 mod external_feedback;
 mod micro_fix;
 mod propose_replan;
+mod range_review;
 mod validation_request;
 
 pub use ask_human::{
@@ -38,6 +39,7 @@ pub use propose_replan::{
     ProposeReplanOutput, ReplanRequest, MAX_REPLAN_EVIDENCE_LINKS, MAX_REPLAN_INSTRUCTIONS_BYTES,
     MAX_REPLAN_REASON_BYTES,
 };
+pub use range_review::{RequestRangeReviewOutput, MAX_RANGE_REVIEW_REASON_BYTES};
 pub use validation_request::{
     CheckPins, RequestValidationOutput, ValidationSubject, ValidationSubjectKind, MAX_REASON_BYTES,
 };
@@ -103,6 +105,7 @@ pub enum CoordinatorOutputKind {
     RequestValidation,
     AskHuman,
     ProposeReplan,
+    RequestRangeReview,
     /// Permission bit for the `micro_fix` subobject embedded in a typed
     /// triage decision; it is not a standalone turn output variant.
     MicroFix,
@@ -114,6 +117,7 @@ impl CoordinatorOutputKind {
             Self::RequestValidation => "request_validation",
             Self::AskHuman => "ask_human",
             Self::ProposeReplan => "propose_replan",
+            Self::RequestRangeReview => "request_range_review",
             Self::MicroFix => "micro_fix",
         }
     }
@@ -147,6 +151,7 @@ pub enum CoordinatorOutput {
     RequestValidation(RequestValidationOutput),
     AskHuman(AskHumanOutput),
     ProposeReplan(ProposeReplanOutput),
+    RequestRangeReview(RequestRangeReviewOutput),
 }
 
 impl CoordinatorOutput {
@@ -155,6 +160,7 @@ impl CoordinatorOutput {
             Self::RequestValidation(_) => CoordinatorOutputKind::RequestValidation,
             Self::AskHuman(_) => CoordinatorOutputKind::AskHuman,
             Self::ProposeReplan(_) => CoordinatorOutputKind::ProposeReplan,
+            Self::RequestRangeReview(_) => CoordinatorOutputKind::RequestRangeReview,
         }
     }
 
@@ -169,6 +175,7 @@ impl CoordinatorOutput {
             Self::RequestValidation(request) => request.validate()?,
             Self::AskHuman(ask) => ask.validate()?,
             Self::ProposeReplan(replan) => replan.validate()?,
+            Self::RequestRangeReview(request) => request.validate()?,
         }
         Ok(output)
     }

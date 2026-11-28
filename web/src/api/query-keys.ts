@@ -19,6 +19,9 @@ export const qk = {
   gates: (taskId: string) => ['tasks', taskId, 'gates'] as const,
   workUnits: (taskId: string) => ['tasks', taskId, 'work-units'] as const,
   reviewLines: (taskId: string) => ['tasks', taskId, 'review-lines'] as const,
+  reviewPolicy: (taskId: string) => ['tasks', taskId, 'review-policy'] as const,
+  reviewCoverage: (taskId: string) => ['tasks', taskId, 'review-coverage'] as const,
+  reviewCheckpoints: (taskId: string) => ['tasks', taskId, 'review-checkpoints'] as const,
   workUnitArtifactPackage: (workUnitId: string) =>
     ['work-units', workUnitId, 'artifact-package'] as const,
   reviewExecutions: (taskId: string) => ['tasks', taskId, 'review-executions'] as const,
