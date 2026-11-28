@@ -295,12 +295,12 @@ fn evaluate_repo(repo_id: &str, rows: &ReviewCoverageRows, facts: &CommitFacts) 
                     ReviewCoverageStatus::Blocked,
                     checkpoint.blocked_code.clone(),
                 )
+            } else if blocking_open || !rows.failing_result_lines.is_empty() {
+                (ReviewCoverageStatus::FindingsOpen, None)
             } else if !facts.base_tree.is_empty() && facts.base_tree == facts.candidate_tree {
                 (ReviewCoverageStatus::Unchanged, None)
             } else if active_checkpoint_id.is_some() {
                 (ReviewCoverageStatus::InReview, None)
-            } else if blocking_open || !rows.failing_result_lines.is_empty() {
-                (ReviewCoverageStatus::FindingsOpen, None)
             } else if !policy.policy.coverage_required {
                 (ReviewCoverageStatus::NotRequired, None)
             } else if covered {

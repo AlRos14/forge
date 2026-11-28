@@ -12,10 +12,10 @@ use std::{
 };
 
 use db::{
-    new_uuid_v4, now_rfc3339, ActorKind, ActorRef, AgentRepo, CreateDomainEvent,
-    ReviewCheckpointRepo, ReviewCheckpointState, ReviewRangeContributor, RoleMembershipRepo,
-    RoleMembershipStatus, SqliteDb, TransitionReviewCheckpoint, WorkUnitReviewRange,
-    WorkUnitWorkspaceRepo, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceScopeKind, WorkspaceStatus,
+    ActorKind, ActorRef, AgentRepo, ReviewCheckpointRepo, ReviewCheckpointState,
+    ReviewRangeContributor, RoleMembershipRepo, RoleMembershipStatus, SqliteDb,
+    WorkUnitReviewRange, WorkUnitWorkspaceRepo, WorkspaceLeaseRepo, WorkspaceRepo,
+    WorkspaceScopeKind, WorkspaceStatus,
 };
 use serde::Serialize;
 
@@ -303,68 +303,6 @@ pub(crate) async fn verify_range_checkout(
     }
     checkout.sort_by(|left, right| left.repo_id.cmp(&right.repo_id));
     Ok(checkout)
-}
-
-/// Move the checkpoint to `in_review` once a reviewer attempt is admitted. The
-/// admitted Execution is already authoritative, so a concurrent transition is
-/// not an error.
-pub(crate) async fn mark_range_review_started(db: &SqliteDb, work_unit_id: &str) -> Result<()> {
-    let Some(frozen) = frozen_range(db, work_unit_id).await? else {
-        return Ok(());
-    };
-    let Some(checkpoint) =
-        ReviewCheckpointRepo::get_review_checkpoint(db, &frozen.checkpoint_id).await?
-    else {
-        return Ok(());
-    };
-    if checkpoint.state != ReviewCheckpointState::Pending {
-        return Ok(());
-    }
-    let now = now_rfc3339();
-    let event = CreateDomainEvent {
-        id: new_uuid_v4(),
-        event_type: "review.checkpoint_state_changed".to_owned(),
-        entity_type: "review_checkpoint".to_owned(),
-        entity_id: checkpoint.id.clone(),
-        actor_type: "system".to_owned(),
-        actor_id: None,
-        scope_type: "task".to_owned(),
-        scope_id: checkpoint.task_id.clone(),
-        correlation_id: checkpoint.id.clone(),
-        causation_id: None,
-        causation_depth: 0,
-        dedupe_key: Some(format!("review-checkpoint-in-review:{}", checkpoint.id)),
-        payload_json: serde_json::json!({
-            "task_id": checkpoint.task_id,
-            "repo_id": checkpoint.repo_id,
-            "checkpoint_id": checkpoint.id,
-            "from_state": checkpoint.state.to_string(),
-            "state": ReviewCheckpointState::InReview.to_string(),
-            "version": checkpoint.version + 1,
-            "blocked_code": null,
-        })
-        .to_string(),
-        created_at: now.clone(),
-    };
-    match ReviewCheckpointRepo::transition_review_checkpoint(
-        db,
-        TransitionReviewCheckpoint {
-            checkpoint_id: checkpoint.id,
-            expected_version: checkpoint.version,
-            state: ReviewCheckpointState::InReview,
-            add_reasons: Vec::new(),
-            blocked_code: None,
-            blocked_detail_json: None,
-            cancel_review_work_units: false,
-            updated_at: now,
-            events: vec![event],
-        },
-    )
-    .await
-    {
-        Ok(_) | Err(db::DbError::VersionConflict) => Ok(()),
-        Err(error) => Err(error.into()),
-    }
 }
 
 pub(crate) fn mismatch(message: impl Into<String>) -> ServiceError {

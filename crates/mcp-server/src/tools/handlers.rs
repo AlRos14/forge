@@ -1135,13 +1135,8 @@ pub(super) async fn forge_update_project(
         return Err(McpToolError::new(-32602, "name must not be empty"));
     }
 
-    if let Some(Some(policy)) = params.default_review_policy.as_ref() {
-        services::review_range::ReviewPolicyService::validate(
-            &super::review_ranges::policy_to_db(policy.clone()),
-        )?;
-    }
     let project = services::ProjectRepositoryService::new(Arc::clone(&state.db))
-        .update_project_at_version(
+        .update_project_at_version_with_review_policy(
             UpdateProject {
                 id: params.project_id,
                 name: params.name,
@@ -1153,23 +1148,11 @@ pub(super) async fn forge_update_project(
             params.version,
             None,
             user_id,
+            params
+                .default_review_policy
+                .map(|policy| policy.map(super::review_ranges::policy_to_db)),
         )
         .await?;
-    if let Some(policy) = params.default_review_policy {
-        let current =
-            db::ReviewPolicyRepo::get_project_review_policy(&*state.db, &project.id).await?;
-        services::review_range::ReviewPolicyService::new(
-            Arc::clone(&state.db),
-            super::review_ranges::workspace_root(),
-        )
-        .set_project_default(
-            user_id,
-            &project.id,
-            current.as_ref().map(|row| row.version),
-            policy.map(super::review_ranges::policy_to_db),
-        )
-        .await?;
-    }
     super::review_ranges::project_response_value(state, project).await
 }
 

@@ -2141,9 +2141,9 @@ impl ReviewCoverageService {
 ```
 
 Precedencia de estado (el primero que aplique): `blocked` (base desconocida o no
-ancestro, o checkpoint `blocked`), `unchanged`, `in_review` (checkpoint
-`pending|in_review`), `findings_open` (P0/P1 abiertos o línea de resultado en
-`request_changes`), `not_required` (`coverage_required=false`), `satisfied`,
+ancestro, o checkpoint `blocked`), `findings_open` (P0/P1 abiertos o línea de
+resultado en `request_changes`), `unchanged`, `in_review` (checkpoint
+`pending|in_review`), `not_required` (`coverage_required=false`), `satisfied`,
 `history_rewritten` (alguna arista revisada con head no ancestro de C),
 `partial` (frontier ≠ B), `uncovered`. `snapshot_digest` cubre en orden:
 `repo_id, review_policy_digest, base_commit, candidate_commit, ranges,
@@ -2174,8 +2174,15 @@ impl ReviewAttribution {
         -> Result<Vec<ReviewLocationAttribution>>;   // 1:1 con locations
     pub async fn contributors(&self, task_id: &str, repo_id: &str, base: &str, head: &str)
         -> Result<RangeContributors>;
-    pub fn primary_author(locations: &[ReviewLocationAttribution]) -> Option<ReviewLocationAttribution>;
+    pub fn primary_author(locations: &[ReviewLocationAttribution],
+        integration_started_at: &BTreeMap<String, String>) -> Option<ReviewLocationAttribution>;
 }
+
+`primary_author` suma líneas por Actor. En empate elige el Actor con la
+integración más reciente por `started_at`; empates de timestamp se resuelven por
+`integration_id` descendente y luego por la clave estable del Actor. La
+atribución representante usa la misma ordenación y remata por commit, Execution
+y WorkUnit IDs.
 
 // review_range/resolution.rs  (lane B)
 impl ReviewFindingService {

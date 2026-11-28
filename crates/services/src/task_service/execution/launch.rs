@@ -636,16 +636,6 @@ impl TaskService {
                 lifecycle_plan,
             )
             .await?;
-        // The Execution is already admitted; a checkpoint left `pending` is
-        // still reviewable, so this must not turn admission into a failure.
-        if let Err(error) = crate::work_unit_service::range_review::mark_range_review_started(
-            &self.db,
-            work_unit_id,
-        )
-        .await
-        {
-            tracing::warn!(%work_unit_id, %error, "range review checkpoint was not marked in review");
-        }
         self.publish(ForgeEvent {
             event_type: "task.execution_launched".to_owned(),
             entity_id: task.id.clone(),

@@ -14,18 +14,19 @@ use crate::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, run_migrations_from,
     ActivateReviewCheckpoint, ActorKind, ActorRef, ApplyReviewCorrections, ArtifactKind,
     ArtifactStorageKind, CollaborationRepo, CreateArtifact, CreateDecision, CreateDomainEvent,
-    CreateProposal, CreateRoleMembership, CreateWorkUnit, CreateWorkspace, DbError,
-    DecisionOutcome, IngestRangeReport, PageRequest, ProjectRepo, ProposalTarget,
-    ProposalTargetKind, ReviewAttributionKind, ReviewBaseSource, ReviewCheckpoint,
-    ReviewCheckpointReason, ReviewCheckpointRepo, ReviewCheckpointState, ReviewCorrectionLink,
-    ReviewFinding, ReviewFindingFilter, ReviewFindingLocation, ReviewFindingResolution,
-    ReviewFindingSeverity, ReviewHumanDecision, ReviewLedgerRepo, ReviewLocationAttribution,
-    ReviewPolicyDocument, ReviewPolicyRepo, ReviewPolicySource, ReviewRange,
-    ReviewRangeContributor, ReviewRangeReport, ReviewRangeReportRepo, ReviewResolutionOutcome,
-    ReviewReworkRound, ReviewRiskClass, ReviewSizeThreshold, ReviewTriggerMode, ReviewVerdict,
-    RoleMembershipRepo, RoleMembershipStatus, SortBy, SortOrder, SqliteDb, TaskRepositoryRole,
-    TaskRepositorySetRepo, TaskRepositoryWrite, UpsertQueuedReviewCheckpoint, WorkUnitReviewRange,
-    WorkspaceRepo, WorkspaceStatus, WriteProjectReviewPolicy, WriteTaskReviewPolicy,
+    CreateExecution, CreateProposal, CreateRoleMembership, CreateWorkUnit, CreateWorkUnitExecution,
+    CreateWorkspace, DbError, DecisionOutcome, ExecutionStatus, IngestRangeReport, PageRequest,
+    ProjectRepo, ProposalTarget, ProposalTargetKind, ReviewAttributionKind, ReviewBaseSource,
+    ReviewCheckpoint, ReviewCheckpointReason, ReviewCheckpointRepo, ReviewCheckpointState,
+    ReviewCorrectionLink, ReviewFinding, ReviewFindingFilter, ReviewFindingLocation,
+    ReviewFindingResolution, ReviewFindingSeverity, ReviewHumanDecision, ReviewLedgerRepo,
+    ReviewLocationAttribution, ReviewPolicyDocument, ReviewPolicyRepo, ReviewPolicySource,
+    ReviewRange, ReviewRangeContributor, ReviewRangeReport, ReviewRangeReportRepo,
+    ReviewResolutionOutcome, ReviewReworkRound, ReviewRiskClass, ReviewSizeThreshold,
+    ReviewTriggerMode, ReviewVerdict, RoleMembershipRepo, RoleMembershipStatus, SortBy, SortOrder,
+    SqliteDb, TaskRepositoryRole, TaskRepositorySetRepo, TaskRepositoryWrite, UpdateProject,
+    UpsertQueuedReviewCheckpoint, WorkUnitExecutionRepo, WorkUnitReviewRange, WorkspaceRepo,
+    WorkspaceStatus, WriteProjectReviewPolicy, WriteTaskReviewPolicy,
 };
 use sqlx::SqlitePool;
 
@@ -1097,6 +1098,134 @@ async fn review_range_policy_writes_are_versioned_authorized_and_copied() {
 }
 
 #[tokio::test]
+async fn review_range_project_policy_and_versioned_fields_update_atomically() {
+    let w = world().await;
+    let before = ProjectRepo::get_by_id(&w.db, &w.project)
+        .await
+        .expect("Project lookup")
+        .expect("Project exists");
+    let stale_policy_update = WriteProjectReviewPolicy {
+        project_id: w.project.clone(),
+        expected_version: Some(1),
+        policy: Some((policy_document(), digest('a'))),
+        updated_by_user_id: w.owner.clone(),
+        updated_at: now_rfc3339(),
+    };
+    let error = ProjectRepo::update_at_version_with_review_policy(
+        &w.db,
+        UpdateProject {
+            id: w.project.clone(),
+            name: Some("must roll back".to_owned()),
+            settings: None,
+            primary_repo_id: None,
+            paused_at: None,
+            updated_at: now_rfc3339(),
+        },
+        before.version,
+        None,
+        Some(&w.owner),
+        Some(stale_policy_update),
+    )
+    .await
+    .expect_err("a stale policy write rolls back the Project update");
+    assert!(matches!(error, DbError::VersionConflict));
+
+    let unchanged = ProjectRepo::get_by_id(&w.db, &w.project)
+        .await
+        .expect("Project lookup after rollback")
+        .expect("Project exists");
+    assert_eq!(unchanged.name, before.name);
+    assert_eq!(unchanged.version, before.version);
+    assert!(
+        ReviewPolicyRepo::get_project_review_policy(&w.db, &w.project)
+            .await
+            .expect("policy lookup")
+            .is_none()
+    );
+
+    let updated = ProjectRepo::update_at_version_with_review_policy(
+        &w.db,
+        UpdateProject {
+            id: w.project.clone(),
+            name: Some("Project and policy committed".to_owned()),
+            settings: None,
+            primary_repo_id: None,
+            paused_at: None,
+            updated_at: now_rfc3339(),
+        },
+        before.version,
+        None,
+        Some(&w.owner),
+        Some(WriteProjectReviewPolicy {
+            project_id: w.project.clone(),
+            expected_version: None,
+            policy: Some((policy_document(), digest('b'))),
+            updated_by_user_id: w.owner.clone(),
+            updated_at: now_rfc3339(),
+        }),
+    )
+    .await
+    .expect("Project fields and review policy commit together");
+    assert_eq!(updated.name, "Project and policy committed");
+    assert_eq!(updated.version, before.version + 1);
+    let policy = ReviewPolicyRepo::get_project_review_policy(&w.db, &w.project)
+        .await
+        .expect("policy lookup after commit")
+        .expect("Project review policy exists");
+    assert_eq!(policy.version, 1);
+    assert_eq!(policy.digest, Some(digest('b')));
+}
+
+#[tokio::test]
+async fn review_range_task_policy_rejects_a_changed_active_gate_set() {
+    let w = world().await;
+    let gate_id = new_uuid_v4();
+    let now = now_rfc3339();
+    ok(
+        w.db.pool(),
+        "INSERT INTO gate (id, task_id, gate_kind, scope_kind, scope_id, created_at)
+         VALUES (?, ?, 'merge_readiness', 'task', ?, ?)",
+        &[&gate_id, &w.task, &w.task, &now],
+    )
+    .await;
+    ok(
+        w.db.pool(),
+        "INSERT INTO gate_policy_revision (
+             gate_id, revision, schema_version, policy_json, policy_digest, created_at
+         ) VALUES (?, 1, 1, '{\"schema_version\":1}', ?, ?)",
+        &[&gate_id, &digest('c'), &now],
+    )
+    .await;
+    ok(
+        w.db.pool(),
+        "UPDATE gate SET active_policy_revision = 1 WHERE id = ?",
+        &[&gate_id],
+    )
+    .await;
+
+    let error = ReviewPolicyRepo::write_task_review_policy(&w.db, policy_write(&w, None, 'd'))
+        .await
+        .expect_err("the active Gate appeared after policy preparation");
+    assert!(matches!(error, DbError::VersionConflict));
+    assert!(
+        ReviewPolicyRepo::get_current_task_review_policy(&w.db, &w.task)
+            .await
+            .expect("policy lookup")
+            .is_none()
+    );
+    let revision_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM gate_policy_revision WHERE gate_id = ?")
+            .bind(&gate_id)
+            .fetch_one(w.db.pool())
+            .await
+            .expect("Gate revision count");
+    assert_eq!(
+        revision_count, 1,
+        "the stale policy write does not revise the newly active Gate"
+    );
+}
+
+#[tokio::test]
 async fn review_range_initial_base_writer_pins_once_and_replays_exactly() {
     let w = world().await;
     ReviewPolicyRepo::write_task_review_policy(&w.db, policy_write(&w, None, 'a'))
@@ -1251,6 +1380,96 @@ async fn review_range_checkpoints_are_single_active_immutable_and_exclusive() {
         .await,
         "exact successful integration",
     );
+}
+
+#[tokio::test]
+async fn review_range_checkpoint_moves_in_review_atomically_with_reviewer_admission() {
+    let w = world().await;
+    let active = activated(&w).await;
+    drop_triggers(w.db.pool(), "work_unit", &[]).await;
+    ok(
+        w.db.pool(),
+        "UPDATE work_unit
+         SET assigned_actor_kind = 'agent', assigned_actor_id = ?, version = version + 1
+         WHERE id = ?",
+        &[&w.reviewer, &active.review_unit],
+    )
+    .await;
+    let execution_id = new_uuid_v4();
+    let now = now_rfc3339();
+    let write = WorkUnitExecutionRepo::create_for_work_unit(
+        &w.db,
+        CreateWorkUnitExecution {
+            execution: CreateExecution {
+                id: execution_id.clone(),
+                task_id: w.task.clone(),
+                agent_id: Some(w.reviewer.clone()),
+                actor_ref: Some(ActorRef::Agent(w.reviewer.clone())),
+                role: "reviewer".to_owned(),
+                status: ExecutionStatus::Running,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                parent_execution_id: None,
+                harness_session_id: None,
+                agent_message_id: None,
+                last_activity_at: Some(now.clone()),
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: None,
+                workspace_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+            work_unit_id: active.review_unit.clone(),
+            work_unit_version: 2,
+            workspace_leases: Vec::new(),
+        },
+        CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: "execution.started".to_owned(),
+            entity_type: "execution".to_owned(),
+            entity_id: execution_id,
+            actor_type: "agent".to_owned(),
+            actor_id: Some(w.reviewer.clone()),
+            scope_type: "task".to_owned(),
+            scope_id: w.task.clone(),
+            correlation_id: w.task.clone(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: None,
+            payload_json: "{}".to_owned(),
+            created_at: now,
+        },
+    )
+    .await
+    .expect("reviewer admission and checkpoint transition commit together");
+    assert_eq!(
+        write.record.work_unit_id.as_deref(),
+        Some(active.review_unit.as_str())
+    );
+    let checkpoint = ReviewCheckpointRepo::get_review_checkpoint(&w.db, &active.checkpoint.id)
+        .await
+        .expect("checkpoint lookup")
+        .expect("checkpoint exists");
+    assert_eq!(checkpoint.state, ReviewCheckpointState::InReview);
+    let transitions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event
+         WHERE event_type = 'review.checkpoint_state_changed'
+           AND dedupe_key = ?",
+    )
+    .bind(format!(
+        "review-checkpoint-in-review:{}",
+        active.checkpoint.id
+    ))
+    .fetch_one(w.db.pool())
+    .await
+    .expect("checkpoint event count");
+    assert_eq!(transitions, 1);
 }
 
 #[tokio::test]

@@ -181,78 +181,51 @@ impl ProjectRepo for SqliteDb {
         caller_user_id: Option<&str>,
     ) -> Result<Project> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        if let Some(caller_user_id) = caller_user_id {
-            let is_admin: i64 = sqlx::query_scalar(
-                "SELECT EXISTS(
-                    SELECT 1 FROM project_member
-                    WHERE project_id = ? AND user_id = ? AND role IN ('owner', 'admin')
-                )",
-            )
-            .bind(&input.id)
-            .bind(caller_user_id)
-            .fetch_one(&mut *tx)
-            .await?;
-            if is_admin == 0 {
-                return Err(DbError::ProjectAdminRequired);
-            }
-        }
-        let mut project = ProjectRepo::get_by_id_in_tx(self, &mut tx, &input.id)
-            .await?
-            .ok_or(DbError::NotFound)?;
-        if project.version != expected_version {
-            return Err(DbError::VersionConflict);
-        }
-        if let Some(name) = input.name {
-            project.name = name;
-        }
-        if let Some(settings) = input.settings {
-            project.settings = settings;
-        }
-        if let Some(primary_repo_id) = input.primary_repo_id {
-            project.primary_repo_id = primary_repo_id;
-        }
-        if let Some(paused_at) = input.paused_at {
-            project.paused_at = paused_at;
-        }
-        if let Some(project_hooks_json) = project_hooks_json {
-            project.project_hooks_json = project_hooks_json;
-        }
-        if let Some(repo_id) = project.primary_repo_id.as_deref() {
-            let belongs_to_project: i64 = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM repo WHERE id = ? AND project_id = ?)",
-            )
-            .bind(repo_id)
-            .bind(&project.id)
-            .fetch_one(&mut *tx)
-            .await?;
-            if belongs_to_project == 0 {
-                return Err(DbError::Check(
-                    "project.primary_repo_not_in_project".to_owned(),
-                ));
-            }
-        }
-        project.updated_at = input.updated_at;
-        let result = sqlx::query(
-            "UPDATE project
-             SET name = ?, settings = ?, primary_repo_id = ?, paused_at = ?,
-                 project_hooks_json = ?, version = version + 1, updated_at = ?
-             WHERE id = ? AND version = ?",
+        update_project_at_version_in_tx(
+            self,
+            &mut tx,
+            input.clone(),
+            expected_version,
+            project_hooks_json.clone(),
+            caller_user_id,
         )
-        .bind(&project.name)
-        .bind(&project.settings)
-        .bind(project.primary_repo_id.as_deref())
-        .bind(project.paused_at.as_deref())
-        .bind(&project.project_hooks_json)
-        .bind(&project.updated_at)
-        .bind(&project.id)
-        .bind(expected_version)
-        .execute(&mut *tx)
         .await?;
-        if result.rows_affected() == 0 {
-            return Err(DbError::VersionConflict);
+        tx.commit().await?;
+        ProjectRepo::get_by_id(self, &input.id)
+            .await?
+            .ok_or(DbError::NotFound)
+    }
+
+    async fn update_at_version_with_review_policy(
+        &self,
+        input: UpdateProject,
+        expected_version: i64,
+        project_hooks_json: Option<String>,
+        caller_user_id: Option<&str>,
+        review_policy: Option<WriteProjectReviewPolicy>,
+    ) -> Result<Project> {
+        if let Some(policy) = review_policy.as_ref() {
+            ensure(
+                policy.project_id == input.id
+                    && caller_user_id == Some(policy.updated_by_user_id.as_str()),
+                "Project review policy update must match the versioned Project writer",
+            )?;
+        }
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        update_project_at_version_in_tx(
+            self,
+            &mut tx,
+            input.clone(),
+            expected_version,
+            project_hooks_json,
+            caller_user_id,
+        )
+        .await?;
+        if let Some(review_policy) = review_policy {
+            super::review_range::write_project_review_policy_in_tx(&mut tx, review_policy).await?;
         }
         tx.commit().await?;
-        ProjectRepo::get_by_id(self, &project.id)
+        ProjectRepo::get_by_id(self, &input.id)
             .await?
             .ok_or(DbError::NotFound)
     }
@@ -591,6 +564,86 @@ impl ProjectRepo for SqliteDb {
         tx.commit().await?;
         Ok(())
     }
+}
+
+async fn update_project_at_version_in_tx(
+    db: &SqliteDb,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    input: UpdateProject,
+    expected_version: i64,
+    project_hooks_json: Option<String>,
+    caller_user_id: Option<&str>,
+) -> Result<()> {
+    if let Some(caller_user_id) = caller_user_id {
+        let is_admin: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM project_member
+                WHERE project_id = ? AND user_id = ? AND role IN ('owner', 'admin')
+            )",
+        )
+        .bind(&input.id)
+        .bind(caller_user_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if is_admin == 0 {
+            return Err(DbError::ProjectAdminRequired);
+        }
+    }
+    let mut project = ProjectRepo::get_by_id_in_tx(db, tx, &input.id)
+        .await?
+        .ok_or(DbError::NotFound)?;
+    if project.version != expected_version {
+        return Err(DbError::VersionConflict);
+    }
+    if let Some(name) = input.name {
+        project.name = name;
+    }
+    if let Some(settings) = input.settings {
+        project.settings = settings;
+    }
+    if let Some(primary_repo_id) = input.primary_repo_id {
+        project.primary_repo_id = primary_repo_id;
+    }
+    if let Some(paused_at) = input.paused_at {
+        project.paused_at = paused_at;
+    }
+    if let Some(project_hooks_json) = project_hooks_json {
+        project.project_hooks_json = project_hooks_json;
+    }
+    if let Some(repo_id) = project.primary_repo_id.as_deref() {
+        let belongs_to_project: i64 =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM repo WHERE id = ? AND project_id = ?)")
+                .bind(repo_id)
+                .bind(&project.id)
+                .fetch_one(&mut **tx)
+                .await?;
+        if belongs_to_project == 0 {
+            return Err(DbError::Check(
+                "project.primary_repo_not_in_project".to_owned(),
+            ));
+        }
+    }
+    project.updated_at = input.updated_at;
+    let result = sqlx::query(
+        "UPDATE project
+         SET name = ?, settings = ?, primary_repo_id = ?, paused_at = ?,
+             project_hooks_json = ?, version = version + 1, updated_at = ?
+         WHERE id = ? AND version = ?",
+    )
+    .bind(&project.name)
+    .bind(&project.settings)
+    .bind(project.primary_repo_id.as_deref())
+    .bind(project.paused_at.as_deref())
+    .bind(&project.project_hooks_json)
+    .bind(&project.updated_at)
+    .bind(&project.id)
+    .bind(expected_version)
+    .execute(&mut **tx)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(DbError::VersionConflict);
+    }
+    Ok(())
 }
 
 impl SqliteDb {

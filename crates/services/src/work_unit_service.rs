@@ -1645,11 +1645,6 @@ impl WorkUnitService {
         )
         .await?;
         self.domain_events.publish_committed(&write.event);
-        // The Execution is already admitted; a checkpoint left `pending` is
-        // still reviewable, so this must not turn admission into a failure.
-        if let Err(error) = range_review::mark_range_review_started(&self.db, id).await {
-            tracing::warn!(work_unit_id = %id, %error, "range review checkpoint was not marked in review");
-        }
         Ok(write.record)
     }
 

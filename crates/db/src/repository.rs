@@ -1699,6 +1699,16 @@ pub trait ProjectRepo: Send + Sync {
         project_hooks_json: Option<String>,
         caller_user_id: Option<&str>,
     ) -> Result<Project>;
+    /// Atomically updates versioned Project fields and its optional default
+    /// review policy in one `BEGIN IMMEDIATE` transaction.
+    async fn update_at_version_with_review_policy(
+        &self,
+        input: UpdateProject,
+        expected_version: i64,
+        project_hooks_json: Option<String>,
+        caller_user_id: Option<&str>,
+        review_policy: Option<WriteProjectReviewPolicy>,
+    ) -> Result<Project>;
     async fn set_project_hooks_json(
         &self,
         id: &str,

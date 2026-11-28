@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use db::{now_rfc3339, Project, ProjectRepo, SqliteDb, UpdateProject};
+use db::{
+    now_rfc3339, Project, ProjectRepo, ReviewPolicyDocument, ReviewPolicyRepo, SqliteDb,
+    UpdateProject, WriteProjectReviewPolicy,
+};
 
 use crate::{Result, ServiceError};
 
@@ -49,6 +52,54 @@ impl ProjectRepositoryService {
             expected_version,
             project_hooks_json,
             Some(caller_user_id),
+        )
+        .await
+        .map_err(|error| match error {
+            db::DbError::Check(message) if message == "project.primary_repo_not_in_project" => {
+                ServiceError::ProjectPrimaryRepoNotInProject
+            }
+            other => ServiceError::from(other),
+        })
+    }
+
+    /// Updates Project fields and, when supplied, its default review policy in
+    /// one database transaction. The Project version remains the caller's
+    /// concurrency fence; the policy version is read before the transaction
+    /// and revalidated by the same atomic write.
+    pub async fn update_project_at_version_with_review_policy(
+        &self,
+        input: UpdateProject,
+        expected_version: i64,
+        project_hooks_json: Option<String>,
+        caller_user_id: &str,
+        default_review_policy: Option<Option<ReviewPolicyDocument>>,
+    ) -> Result<Project> {
+        let policy_update = if let Some(policy) = default_review_policy {
+            let current = ReviewPolicyRepo::get_project_review_policy(&*self.db, &input.id).await?;
+            let policy = policy
+                .map(|policy| {
+                    crate::review_range::ReviewPolicyService::validate(&policy)?;
+                    let digest = crate::review_range::ReviewPolicyService::digest(&policy)?;
+                    Ok::<_, ServiceError>((policy, digest))
+                })
+                .transpose()?;
+            Some(WriteProjectReviewPolicy {
+                project_id: input.id.clone(),
+                expected_version: current.as_ref().map(|record| record.version),
+                policy,
+                updated_by_user_id: caller_user_id.to_owned(),
+                updated_at: input.updated_at.clone(),
+            })
+        } else {
+            None
+        };
+        ProjectRepo::update_at_version_with_review_policy(
+            &*self.db,
+            input,
+            expected_version,
+            project_hooks_json,
+            Some(caller_user_id),
+            policy_update,
         )
         .await
         .map_err(|error| match error {

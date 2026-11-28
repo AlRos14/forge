@@ -339,6 +339,29 @@ fn review_range_coverage_applies_status_precedence() {
 }
 
 #[test]
+fn review_range_unchanged_tree_with_open_p0_or_p1_finding_blocks_gate_coverage() {
+    let mut unchanged = linear(&["b", "c"]);
+    unchanged.candidate_tree = unchanged.base_tree.clone();
+
+    for coverage_required in [true, false] {
+        for (id, severity) in [
+            ("open-p0", ReviewFindingSeverity::P0),
+            ("open-p1", ReviewFindingSeverity::P1),
+        ] {
+            let mut rows = rows();
+            rows.policy.as_mut().unwrap().policy.coverage_required = coverage_required;
+            finding(&mut rows, id, severity, "b");
+            let coverage = evaluate_coverage(&rows, &unchanged);
+            assert_eq!(coverage.status, ReviewCoverageStatus::FindingsOpen);
+            assert_eq!(
+                coverage.gate_status(),
+                api_types::ReviewCoverageStatus::FindingsOpen
+            );
+        }
+    }
+}
+
+#[test]
 fn review_range_coverage_is_not_required_without_a_policy() {
     let mut rows = rows();
     rows.policy = None;

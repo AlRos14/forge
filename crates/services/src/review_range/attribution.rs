@@ -191,14 +191,28 @@ impl ReviewAttribution {
     }
 
     /// Sum the lines attributed to each Actor and return the largest author.
-    /// Equal totals use a stable descending integration-ID fallback. This
-    /// frozen signature has no integration timestamps, so it cannot implement
-    /// the contract's exact most-recent-integration tie break.
+    /// Equal totals prefer the Actor with the latest recorded integration in
+    /// `integration_started_at`; equal timestamps use descending integration
+    /// ID, then the stable Actor key. The returned location is selected by the
+    /// same order, with commit, Execution, and WorkUnit IDs as final fallbacks.
     pub fn primary_author(
         locations: &[ReviewLocationAttribution],
+        integration_started_at: &BTreeMap<String, String>,
     ) -> Option<ReviewLocationAttribution> {
-        let mut totals = BTreeMap::<(String, String), i64>::new();
-        let mut representative = BTreeMap::<(String, String), ReviewLocationAttribution>::new();
+        let mut candidates = BTreeMap::<
+            (String, String),
+            (
+                i64,
+                (
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                ),
+                ReviewLocationAttribution,
+            ),
+        >::new();
         for location in locations {
             let Some(actor) = location.actor.as_ref() else {
                 continue;
@@ -207,31 +221,42 @@ impl ReviewAttribution {
                 continue;
             }
             let key = (actor.kind().to_string(), actor.id().to_owned());
-            *totals.entry(key.clone()).or_default() += location.line_count;
-            let replace = representative.get(&key).is_none_or(|current| {
-                location.integration_id.as_deref() > current.integration_id.as_deref()
-            });
-            if replace {
-                representative.insert(key, location.clone());
+            let started_at = location
+                .integration_id
+                .as_ref()
+                .and_then(|id| integration_started_at.get(id).cloned());
+            let order = (
+                started_at,
+                location.integration_id.clone(),
+                location.commit_sha.clone(),
+                location.execution_id.clone(),
+                location.work_unit_id.clone(),
+            );
+            match candidates.entry(key) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert((location.line_count, order, location.clone()));
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let candidate = entry.get_mut();
+                    candidate.0 += location.line_count;
+                    if order > candidate.1 {
+                        candidate.1 = order;
+                        candidate.2 = location.clone();
+                    }
+                }
             }
         }
-        totals
+        candidates
             .into_iter()
-            .max_by(|(left_key, left_total), (right_key, right_total)| {
-                left_total
-                    .cmp(right_total)
-                    .then_with(|| {
-                        representative[left_key]
-                            .integration_id
-                            .cmp(&representative[right_key].integration_id)
-                    })
+            .max_by(|(left_key, left), (right_key, right)| {
+                left.0
+                    .cmp(&right.0)
+                    .then_with(|| left.1.cmp(&right.1))
                     .then_with(|| left_key.cmp(right_key))
             })
-            .and_then(|(key, total)| {
-                representative.get(&key).cloned().map(|mut attribution| {
-                    attribution.line_count = total;
-                    attribution
-                })
+            .map(|(_, (total, _, mut attribution))| {
+                attribution.line_count = total;
+                attribution
             })
     }
 
@@ -492,9 +517,40 @@ mod tests {
             source("two", 5, "i-2"),
             second_unit,
         ];
-        let author = ReviewAttribution::primary_author(&attributed).expect("primary author");
+        let integration_started_at = BTreeMap::from([
+            ("i-1".to_owned(), "2026-11-27T10:00:00Z".to_owned()),
+            ("i-2".to_owned(), "2026-11-27T10:01:00Z".to_owned()),
+            ("i-3".to_owned(), "2026-11-27T10:02:00Z".to_owned()),
+        ]);
+        let author = ReviewAttribution::primary_author(&attributed, &integration_started_at)
+            .expect("primary author");
         assert_eq!(author.actor, Some(ActorRef::Human("one".to_owned())));
         assert_eq!(author.line_count, 5);
         assert_eq!(author.integration_id.as_deref(), Some("i-3"));
+    }
+
+    #[test]
+    fn review_range_primary_author_breaks_line_ties_by_latest_integration_timestamp() {
+        let attributed = vec![source("older", 5, "i-old"), source("newer", 5, "i-new")];
+        let integration_started_at = BTreeMap::from([
+            ("i-old".to_owned(), "2026-11-27T09:00:00Z".to_owned()),
+            ("i-new".to_owned(), "2026-11-27T10:00:00Z".to_owned()),
+        ]);
+
+        let author = ReviewAttribution::primary_author(&attributed, &integration_started_at)
+            .expect("primary author");
+        assert_eq!(author.actor, Some(ActorRef::Human("newer".to_owned())));
+        assert_eq!(author.integration_id.as_deref(), Some("i-new"));
+        assert_eq!(author.line_count, 5);
+
+        let same_time = vec![source("a", 5, "i-a"), source("z", 5, "i-z")];
+        let equal_timestamps = BTreeMap::from([
+            ("i-a".to_owned(), "2026-11-27T10:00:00Z".to_owned()),
+            ("i-z".to_owned(), "2026-11-27T10:00:00Z".to_owned()),
+        ]);
+        let deterministic = ReviewAttribution::primary_author(&same_time, &equal_timestamps)
+            .expect("stable integration-ID tie break");
+        assert_eq!(deterministic.actor, Some(ActorRef::Human("z".to_owned())));
+        assert_eq!(deterministic.integration_id.as_deref(), Some("i-z"));
     }
 }

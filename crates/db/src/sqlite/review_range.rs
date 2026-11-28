@@ -598,6 +598,28 @@ impl ReviewPolicyRepo for SqliteDb {
             });
             return replay.ok_or(DbError::VersionConflict);
         }
+        // Gate revisions are prepared outside this transaction because policy
+        // conversion may be expensive. Revalidate the complete Gate set and
+        // every active revision while the SQLite write lock is held so a Gate
+        // added, removed, activated, or revised in the meantime cannot be
+        // silently left on an older review policy.
+        let mut actual_gates: Vec<(String, Option<i64>)> = sqlx::query_as(
+            "SELECT id, active_policy_revision FROM gate
+             WHERE task_id = ? AND gate_kind = 'merge_readiness' ORDER BY id",
+        )
+        .bind(&input.task_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut expected_gates = input
+            .gate_revisions
+            .iter()
+            .map(|gate| (gate.gate_id.clone(), gate.expected_active_revision))
+            .collect::<Vec<_>>();
+        actual_gates.sort();
+        expected_gates.sort();
+        if actual_gates != expected_gates {
+            return Err(DbError::VersionConflict);
+        }
         // Coverage state is created for the Task's current repository set.
         super::task_repository::ensure_initial_current_revision_in_tx(&mut tx, &input.task_id)
             .await?;
@@ -694,68 +716,143 @@ impl ReviewPolicyRepo for SqliteDb {
         input: WriteProjectReviewPolicy,
     ) -> Result<ProjectReviewPolicy> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        require_project_admin(&mut tx, &input.project_id, &input.updated_by_user_id).await?;
-        let current = sqlx::query("SELECT * FROM project_review_policy WHERE project_id = ?")
-            .bind(&input.project_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .map(map_project_policy)
-            .transpose()?;
-        let (policy, digest) = match input.policy {
-            Some((policy, digest)) => (Some(policy), Some(digest)),
-            None => (None, None),
-        };
-        if current.as_ref().map(|record| record.version) != input.expected_version {
-            let replay = current.filter(|record| {
-                record.version == input.expected_version.unwrap_or(0) + 1
-                    && record.policy == policy
-                    && record.digest == digest
-                    && record.updated_by_user_id == input.updated_by_user_id
-            });
-            return replay.ok_or(DbError::VersionConflict);
-        }
-        let policy_json = policy.as_ref().map(to_json).transpose()?;
-        if current.is_some() {
-            sqlx::query(
-                "UPDATE project_review_policy
-                 SET version = version + 1, policy_json = ?, digest = ?,
-                     updated_by_user_id = ?, updated_at = ?
-                 WHERE project_id = ?",
-            )
-            .bind(policy_json.as_deref())
-            .bind(digest.as_deref())
-            .bind(&input.updated_by_user_id)
-            .bind(&input.updated_at)
-            .bind(&input.project_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(write_error)?;
-        } else {
-            sqlx::query(
-                "INSERT INTO project_review_policy (
-                     project_id, version, policy_json, digest, updated_by_user_id,
-                     created_at, updated_at
-                 ) VALUES (?, 1, ?, ?, ?, ?, ?)",
-            )
-            .bind(&input.project_id)
-            .bind(policy_json.as_deref())
-            .bind(digest.as_deref())
-            .bind(&input.updated_by_user_id)
-            .bind(&input.updated_at)
-            .bind(&input.updated_at)
-            .execute(&mut *tx)
-            .await
-            .map_err(write_error)?;
-        }
-        let record = map_project_policy(
-            sqlx::query("SELECT * FROM project_review_policy WHERE project_id = ?")
-                .bind(&input.project_id)
-                .fetch_one(&mut *tx)
-                .await?,
-        )?;
+        let record = write_project_review_policy_in_tx(&mut tx, input).await?;
         tx.commit().await?;
         Ok(record)
     }
+}
+
+pub(super) async fn write_project_review_policy_in_tx(
+    tx: &mut Tx<'_>,
+    input: WriteProjectReviewPolicy,
+) -> Result<ProjectReviewPolicy> {
+    require_project_admin(tx, &input.project_id, &input.updated_by_user_id).await?;
+    let current = sqlx::query("SELECT * FROM project_review_policy WHERE project_id = ?")
+        .bind(&input.project_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .map(map_project_policy)
+        .transpose()?;
+    let (policy, digest) = match input.policy {
+        Some((policy, digest)) => (Some(policy), Some(digest)),
+        None => (None, None),
+    };
+    if current.as_ref().map(|record| record.version) != input.expected_version {
+        let replay = current.filter(|record| {
+            record.version == input.expected_version.unwrap_or(0) + 1
+                && record.policy == policy
+                && record.digest == digest
+                && record.updated_by_user_id == input.updated_by_user_id
+        });
+        return replay.ok_or(DbError::VersionConflict);
+    }
+    let policy_json = policy.as_ref().map(to_json).transpose()?;
+    if current.is_some() {
+        sqlx::query(
+            "UPDATE project_review_policy
+             SET version = version + 1, policy_json = ?, digest = ?,
+                 updated_by_user_id = ?, updated_at = ?
+             WHERE project_id = ?",
+        )
+        .bind(policy_json.as_deref())
+        .bind(digest.as_deref())
+        .bind(&input.updated_by_user_id)
+        .bind(&input.updated_at)
+        .bind(&input.project_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(write_error)?;
+    } else {
+        sqlx::query(
+            "INSERT INTO project_review_policy (
+                 project_id, version, policy_json, digest, updated_by_user_id,
+                 created_at, updated_at
+             ) VALUES (?, 1, ?, ?, ?, ?, ?)",
+        )
+        .bind(&input.project_id)
+        .bind(policy_json.as_deref())
+        .bind(digest.as_deref())
+        .bind(&input.updated_by_user_id)
+        .bind(&input.updated_at)
+        .bind(&input.updated_at)
+        .execute(&mut **tx)
+        .await
+        .map_err(write_error)?;
+    }
+    map_project_policy(
+        sqlx::query("SELECT * FROM project_review_policy WHERE project_id = ?")
+            .bind(&input.project_id)
+            .fetch_one(&mut **tx)
+            .await?,
+    )
+}
+
+/// Admission and the checkpoint transition share the caller's write
+/// transaction. A reviewer Execution can never commit while its checkpoint
+/// remains `pending` because a follow-up service write failed.
+pub(super) async fn mark_range_review_started_in_tx(
+    db: &SqliteDb,
+    tx: &mut Tx<'_>,
+    work_unit_id: &str,
+    started_at: &str,
+) -> Result<()> {
+    let checkpoint_id: Option<String> = sqlx::query_scalar(
+        "SELECT checkpoint_id FROM work_unit_review_range
+         WHERE review_work_unit_id = ?",
+    )
+    .bind(work_unit_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(checkpoint_id) = checkpoint_id else {
+        return Ok(());
+    };
+    let Some(checkpoint) = checkpoint_by_id(tx, &checkpoint_id).await? else {
+        return Err(DbError::NotFound);
+    };
+    if checkpoint.state != ReviewCheckpointState::Pending {
+        return Ok(());
+    }
+    let event = CreateDomainEvent {
+        id: crate::new_uuid_v4(),
+        event_type: "review.checkpoint_state_changed".to_owned(),
+        entity_type: "review_checkpoint".to_owned(),
+        entity_id: checkpoint.id.clone(),
+        actor_type: "system".to_owned(),
+        actor_id: None,
+        scope_type: "task".to_owned(),
+        scope_id: checkpoint.task_id.clone(),
+        correlation_id: checkpoint.id.clone(),
+        causation_id: None,
+        causation_depth: 0,
+        dedupe_key: Some(format!("review-checkpoint-in-review:{}", checkpoint.id)),
+        payload_json: serde_json::json!({
+            "task_id": checkpoint.task_id,
+            "repo_id": checkpoint.repo_id,
+            "checkpoint_id": checkpoint.id,
+            "from_state": checkpoint.state.to_string(),
+            "state": ReviewCheckpointState::InReview.to_string(),
+            "version": checkpoint.version + 1,
+            "blocked_code": null,
+        })
+        .to_string(),
+        created_at: started_at.to_owned(),
+    };
+    let changed = sqlx::query(
+        "UPDATE review_checkpoint
+         SET state = 'in_review', version = version + 1, updated_at = ?
+         WHERE id = ? AND state = 'pending' AND version = ?",
+    )
+    .bind(started_at)
+    .bind(&checkpoint.id)
+    .bind(checkpoint.version)
+    .execute(&mut **tx)
+    .await
+    .map_err(write_error)?;
+    if changed.rows_affected() != 1 {
+        return Err(DbError::VersionConflict);
+    }
+    append_events(db, tx, &[event]).await?;
+    Ok(())
 }
 
 async fn insert_base(tx: &mut Tx<'_>, base: &TaskReviewBase) -> Result<()> {

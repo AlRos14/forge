@@ -239,12 +239,6 @@ pub async fn update_project(
         version,
         default_review_policy,
     } = request;
-    if let Some(Some(policy)) = default_review_policy.as_ref() {
-        services::review_range::ReviewPolicyService::validate(&super::review_ranges::policy_to_db(
-            policy.clone(),
-        ))
-        .map_err(ApiError::from)?;
-    }
     let project_hooks_json = match project_hooks {
         Some(rules) => {
             let serialized = serde_json::to_string(&rules).map_err(|error| {
@@ -256,7 +250,7 @@ pub async fn update_project(
         None => None,
     };
     let project = services::ProjectRepositoryService::new(state.db.clone())
-        .update_project_at_version(
+        .update_project_at_version_with_review_policy(
             UpdateProject {
                 id,
                 name,
@@ -268,24 +262,9 @@ pub async fn update_project(
             version,
             project_hooks_json,
             &user.user_id,
+            default_review_policy.map(|policy| policy.map(super::review_ranges::policy_to_db)),
         )
         .await?;
-    if let Some(policy) = default_review_policy {
-        let current =
-            db::ReviewPolicyRepo::get_project_review_policy(&*state.db, &project.id).await?;
-        services::review_range::ReviewPolicyService::new(
-            state.db.clone(),
-            state.cleanup_scheduler.workspace_root().to_path_buf(),
-        )
-        .set_project_default(
-            &user.user_id,
-            &project.id,
-            current.as_ref().map(|row| row.version),
-            policy.map(super::review_ranges::policy_to_db),
-        )
-        .await
-        .map_err(ApiError::from)?;
-    }
     state.event_bus.publish(ForgeEvent {
         event_type: "project.updated".to_owned(),
         entity_id: project.id.clone(),

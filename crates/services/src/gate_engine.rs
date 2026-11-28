@@ -3568,6 +3568,9 @@ fn gate_fact_event(event: &DomainEvent) -> bool {
     if event.event_type == "task.lifecycle_changed" && event.entity_type == "task" {
         return true;
     }
+    if event.event_type == "review.coverage_changed" && event.entity_type == "task" {
+        return true;
+    }
     matches!(
         event.entity_type.as_str(),
         "artifact"
@@ -3725,6 +3728,31 @@ fn invalid(message: impl Into<String>) -> ServiceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_range_coverage_changed_event_is_a_gate_fact() {
+        let event = DomainEvent {
+            sequence: 1,
+            id: "coverage-event".to_owned(),
+            event_type: "review.coverage_changed".to_owned(),
+            entity_type: "task".to_owned(),
+            entity_id: "task".to_owned(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "task".to_owned(),
+            scope_id: "task".to_owned(),
+            correlation_id: "task".to_owned(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: None,
+            payload_json:
+                r#"{"task_id":"task","repo_id":"repo","revision":2,"status":"satisfied"}"#
+                    .to_owned(),
+            created_at: "2026-11-27T00:00:00Z".to_owned(),
+        };
+
+        assert!(gate_fact_event(&event));
+    }
 
     #[tokio::test]
     async fn multirepo_lifecycle_gate_checks_only_changed_repositories() {

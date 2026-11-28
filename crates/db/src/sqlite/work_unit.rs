@@ -1558,12 +1558,21 @@ impl WorkUnitExecutionRepo for SqliteDb {
         event_input: CreateDomainEvent,
     ) -> Result<CollaborationWrite<Execution>> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let review_work_unit_id = input.work_unit_id.clone();
+        let started_at = input.execution.created_at.clone();
         let (execution, event) = insert_work_unit_execution_in_tx(
             self,
             &mut tx,
             input,
             artifact_input_ids,
             &event_input,
+        )
+        .await?;
+        super::review_range::mark_range_review_started_in_tx(
+            self,
+            &mut tx,
+            &review_work_unit_id,
+            &started_at,
         )
         .await?;
         tx.commit().await?;
@@ -2115,12 +2124,21 @@ impl WorkUnitExecutionRepo for SqliteDb {
             }
         }
 
+        let review_work_unit_id = admission.work_unit_id.clone();
+        let started_at = admission.execution.created_at.clone();
         let (execution, execution_event) = insert_work_unit_execution_in_tx(
             self,
             &mut tx,
             admission,
             artifact_input_ids,
             &execution_event_input,
+        )
+        .await?;
+        super::review_range::mark_range_review_started_in_tx(
+            self,
+            &mut tx,
+            &review_work_unit_id,
+            &started_at,
         )
         .await?;
         if let Some(receipt) = input.follow_up_receipt {
@@ -2665,12 +2683,21 @@ impl WorkUnitExecutionRepo for SqliteDb {
             None
         };
 
+        let review_work_unit_id = admission.work_unit_id.clone();
+        let started_at = admission.execution.created_at.clone();
         let (execution, execution_event) = insert_work_unit_execution_in_tx(
             self,
             &mut tx,
             admission,
             artifact_input_ids,
             &execution_event_input,
+        )
+        .await?;
+        super::review_range::mark_range_review_started_in_tx(
+            self,
+            &mut tx,
+            &review_work_unit_id,
+            &started_at,
         )
         .await?;
         let request_receipt_event = if let Some(receipt) = input.request_receipt.as_ref() {
