@@ -296,24 +296,9 @@ impl From<ServiceError> for ApiError {
                     || code == "review.checkpoint.limit_reached"
                 {
                     StatusCode::TOO_MANY_REQUESTS
-                } else if matches!(
-                    code,
-                    "review.policy.version_conflict"
-                        | "review.checkpoint.version_conflict"
-                        | "review.coverage.version_conflict"
-                        | "review.coverage.base_unknown"
-                        | "review.coverage.base_not_ancestor"
-                        | "review.coverage.facts_stale"
-                        | "review.range.nothing_to_review"
-                        | "review.range.checkpoint_active"
-                        | "review.range.unrecorded_commits"
-                        | "review.range.head_not_integrated"
-                        | "review.checkpoint.reviewer_unavailable"
-                        | "review.report.subject_mismatch"
-                        | "review.report.questions"
-                ) {
-                    StatusCode::CONFLICT
                 } else {
+                    // Every other domain rule violation, including review
+                    // version, base and checkpoint conflicts, is a 409.
                     StatusCode::CONFLICT
                 };
                 Self {
