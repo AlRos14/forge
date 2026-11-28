@@ -60,7 +60,7 @@ fn invalid(message: &str) -> DbError {
     DbError::Check(message.to_owned())
 }
 
-fn ensure(condition: bool, message: &str) -> Result<()> {
+pub(super) fn ensure(condition: bool, message: &str) -> Result<()> {
     if condition {
         Ok(())
     } else {
