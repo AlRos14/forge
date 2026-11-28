@@ -29,7 +29,7 @@ the repository `docker-compose.yml`:
 ```bash
 docker run -d --name forge --init --restart unless-stopped \
   -p 127.0.0.1:8080:8080 -v forge-data:/data \
-  ghcr.io/alros14/forge:0.9.1
+  ghcr.io/alros14/forge:0.9.2
 docker logs -f forge
 ```
 

@@ -4,9 +4,14 @@ This changelog preserves the source repository's recorded history. Sections
 from 0.9.0 onward describe releases of AlRos14/forge, published on GitHub
 Releases from `v*` tags. Entries for 0.8.0 and earlier are inherited history
 and do not assert that this fork published matching artifacts. The workspace
-source version is 0.9.1.
+source version is 0.9.2.
 
 ## [Unreleased]
+
+## [0.9.2] - 2026-11-27
+
+Multirepo Tasks, per-Agent Git attribution, and coordination fixes found in a
+real multi-repository end-to-end run. Adds migrations V181–V183.
 
 ### Added
 
